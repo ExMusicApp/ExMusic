@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ExMusic</string>
+    <string name="widget_label">Плеер ExMusic</string>
+    <string name="widget_description">Обложка, название и управление воспроизведением</string>
+    <string name="widget_idle_title">Ничего не играет</string>
+    <string name="widget_idle_subtitle">Откройте приложение и выберите музыку</string>
+    <string name="widget_cover">Обложка</string>
+    <string name="widget_prev">Предыдущий трек</string>
+    <string name="widget_next">Следующий трек</string>
+    <string name="widget_play">Играть</string>
+    <string name="widget_pause">Пауза</string>
+    <string name="widget_open_player">Открыть плеер</string>
+    <string name="tile_recognize_label">Распознать музыку</string>
+</resources>
