@@ -8,8 +8,14 @@ import androidx.compose.runtime.setValue
 import org.json.JSONArray
 import org.json.JSONObject
 
+/** Запись истории распознавания: найденный трек и время, когда он был узнан. */
 data class RecHistoryItem(val result: RecResult, val time: Long)
 
+/**
+ * История распознавания: найденные треки (новые — первыми), хранится на устройстве в SharedPreferences
+ * «recognition_history». Трек попадает сюда, когда его узнали (см. [Recognizer.set]). Повторно узнанный трек
+ * поднимается наверх с новым временем, а не дублируется. Можно удалить одну запись или очистить всё.
+ */
 object RecognitionHistory {
     private const val LIMIT = 100
     private var prefs: SharedPreferences? = null
@@ -61,6 +67,7 @@ object RecognitionHistory {
     private fun same(a: RecResult, b: RecResult) =
         a.title.equals(b.title, ignoreCase = true) && a.artist.equals(b.artist, ignoreCase = true)
 
+    /** Добавляет найденный трек в начало; такой же трек переезжает наверх с новым временем. */
     @Synchronized
     fun add(r: RecResult) {
         if (r.title.isBlank()) return

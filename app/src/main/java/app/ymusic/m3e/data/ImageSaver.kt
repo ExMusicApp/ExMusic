@@ -12,13 +12,22 @@ import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 
+/**
+ * Сохранение картинки (фото исполнителя, обложка альбома) в галерею: «Pictures/ExMusic».
+ * Как и у скачанных треков, дополнительные разрешения не нужны: на Android 10+ — MediaStore,
+ * на Android 8–9 — папка приложения.
+ */
 object ImageSaver {
     private const val DIR = "ExMusic"
-    private val http = OkHttpClient()
+    private val http = ScProxy.applyTo(OkHttpClient.Builder()).build()
 
     private fun safeName(s: String): String =
         s.replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001f]"), "_").replace(Regex("\\s+"), " ").trim().trimEnd('.', ' ')
 
+    /**
+     * Скачивает картинку по [url] и сохраняет файлом с именем [baseName].
+     * Вызывать из фонового потока. При успехе возвращает понятную подпись папки, например «Pictures/ExMusic».
+     */
     fun save(ctx: Context, url: String, baseName: String): Result<String> = runCatching {
         val name0 = safeName(baseName).take(100).ifBlank { "image" }
         if (url.startsWith("content://") || url.startsWith("file://")) {
@@ -37,6 +46,12 @@ object ImageSaver {
                 body.byteStream().use { write(ctx, it, name0, ext, mime) }
             }
         }
+    }
+
+    /** Сохраняет готовую картинку (например, QR-код) в «Pictures/ExMusic». Вызывать из фонового потока. */
+    fun savePng(ctx: Context, bitmap: android.graphics.Bitmap, baseName: String): Result<String> = runCatching {
+        val bytes = java.io.ByteArrayOutputStream().also { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
+        write(ctx, bytes.inputStream(), safeName(baseName).take(100).ifBlank { "qr" }, "png", "image/png")
     }
 
     private fun write(ctx: Context, input: InputStream, name: String, ext: String, mime: String): String {
@@ -60,6 +75,7 @@ object ImageSaver {
             }
             return "${Environment.DIRECTORY_PICTURES}/$DIR"
         }
+        // Android 8–9: без разрешения на память — папка приложения (как и у скачанных треков).
         val dir = File(ctx.getExternalFilesDir(Environment.DIRECTORY_PICTURES) ?: ctx.filesDir, DIR).apply { mkdirs() }
         var f = File(dir, "$name.$ext")
         var n = 1

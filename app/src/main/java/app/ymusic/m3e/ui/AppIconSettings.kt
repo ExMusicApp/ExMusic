@@ -22,7 +22,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -39,6 +38,10 @@ import androidx.compose.ui.unit.dp
 import app.ymusic.m3e.MainActivity
 import app.ymusic.m3e.R
 
+/**
+ * Варианты иконки приложения. Каждый — это <activity-alias> в манифесте (с собственной иконкой запуска);
+ * в каждый момент включён ровно один. Название = то, что видно в настройках.
+ */
 enum class AppIcon(val title: String, val alias: String, @DrawableRes val preview: Int) {
     ExMusic("ExMusic", "IconDefault", R.drawable.icon_preview_exmusic),
     NotClaude("(не) клод", "IconNotClaude", R.drawable.icon_preview_notclaude),
@@ -50,14 +53,25 @@ enum class AppIcon(val title: String, val alias: String, @DrawableRes val previe
     BlackWhite("Черно-белая", "IconBw", R.drawable.icon_preview_bw),
 }
 
+/**
+ * Смена иконки приложения (Настройки → Внешний вид → Иконка приложения).
+ *
+ * Выбор запоминается сразу, а в системе включается другой alias, когда приложение сворачивается
+ * ([apply] из `MainActivity.onStop`): смена иконки на лету на части прошивок закрывает приложение,
+ * а в фоне этого никто не заметит. Источник правды — состояние компонентов в системе, поэтому отдельно
+ * ничего не хранится: после переустановки и обновления включённая иконка сохраняется сама.
+ */
 object AppIconSettings {
     private var inited = false
 
+    /** Иконка, выбранная в настройках (может ещё не быть применена в системе). */
     var selected by mutableStateOf(AppIcon.ExMusic)
         private set
 
+    /** Иконка, которая сейчас реально включена в системе; null — состояние неоднозначно (будет исправлено при [apply]). */
     private var applied by mutableStateOf<AppIcon?>(null)
 
+    /** Выбор сделан, но на рабочем столе иконка ещё прежняя. */
     val pending: Boolean get() = selected != applied
 
     private fun component(ctx: Context, icon: AppIcon) =
@@ -67,12 +81,14 @@ object AppIconSettings {
         when (ctx.packageManager.getComponentEnabledSetting(component(ctx, icon))) {
             PackageManager.COMPONENT_ENABLED_STATE_ENABLED -> true
             PackageManager.COMPONENT_ENABLED_STATE_DISABLED -> false
+            // По умолчанию — как в манифесте: включён только основной alias.
             else -> icon == AppIcon.ExMusic
         }
     } catch (_: Throwable) {
         icon == AppIcon.ExMusic
     }
 
+    /** Читает из системы, какая иконка включена. Вызывать один раз на запуск процесса. */
     fun init(context: Context) {
         if (inited) return
         inited = true
@@ -86,12 +102,14 @@ object AppIconSettings {
         selected = icon
     }
 
+    /** Включает выбранную иконку и выключает остальные. Ничего не делает, если менять нечего. */
     fun apply(context: Context) {
         if (!pending) return
         val ctx = context.applicationContext
         val pm = ctx.packageManager
         val target = selected
         try {
+            // Сначала включаем новую, потом выключаем старые: ярлык запуска у приложения не пропадает ни на миг.
             pm.setComponentEnabledSetting(
                 component(ctx, target), PackageManager.COMPONENT_ENABLED_STATE_ENABLED, PackageManager.DONT_KILL_APP,
             )
@@ -102,10 +120,12 @@ object AppIconSettings {
             }
             applied = target
         } catch (_: Throwable) {
+            // Не удалось — остаёмся как были; при следующем сворачивании попробуем ещё раз.
         }
     }
 }
 
+/** Раздел «Иконка приложения» на странице «Внешний вид». */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 internal fun AppIconSection() {

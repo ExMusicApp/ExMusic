@@ -5,20 +5,32 @@ import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 
+/** Что слушал пользователь: обычный список (плейлист, альбом, поиск…) или «Моя волна». */
 enum class SessionKind { Queue, Wave }
 
+/** Лёгкая часть сессии: где остановились. Пишется часто. */
 data class SessionPosition(
     val index: Int,
     val positionMs: Long,
     val kind: SessionKind,
     val waveBatchId: String?,
     val shuffle: Boolean,
+    /** Станция волны, которая играла (null — «Моя волна»). */
     val waveStation: String? = null,
 )
 
+/**
+ * Локальное хранилище: история прослушанных треков и последняя сессия воспроизведения
+ * (очередь + позиция + режим), чтобы после перезапуска мини-плеер был готов продолжить.
+ *
+ * Очередь (тяжёлая) и позиция (лёгкая) лежат под разными ключами: очередь пишется только при её смене,
+ * позицию можно сохранять каждые несколько секунд.
+ */
 class PlaybackStore(context: Context) {
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences("playback_store", Context.MODE_PRIVATE)
+
+    // ---- История ----
 
     fun loadHistory(owner: String?): List<Track> {
         if (owner == null || prefs.getString("history_owner", null) != owner) return emptyList()
@@ -33,6 +45,18 @@ class PlaybackStore(context: Context) {
             .apply()
     }
 
+    // ---- Локальный журнал прослушивания ----
+    // Не привязан к аккаунту и не стирается при выходе/смене аккаунта: если сервис не отдаёт историю (как SoundCloud)
+    // или токен сменился, то после перезапуска приложение всё равно помнит, что слушали раньше.
+
+    fun loadListenLog(): List<Track> = decodeTracks(prefs.getString("listen_log", null))
+
+    fun saveListenLog(tracks: List<Track>) {
+        prefs.edit().putString("listen_log", encodeTracks(tracks)).apply()
+    }
+
+    // ---- Что слушали в «Моей волне» (для вкладки на странице исполнителя) ----
+
     fun loadWave(owner: String?): List<Track> {
         if (owner == null || prefs.getString("wave_owner", null) != owner) return emptyList()
         return decodeTracks(prefs.getString("wave_history", null))
@@ -46,6 +70,9 @@ class PlaybackStore(context: Context) {
             .apply()
     }
 
+    // ---- Сессия ----
+
+    /** Сохраняет очередь. [owner] — отпечаток аккаунта: чужую очередь после смены аккаунта не восстанавливаем. */
     fun saveQueue(owner: String?, tracks: List<Track>) {
         if (owner == null) return
         prefs.edit()
@@ -65,6 +92,9 @@ class PlaybackStore(context: Context) {
             .apply()
     }
 
+    // ---- История текущего списка / волны («с включения») ----
+
+    /** Что слушали с момента запуска текущего плейлиста или волны (новые — первыми) и название этого списка. */
     class SessionLog(val label: String, val tracks: List<Track>)
 
     fun saveSessionLog(owner: String?, label: String, tracks: List<Track>) {
@@ -95,9 +125,14 @@ class PlaybackStore(context: Context) {
         waveStation = prefs.getString("pos_station", null),
     )
 
+    /** Забыть сессию и историю (смена аккаунта, выход). */
     fun clear() {
+        val keep = prefs.getString("listen_log", null)
         prefs.edit().clear().apply()
+        if (keep != null) prefs.edit().putString("listen_log", keep).apply()
     }
+
+    // ---- JSON ----
 
     companion object {
         fun encodeTracks(tracks: List<Track>): String {
@@ -128,6 +163,9 @@ class PlaybackStore(context: Context) {
             put("lalbum", t.localAlbumId)
             put("tno", t.trackNo)
             put("year", t.year)
+            put("key", t.accessKey)
+            put("genre", t.genre)
+            put("label", t.label)
             put(
                 "refs",
                 JSONArray().apply {
@@ -148,6 +186,10 @@ class PlaybackStore(context: Context) {
                     ArtistRef(r.getString("id"), r.optString("name"), r.optStr("cover"))
                 }
             }.orEmpty()
+            return decodeTrackBase(o, refs).also { VkKeys.remember(it) }
+        }
+
+        private fun decodeTrackBase(o: JSONObject, refs: List<ArtistRef>): Track {
             return Track(
                 id = o.getString("id"),
                 albumId = o.optStr("albumId"),
@@ -163,6 +205,9 @@ class PlaybackStore(context: Context) {
                 fileName = o.optStr("file"),
                 localAlbumId = o.optLong("lalbum"),
                 trackNo = o.optInt("tno"),
+                accessKey = o.optStr("key"),
+                genre = o.optStr("genre"),
+                label = o.optStr("label"),
             )
         }
     }

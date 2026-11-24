@@ -22,12 +22,18 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.coerceIn
 import androidx.compose.ui.unit.dp
 
+/**
+ * Планшетный режим. «Авто» — широкая раскладка включается, когда окно шире 600 dp (планшеты, складные устройства,
+ * телефоны в альбомной ориентации). «Только планшеты» — только на устройствах с короткой стороной от 600 dp
+ * (на телефонах остаётся обычная раскладка и в альбомной ориентации). «Выкл» — широкой раскладки нет совсем.
+ */
 internal enum class TabletMode(val title: String) {
     Auto("Авто"),
     TabletsOnly("Только планшеты"),
     Off("Выкл"),
 }
 
+/** Где на планшете стоит островок. */
 internal enum class IslandPos(val title: String) {
     Left("Слева"),
     Right("Справа"),
@@ -35,6 +41,7 @@ internal enum class IslandPos(val title: String) {
     Bottom("Снизу"),
 }
 
+/** Настройка планшетного режима (SharedPreferences «tablet»). Настройки → Внешний вид → Планшеты. */
 internal object TabletSettings {
     private var prefs: SharedPreferences? = null
 
@@ -45,12 +52,13 @@ internal object TabletSettings {
         val p = context.applicationContext.getSharedPreferences("tablet", Context.MODE_PRIVATE)
         prefs = p
         mode = runCatching { TabletMode.valueOf(p.getString("mode", null) ?: "Auto") }.getOrDefault(TabletMode.Auto)
-        sideRail = p.getBoolean("side_rail", false)
+        sideRail = p.getBoolean("side_rail", true)
         inPortrait = p.getBoolean("in_portrait", true)
         islandPos = runCatching { IslandPos.valueOf(p.getString("island_pos", null) ?: "Left") }.getOrDefault(IslandPos.Left)
     }
 
-    var sideRail by mutableStateOf(false)
+    /** Навигация на планшете: true — боковая панель слева, false — нижний док / островок поверх контента. */
+    var sideRail by mutableStateOf(true)
         private set
 
     fun updateSideRail(on: Boolean) {
@@ -58,6 +66,7 @@ internal object TabletSettings {
         prefs?.edit()?.putBoolean("side_rail", on)?.apply()
     }
 
+    /** Планшетная раскладка и в вертикальной ориентации (по умолчанию включено). */
     var inPortrait by mutableStateOf(true)
         private set
 
@@ -79,6 +88,7 @@ internal object TabletSettings {
         prefs?.edit()?.putString("mode", m.name)?.apply()
     }
 
+    /** Нужна ли широкая раскладка (боковая панель, две колонки) при такой конфигурации окна. */
     fun isWide(cfg: Configuration): Boolean = if (!inPortrait && cfg.orientation == Configuration.ORIENTATION_PORTRAIT) false else when (mode) {
         TabletMode.Off -> false
         TabletMode.Auto -> cfg.screenWidthDp >= 600
@@ -86,10 +96,13 @@ internal object TabletSettings {
     }
 }
 
+/** Широкая (планшетная) раскладка включена. Задаётся один раз в AppRoot. */
 internal val LocalWide = compositionLocalOf { false }
 
+/** Окно низкое (телефон в альбомной ориентации): боковая панель и шапки делаются компактнее. */
 internal val LocalCompactHeight = compositionLocalOf { false }
 
+/** Мы внутри левой колонки двухпанельного экрана: шапка альбома / плейлиста рисуется вертикально, с крупной обложкой. */
 internal val LocalInSplitPane = compositionLocalOf { false }
 
 @Composable
@@ -101,10 +114,16 @@ internal fun rememberIsWide(): Boolean {
 @Composable
 internal fun rememberIsCompactHeight(): Boolean = LocalConfiguration.current.screenHeightDp < 480
 
+/** Сетка альбомов: карточки не растягиваются на пол-экрана, а на широком экране помещается столько, сколько влезает. */
 internal val AlbumGridCells: GridCells = GridCells.Adaptive(148.dp)
 
+/** Ширина левой колонки двухпанельного экрана от ширины области. */
 internal fun splitLeftWidth(total: Dp): Dp = (total * 0.38f).coerceIn(300.dp, 440.dp)
 
+/**
+ * Две колонки: слева кнопки и шапка, справа список. Каждая колонка прокручивается сама.
+ * [leftWidth] по умолчанию считается от ширины области.
+ */
 @Composable
 internal fun TwoPane(
     modifier: Modifier = Modifier,

@@ -13,10 +13,15 @@ import app.ymusic.m3e.MainActivity
 import app.ymusic.m3e.ui.RecognitionContent
 import app.ymusic.m3e.ui.YMusicTheme
 
+/**
+ * Прозрачное окно распознавания: его открывает плитка из шторки уведомлений (и кнопка «Распознать» в приложении
+ * при необходимости). Показывает ту же панель, что и в приложении, снизу поверх текущего экрана.
+ */
 class RecognizeActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Новое открытие — чистое состояние (старый результат не показываем).
         if (savedInstanceState == null && !Recognizer.busy) Recognizer.reset()
         setContent {
             YMusicTheme {

@@ -14,6 +14,16 @@ import java.util.Date
 import java.util.Locale
 import kotlin.concurrent.thread
 
+/**
+ * Журнал клиента для режима разработчика (Настройки → Для разработчиков).
+ *
+ * Два файла во внутренней папке `files/logs/`:
+ *  - `current.log`  — журнал текущего запуска (пишется сразу, строка за строкой);
+ *  - `previous.log` — полный журнал прошлого запуска (при старте `current.log` переименовывается в него).
+ *
+ * В журнал попадают: события запуска и закрытия (жизненный цикл Activity), собственные записи через [d]/[i]/[w]/[e],
+ * необработанные исключения (с трассировкой) и всё, что процесс приложения пишет в logcat.
+ */
 object AppLog {
     private const val MAX_BYTES = 1_500_000L
 
@@ -26,6 +36,7 @@ object AppLog {
     private var inited = false
     private val fmt = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
 
+    /** Вызывать из [Application.onCreate] как можно раньше. */
     fun init(app: Application) {
         synchronized(lock) {
             if (inited) return
@@ -33,6 +44,10 @@ object AppLog {
             dir = File(app.filesDir, "logs").apply { mkdirs() }
             current = File(dir, "current.log")
             previous = File(dir, "previous.log")
+            // Прошлый запуск закончился аварией: в этом случае `current.log` — журнал аварии.
+            val crashFlag = File(dir, "crash.flag")
+            val crashed = crashFlag.exists() && current.exists() && current.length() > 0
+            // Журнал прошлого запуска сохраняем целиком.
             runCatching {
                 if (current.exists() && current.length() > 0) {
                     previous.delete()
@@ -42,6 +57,12 @@ object AppLog {
                     }
                 }
             }
+            if (crashed) runCatching {
+                // Отдельная копия, которую не затрёт следующий запуск, и отметка «предложить отправить».
+                previous.copyTo(File(dir, "crash.log"), overwrite = true)
+                File(dir, "crash.pending").writeText(crashFlag.readText())
+            }
+            crashFlag.delete()
             openWriter(append = false)
         }
         header(app)
@@ -87,6 +108,7 @@ object AppLog {
         }
     }
 
+    /** Файл слишком большой: оставляем вторую половину (самые свежие строки). */
     private fun trimLocked() {
         runCatching {
             writer?.close()
@@ -110,10 +132,27 @@ object AppLog {
     fun w(tag: String, msg: String, t: Throwable? = null) = log('W', tag, msg, t)
     fun e(tag: String, msg: String, t: Throwable? = null) = log('E', tag, msg, t)
 
+    // ---------- Чтение ----------
+
+    /** Файл журнала текущего запуска. */
     fun currentFile(): File? = if (inited) current else null
 
+    /** Файл журнала прошлого запуска (null, если прошлого запуска ещё не было). */
     fun previousFile(): File? = if (inited && previous.exists() && previous.length() > 0) previous else null
 
+    /** Журнал аварии, о которой ещё не предлагали сообщить (после аварийного закрытия прошлого запуска), иначе null. */
+    fun pendingCrashReport(): File? {
+        if (!inited) return null
+        val f = File(dir, "crash.log")
+        return if (File(dir, "crash.pending").exists() && f.exists() && f.length() > 0) f else null
+    }
+
+    /** Больше не предлагать отправить этот журнал (сам файл остаётся, пока его не заменит следующая авария). */
+    fun markCrashHandled() {
+        if (inited) runCatching { File(dir, "crash.pending").delete() }
+    }
+
+    /** Весь текст журнала (при [maxChars] > 0 — только последние [maxChars] символов). */
     fun read(file: File?, maxChars: Int = 0): String {
         if (file == null) return ""
         return synchronized(lock) {
@@ -124,11 +163,14 @@ object AppLog {
         }
     }
 
+    // ---------- Источники записей ----------
+
     private fun installCrashHandler() {
         val old = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { th, ex ->
             runCatching { e("CRASH", "Необработанное исключение в потоке ${th.name}", ex) }
             runCatching { raw("==================== АВАРИЙНОЕ ЗАКРЫТИЕ ====================") }
+            runCatching { File(dir, "crash.flag").writeText(synchronized(fmt) { fmt.format(Date()) }) }
             old?.uncaughtException(th, ex)
         }
     }
@@ -156,6 +198,7 @@ object AppLog {
         })
     }
 
+    /** Всё, что процесс пишет в logcat (на своём PID видно без особых прав), дописываем в тот же файл. */
     private fun startLogcat() {
         thread(name = "AppLog-logcat", isDaemon = true) {
             var p: java.lang.Process? = null

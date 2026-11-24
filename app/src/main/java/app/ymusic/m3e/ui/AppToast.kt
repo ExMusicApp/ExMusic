@@ -30,7 +30,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -56,21 +55,30 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
+/** Вид тоста: определяет значок и цвета. */
 enum class ToastKind { Info, Success, Error }
 
+/**
+ * Тост в стиле приложения: плавающая капсула над док-панелью с цветным значком и анимацией
+ * быстрого появления. Капсула сразу нужной ширины по длине текста и не уменьшается, пока на экране. Заменяет системный [android.widget.Toast] и стандартный Snackbar. Показывается из любого места
+ * (в том числе не из Compose): `AppToast.show("Текст")`. Новый тост заменяет предыдущий. Тап или свайп в сторону — закрыть.
+ */
 object AppToast {
     class Item(val id: Long, val text: String, val kind: ToastKind, val durationMs: Long)
 
     private var seq = 0L
     private val main = Handler(Looper.getMainLooper())
 
+    /** Тост, который сейчас на экране (null — ничего не показано). */
     var current by mutableStateOf<Item?>(null)
         private set
 
+    /** Окна, которые умеют рисовать тост. Рисует только последнее зарегистрированное, чтобы тост не дублировался. */
     internal val hosts = mutableStateListOf<Any>()
 
     fun show(text: String, kind: ToastKind = ToastKind.Info, long: Boolean = false) {
         if (text.isBlank()) return
+        // Время на экране растёт с длиной текста: успеть прочитать и короткое, и длинное сообщение.
         val ms = ((if (long) 3500L else 2000L) + text.length * 60L).coerceAtMost(9000L)
         val post = {
             current = Item(++seq, text, kind, ms)
@@ -87,6 +95,10 @@ object AppToast {
     }
 }
 
+/**
+ * Место, где рисуется тост. Кладётся в слот snackbarHost у Scaffold (над панелью навигации) или в низ окна.
+ * Если окон несколько (например, поверх экрана открыт диалог со своим хостом), тост рисует только последнее.
+ */
 @Composable
 fun AppToastHost(modifier: Modifier = Modifier) {
     val token = remember { Any() }
@@ -121,6 +133,7 @@ fun AppToastHost(modifier: Modifier = Modifier) {
     }
 }
 
+// Быстро и без масштабирования: капсула сразу нужного размера, только лёгкий сдвиг и проявление.
 private fun toastEnter(): EnterTransition =
     fadeIn(tween(fxMs(110))) + slideInVertically(tween(fxMs(150))) { it / 3 }
 
@@ -154,6 +167,7 @@ private fun ToastCard(t: AppToast.Item) {
     }
     val shape = containerShape(22)
 
+    // Свайп в сторону закрывает тост; короткий — возвращается на место.
     val scope = rememberCoroutineScope()
     val dragX = remember(t.id) { Animatable(0f) }
     val dismissPx = with(LocalDensity.current) { 96.dp.toPx() }

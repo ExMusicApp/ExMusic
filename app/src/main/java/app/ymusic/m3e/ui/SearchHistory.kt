@@ -7,13 +7,21 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import org.json.JSONArray
 
+/**
+ * История поиска: последние запросы (новые — первыми), хранятся на устройстве в SharedPreferences «search_history».
+ * Запрос попадает в историю, когда его отправили (кнопка поиска на клавиатуре), открыли карточку из результатов
+ * или запустили трек из них. Повторный запрос поднимается наверх, а не дублируется.
+ * Можно удалить один запрос или всю историю разом. Выключатель — Настройки → Внешний вид → Поиск.
+ */
 internal object SearchHistory {
     private const val LIMIT = 30
     private var prefs: SharedPreferences? = null
 
+    /** Запросы, новые первыми. */
     var items by mutableStateOf<List<String>>(emptyList())
         private set
 
+    /** Запоминать ли запросы. Выключено — история не пополняется и не показывается (сохранённое не стирается). */
     var enabled by mutableStateOf(true)
         private set
 
@@ -37,6 +45,7 @@ internal object SearchHistory {
         prefs?.edit()?.putString("items", JSONArray(list).toString())?.apply()
     }
 
+    /** Добавляет запрос в начало; такой же запрос (без учёта регистра) переезжает наверх. */
     fun add(query: String) {
         val q = query.trim()
         if (!enabled || q.length < 2) return

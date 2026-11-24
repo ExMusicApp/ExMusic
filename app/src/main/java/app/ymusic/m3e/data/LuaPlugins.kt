@@ -50,20 +50,37 @@ import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.TimeUnit
 
+/*
+ * Lua-плагины.
+ *
+ * Плагин .exm состоит из Lua-скриптов: в manifest.json → contributes.lua = { "main": "main.lua" }.
+ * Скрипт запускается в песочнице LuaJ: нет io, os.execute, debug, load, dofile, coroutine, java-мостов; доступно только то,
+ * что приложение даёт через API (player, ui, storage, http, timer, events, wave, theme, json, app). Никаких прав в манифесте
+ * объявлять не нужно: все эти возможности доступны любому включённому плагину. Описание — в PLUGINS_LUA.md.
+ *
+ * Весь Lua-код всех плагинов выполняется в ОДНОМ фоновом потоке («lua-plugins»), поэтому интерфейс не тормозит.
+ * Каждый вызов в скрипт (запуск, событие, таймер) ограничен по времени: завис — плагин останавливается и выключается.
+ */
+
+/** Связь Lua-плагинов с приложением. Реализуется в AppViewModel. Вызывается только с главного потока. */
 interface LuaBridge {
     fun toast(text: String)
     fun currentTrack(): Track?
     fun search(query: String)
     fun startWave(station: String, label: String)
 
+    /** Сам AppViewModel: отдаётся скрипту только когда для плагина отключена песочница (app.viewmodel()). */
     fun viewModel(): Any? = null
 }
 
+/** Выбрасывается из хука подсчёта инструкций, когда скрипт превысил лимит времени. Это Error, а не Exception — pcall в Lua его не перехватит. */
 private class LuaTimeout(val reason: String) : Error(reason)
 
 object LuaPlugins {
+    /** Возможности API, доступные каждому плагину (отдельно объявлять их в манифесте не нужно). */
     val PERMISSIONS: Set<String> = setOf("player", "ui", "storage", "net", "search", "theme", "wave")
 
+    /** Вызывается из AppViewModel: подключает плеер и мост, после чего запускаются скрипты включённых плагинов. */
     fun attach(ctx: Context, player: Player, bridge: LuaBridge) {
         lxCtx = ctx.applicationContext
         lxStartWatchdog()
@@ -90,6 +107,7 @@ object LuaPlugins {
         sync()
     }
 
+    /** Приводит запущенные скрипты в соответствие с настройками (главный выключатель, переключатели плагинов, установка/удаление). */
     fun sync() {
         if (lxBridge == null) return
         val want: List<InstalledPlugin> =
@@ -103,10 +121,12 @@ object LuaPlugins {
         }
     }
 
+    /** Пользователь изменил настройку плагина (значение уже проверено и сохранено в PluginSystem). */
     fun settingChanged(p: InstalledPlugin, key: String, value: Any) {
         luaExec.execute {
             val inst = luaRunning[p.id]
             if (inst != null && inst.plugin === p) {
+                // Песочницу включили или выключили: окружение скрипта строится при запуске, поэтому плагин перезапускается.
                 if (key.startsWith(PluginHooks.KEY_PREFIX) && inst.unsafeBuilt != p.unsafeOn) {
                     luaRunning.remove(p.id)
                     inst.stop()
@@ -115,12 +135,14 @@ object LuaPlugins {
                     reconcile(want)
                     return@execute
                 }
+                // Переключили хуки (главный выключатель или отдельный хук): включаем и выключаем их код.
                 if (key.startsWith(PluginHooks.KEY_PREFIX)) inst.evalHooks()
                 inst.fire("setting_changed", key, value)
             }
         }
     }
 
+    /** Пользователь тронул компонент на странице, созданной скриптом (значение уже проверено в PluginSystem.uiEvent). */
     fun uiEvent(p: InstalledPlugin, entryId: String, index: Int, value: Any?) {
         luaExec.execute {
             val inst = luaRunning[p.id]
@@ -128,6 +150,7 @@ object LuaPlugins {
         }
     }
 
+    /** Пользователь ответил на диалог плагина. */
     fun dialogEvent(p: InstalledPlugin, key: Int, button: Int, input: String?) {
         luaExec.execute {
             val inst = luaRunning[p.id]
@@ -135,6 +158,7 @@ object LuaPlugins {
         }
     }
 
+    /** Нижнюю модалку плагина закрыли. */
     fun sheetClosed(p: InstalledPlugin, entryId: String) {
         luaExec.execute {
             val inst = luaRunning[p.id]
@@ -142,6 +166,7 @@ object LuaPlugins {
         }
     }
 
+    /** Нужно заново получить отрисовку страниц плагина (окно настроек открыли). */
     fun renderPages(p: InstalledPlugin, entryId: String?) {
         luaExec.execute {
             val inst = luaRunning[p.id]
@@ -149,6 +174,7 @@ object LuaPlugins {
         }
     }
 
+    /** Нажата кнопка из настроек плагина. */
     fun action(p: InstalledPlugin, key: String) {
         luaExec.execute {
             val inst = luaRunning[p.id]
@@ -156,11 +182,14 @@ object LuaPlugins {
         }
     }
 
+    /** Удаляет данные плагина (его хранилище storage). Вызывать после sync() при удалении плагина. */
     fun purge(id: String) {
         val ctx = lxCtx ?: return
         luaExec.execute { runCatching { ctx.deleteSharedPreferences(lxStorageName(id)) } }
     }
 }
+
+// ============================ внутреннее устройство ============================
 
 private const val LX_TAG = "Lua"
 private const val LX_BUDGET_MS = 3000L
@@ -206,6 +235,7 @@ private val LX_MODULE_RE = Regex("^[A-Za-z0-9_./\\-]{1,80}$")
 
 private val luaMain = Handler(Looper.getMainLooper())
 
+/** Поток, в котором выполняется весь Lua-код. Заменяется целиком, если скрипт застрял в нативном вызове (см. сторожа ниже). */
 private fun lxNewExec() = ScheduledThreadPoolExecutor(
     1,
     ThreadFactory { r -> Thread(null, r, "lua-plugins", 4L * 1024 * 1024).apply { isDaemon = true } },
@@ -213,6 +243,7 @@ private fun lxNewExec() = ScheduledThreadPoolExecutor(
 
 @Volatile private var luaExec = lxNewExec()
 
+/** Сторож: отдельный поток, который следит, что скрипт не завис там, куда не дотягивается счётчик инструкций. */
 private val luaWatch = ScheduledThreadPoolExecutor(1, ThreadFactory { r -> Thread(r, "lua-watchdog").apply { isDaemon = true } })
 @Volatile private var lxWatchStarted = false
 @Volatile private var luaActive: LuaInst? = null
@@ -222,24 +253,27 @@ private val luaWatch = ScheduledThreadPoolExecutor(1, ThreadFactory { r -> Threa
 @Volatile private var lxPlayer: Player? = null
 private var lxListener: Player.Listener? = null
 
+// Меняются из потока lua-plugins (и сторожем при аварии), поэтому потокобезопасные:
 private val luaRunning = ConcurrentHashMap<String, LuaInst>()
 private val luaFailed = ConcurrentHashMap<String, InstalledPlugin>()
 
+/** Локальные и служебные адреса. Проверяется при КАЖДОМ соединении (а не один раз заранее), чтобы нельзя было подменить DNS-ответ. */
 private fun lxBadAddress(a: InetAddress): Boolean {
     if (a.isAnyLocalAddress || a.isLoopbackAddress || a.isLinkLocalAddress || a.isSiteLocalAddress || a.isMulticastAddress) return true
     val b = a.address
-    if (b.size == 16 && (b[0].toInt() and 0xFE) == 0xFC) return true
+    if (b.size == 16 && (b[0].toInt() and 0xFE) == 0xFC) return true                                 // fc00::/7
     if (b.size == 4) {
         val b0 = b[0].toInt() and 0xFF
         val b1 = b[1].toInt() and 0xFF
         val b2 = b[2].toInt() and 0xFF
-        if (b0 == 0) return true
-        if (b0 == 100 && (b1 and 0xC0) == 64) return true
-        if (b0 == 192 && b1 == 0 && b2 == 0) return true
-        if (b0 == 198 && (b1 and 0xFE) == 18) return true
-        if (b0 >= 240) return true
+        if (b0 == 0) return true                                       // 0.0.0.0/8
+        if (b0 == 100 && (b1 and 0xC0) == 64) return true              // 100.64.0.0/10 (CGNAT)
+        if (b0 == 192 && b1 == 0 && b2 == 0) return true               // 192.0.0.0/24
+        if (b0 == 198 && (b1 and 0xFE) == 18) return true              // 198.18.0.0/15
+        if (b0 >= 240) return true                                     // 240.0.0.0/4 и широковещательный
     }
     if (b.size == 16) {
+        // IPv4 внутри IPv6 (NAT64 64:ff9b::/96 и 6to4 2002::/16): проверяем вшитый IPv4-адрес.
         val nat64 = b[0].toInt() == 0x00 && b[1].toInt() == 0x64 && (b[2].toInt() and 0xFF) == 0xFF &&
             (b[3].toInt() and 0xFF) == 0x9B && (4 until 12).all { b[it].toInt() == 0 }
         if (nat64 || ((b[0].toInt() and 0xFF) == 0x20 && (b[1].toInt() and 0xFF) == 0x02)) {
@@ -263,7 +297,7 @@ private val luaHttp: OkHttpClient by lazy {
     OkHttpClient.Builder()
         .callTimeout(15, TimeUnit.SECONDS)
         .dns(luaDns)
-        .proxy(java.net.Proxy.NO_PROXY)
+        .proxy(java.net.Proxy.NO_PROXY) // через прокси имя разрешает сам прокси — проверка адресов в luaDns была бы обойдена
         .followRedirects(false)
         .followSslRedirects(false)
         .build()
@@ -274,7 +308,7 @@ private fun lxStorageName(id: String) = "plugin_lua_$id"
 private fun luaEmit(event: String, vararg args: Any?) {
     if (!PluginSystem.enabled) return
     val ex = luaExec
-    if (ex.queue.size > LX_MAX_QUEUE) return
+    if (ex.queue.size > LX_MAX_QUEUE) return // скрипты не успевают — лишние события отбрасываем, а не копим
     ex.execute {
         for (inst in luaRunning.values.toList()) {
             try { inst.fire(event, *args) } catch (t: Throwable) { AppLog.w(LX_TAG, "event $event: ${t.message}") }
@@ -292,6 +326,11 @@ private fun lxStartWatchdog() {
     }, 1, 1, TimeUnit.SECONDS)
 }
 
+/**
+ * Счётчик инструкций не видит нативные вызовы (например, тяжёлый шаблон в string.find). Если скрипт не вернул управление
+ * через LX_BUDGET + LX_HANG_GRACE, поток считается зависшим: он бросается, плагин выключается, остальные плагины
+ * запускаются заново на новом потоке.
+ */
 private fun lxWatchdogCheck() {
     val inst = luaActive ?: return
     if (inst.stopped || inst.inBlocking) return
@@ -313,7 +352,7 @@ private fun lxWatchdogCheck() {
         p.uiPages.clear()
         PluginSystem.dropUi(p.id)
         p.luaStatus = "Остановлен: скрипт завис"
-        PluginSystem.setPluginEnabled(p, false)
+        PluginSystem.setPluginEnabled(p, false) // заодно перезапустит остальные плагины через sync()
         lxBridge?.toast("Плагин «${p.manifest.name}» завис и выключен")
     }
 }
@@ -339,6 +378,7 @@ private fun reconcile(want: List<InstalledPlugin>) {
     }
 }
 
+/** Выполняет [f] на главном потоке и ждёт результат (вызывать из потока lua-plugins). */
 private fun <T> luaOnMain(timeoutMs: Long = 3000L, f: () -> T): T? {
     if (Looper.myLooper() === Looper.getMainLooper()) return f()
     val latch = CountDownLatch(1)
@@ -398,9 +438,15 @@ private fun lxCloneTable(t: LuaTable): LuaTable {
     return c
 }
 
+// ---------- Страницы настроек: таблица из render() → компоненты для интерфейса ----------
+
 private fun lxClean(s: String, max: Int): String =
     s.map { if (it == '\n' || !it.isISOControl()) it else ' ' }.joinToString("").trim().take(max)
 
+/**
+ * Разбирает то, что вернула render(): массив таблиц-компонентов. Приложение само проверяет и ограничивает всё (типы, длины,
+ * диапазоны), поэтому скрипт управляет только содержимым, а не рисованием. Возвращает компоненты и их колбэки (по позиции).
+ */
 private fun lxBuildPage(r: LuaValue): Pair<List<PluginUiNode>, Array<LuaValue?>> {
     if (!r.istable()) throw LuaError("render должна вернуть таблицу-список компонентов")
     val arr = r.checktable()
@@ -486,6 +532,8 @@ private fun lxBuildPage(r: LuaValue): Pair<List<PluginUiNode>, Array<LuaValue?>>
     return nodes to cbs
 }
 
+// ---------- JSON <-> Lua ----------
+
 private fun lxToJson(v: LuaValue, depth: Int = 0): Any? {
     if (depth > 12) throw LuaError("json: слишком глубокая вложенность")
     return when (v.type()) {
@@ -552,9 +600,12 @@ private fun lxFromJson(x: Any?, depth: Int = 0): LuaValue {
     }
 }
 
+// ---------- http ----------
+
 private fun lxCheckUrl(raw: String): HttpUrl {
     val url = raw.trim().toHttpUrlOrNull() ?: throw LuaError("http: неверный адрес")
     if (!url.isHttps) throw LuaError("http: разрешён только https")
+    // Адрес-литерал (https://192.168.0.1/, https://[::1]/) OkHttp не отдаёт на разрешение имён, и проверка в luaDns его бы не увидела.
     val host = url.host
     if (host.contains(':') || host.all { it.isDigit() || it == '.' }) {
         val addr = try { InetAddress.getByName(host) } catch (e: Exception) { throw LuaError("http: неверный адрес") }
@@ -564,6 +615,8 @@ private fun lxCheckUrl(raw: String): HttpUrl {
         throw LuaError("http: локальные адреса запрещены")
     return url
 }
+
+// ---------- os.date / os.time ----------
 
 private fun lxPad2(n: Int) = if (n < 10) "0$n" else n.toString()
 
@@ -612,6 +665,9 @@ private fun lxDate(fmtRaw: String, ms: Long): LuaValue {
     return LuaValue.valueOf(sb.toString())
 }
 
+// ============================ один запущенный плагин ============================
+
+/** Обработчик events.once: вызывается один раз, перед вызовом снимает себя через [detach]. */
 private class LxOnce(val orig: LuaValue, val detach: (LxOnce) -> Unit) : VarArgFunction() {
     override fun invoke(args: Varargs): Varargs {
         detach(this)
@@ -637,10 +693,12 @@ private class LuaInst(val plugin: InstalledPlugin) {
 
     private val handlers = HashMap<String, ArrayList<LuaValue>>()
 
+    /** Lua-обработчики хуков (hooks.on): id хука → функция(active); хуки, которые сейчас включены; хуки в очереди на повторную проверку. */
     private val hookHandlers = HashMap<String, LuaValue>()
     private val hookActive = HashSet<String>()
     private val hookPending = HashSet<String>()
 
+    /** Окружение построено с отключённой песочницей (luajava): если пользователь выключит хуки, плагин надо перезапустить. */
     @Volatile var unsafeBuilt = false
         private set
     private val timers = HashMap<Int, ScheduledFuture<*>>()
@@ -652,6 +710,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
     private var lastDialog = 0L
     private val httpTimes = ArrayDeque<Long>()
 
+    // Страницы настроек, созданные скриптом (ui.settings_page): описание, колбэки последней отрисовки и очередь перерисовок.
     private class PageDef(
         val id: String, val title: String, val summary: String, val menu: Boolean, val render: LuaValue,
         val onClose: LuaValue? = null, val transient: Boolean = false,
@@ -664,6 +723,8 @@ private class LuaInst(val plugin: InstalledPlugin) {
     private val prefs by lazy {
         (lxCtx ?: throw LuaError("хранилище недоступно")).getSharedPreferences(lxStorageName(id), Context.MODE_PRIVATE)
     }
+
+    // ---------- жизненный цикл ----------
 
     fun boot(): Boolean {
         val entry = plugin.manifest.lua
@@ -691,6 +752,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         return true
     }
 
+    /** Нормальная остановка (плагин выключен/удалён/заменён): сначала событие unload. */
     fun stop() {
         if (stopped) return
         deactivateHooks()
@@ -700,8 +762,10 @@ private class LuaInst(val plugin: InstalledPlugin) {
         luaMain.post { plugin.luaStatus = null }
     }
 
+    /** Вызывается сторожем: поток завис, этот экземпляр больше не используется. */
     fun kill() { stopped = true }
 
+    /** Аварийная остановка. */
     private fun abort(message: String, disable: Boolean) {
         if (stopped) return
         stopped = true
@@ -745,6 +809,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         luaMain.post { plugin.luaStatus = s }
     }
 
+    /** Вызов в скрипт с ограничением по времени и перехватом ошибок. true — выполнено без ошибок. */
     private fun guard(what: String, block: () -> Unit): Boolean {
         if (stopped) return false
         deadline = System.nanoTime() + LX_BUDGET_MS * 1_000_000L
@@ -782,11 +847,19 @@ private class LuaInst(val plugin: InstalledPlugin) {
         }
     }
 
+    // ---------- хуки: код хука находится в самом плагине ----------
+
+    /** Хук [hid] разрешён пользователем: включён главный выключатель «Хуки» плагина и отдельный выключатель этого хука. */
     private fun hookAllowed(hid: String): Boolean {
         val cur = plugin.settingsCopy
         return plugin.manifest.hooks.any { it.id == hid } && cur[PluginHooks.MASTER_KEY] == true && cur[PluginHooks.key(hid)] != false
     }
 
+    /**
+     * Включает и выключает код хуков плагина. Для каждого объявленного хука, у которого есть обработчик (hooks.on), считается,
+     * разрешил ли его пользователь; если состояние изменилось, обработчик вызывается с `true` (включить) или `false` (выключить).
+     * Хуки без разрешения не вызываются вообще. [only] — только один хук (null — все объявленные).
+     */
     fun evalHooks(only: String? = null) {
         if (stopped) return
         for (h in plugin.manifest.hooks) {
@@ -794,6 +867,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
             val fn = hookHandlers[h.id] ?: continue
             val want = hookAllowed(h.id)
             val now = h.id in hookActive
+            // «Включить» повторно по hooks.refresh тоже вызываем: плагин мог поменять данные, от которых зависит код хука.
             if (want == now && !(want && only != null)) continue
             if (want) hookActive.add(h.id) else hookActive.remove(h.id)
             guard("хук ${h.id}") { fn.call(LuaValue.valueOf(want)) }
@@ -801,6 +875,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         }
     }
 
+    /** Плагин останавливают: все включённые хуки получают `false`, чтобы плагин мог откатить свои изменения. */
     private fun deactivateHooks() {
         for (h in plugin.manifest.hooks) {
             if (h.id !in hookActive) continue
@@ -818,6 +893,9 @@ private class LuaInst(val plugin: InstalledPlugin) {
                 throw LuaError("$what: хук «$id» не объявлен в manifest.json (contributes.hooks)")
             }
         }
+        // hooks.on(id, функция(active)) — код хука. Вызывается с true, когда пользователь включил хук (и хуки плагина вообще),
+        // и с false, когда выключил, а также при остановке плагина. Пока хуки выключены, функция не вызывается.
+        // На один хук один обработчик: повторный вызов заменяет прежний. Обработчик вызывается после запуска скрипта и при переключении.
         hk.fn("on") { a ->
             val id = a.checkjstring(1)
             val f = a.checkfunction(2)
@@ -831,6 +909,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
             hookActive.remove(id)
             LuaValue.valueOf(hookHandlers.remove(id) != null)
         }
+        // hooks.refresh([id]) — вызвать код включённого хука ещё раз (с true). Выполняется отдельным вызовом в потоке Lua.
         hk.fn("refresh") { a ->
             val only = if (a.isnil(1)) null else a.checkjstring(1).also { declared("hooks.refresh", it) }
             val key = only ?: "*"
@@ -845,6 +924,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
             }
             LuaValue.NONE
         }
+        // hooks.enabled(id) — разрешил ли пользователь этот хук (главный выключатель и выключатель хука).
         hk.fn("enabled") { a ->
             val id = a.checkjstring(1)
             declared("hooks.enabled", id)
@@ -853,17 +933,19 @@ private class LuaInst(val plugin: InstalledPlugin) {
         g.set("hooks", hk)
     }
 
+    /** Блокирующая операция (сеть, главный поток): её время не считается в лимит скрипта. */
     private fun <T> blocking(f: () -> T): T {
         val t0 = System.nanoTime()
         inBlocking = true
         try {
             return f()
         } finally {
-            deadline += System.nanoTime() - t0
+            deadline += System.nanoTime() - t0 // сначала сдвигаем срок, потом снимаем отметку — иначе сторож может ошибиться
             inBlocking = false
         }
     }
 
+    /** Действие на главном потоке; за один вызов скрипта их не больше LX_MAX_POSTS (иначе цикл завалит интерфейс). */
     private fun post(f: () -> Unit) {
         if (++posts > LX_MAX_POSTS) throw LuaError("слишком много обращений к интерфейсу за один вызов")
         luaMain.post { f() }
@@ -873,6 +955,9 @@ private class LuaInst(val plugin: InstalledPlugin) {
         if (perm !in perms) throw LuaError("возможность «$perm» недоступна")
     }
 
+    // ---------- страницы настроек из Lua ----------
+
+    /** Ставит перерисовку страницы [entryId] (или всех, если null) в очередь потока Lua; несколько запросов подряд сливаются в один. */
     fun scheduleRender(entryId: String?) {
         if (stopped) return
         val ids = if (entryId == null) pages.keys.toList() else listOf(entryId)
@@ -885,6 +970,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         }
     }
 
+    /** Вызывает render() страницы и отдаёт результат интерфейсу. Ошибка в render() пишется в статус плагина, прежняя страница остаётся. */
     private fun renderPage(pid: String) {
         val def = pages[pid] ?: return
         var built: Pair<List<PluginUiNode>, Array<LuaValue?>>? = null
@@ -895,6 +981,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         luaMain.post { pl.uiPages[pid] = b.first }
     }
 
+    /** Ответ на диалог: вызывает колбэк кнопки (или on_dismiss) и перерисовывает страницы. */
     fun dialogEvent(key: Int, button: Int, input: String?) {
         val cbs = dialogCbs.remove(key) ?: return
         val cb = if (button >= 0) cbs.getOrNull(button) else cbs.lastOrNull()
@@ -904,6 +991,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         if (!stopped) scheduleRender(null)
     }
 
+    /** Шторку закрыли: вызывает on_close; одноразовая (ui.sheet) страница удаляется. */
     fun sheetClosed(entryId: String) {
         val def = pages[entryId] ?: return
         def.onClose?.let { cb -> guard("закрытие «$entryId»") { cb.call() } }
@@ -914,6 +1002,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         }
     }
 
+    /** Регистрирует страницу из таблицы-описания (ui.settings_page / ui.sheet). */
     private fun registerPage(d: LuaTable, transient: Boolean, fn: String): String {
         val pid = d.get("id").optjstring(if (transient) "sheet" else null)
             ?: throw LuaError("$fn: нужен id")
@@ -937,6 +1026,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         return pid
     }
 
+    /** Создаёт диалог; возвращает его номер или null, если слишком часто / слишком много открытых. */
     private fun openDialog(
         title: String, text: String, buttons: List<Triple<String, String, LuaValue?>>, dismiss: LuaValue?,
         input: Triple<String, String, Int>?, cancelable: Boolean,
@@ -956,6 +1046,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         return key
     }
 
+    /** Событие от интерфейса: вызывает on_change / on_click компонента и перерисовывает страницу. */
     fun uiEvent(entryId: String, index: Int, value: Any?) {
         val cb = pageCallbacks[entryId]?.getOrNull(index)
         if (cb != null) {
@@ -966,7 +1057,12 @@ private class LuaInst(val plugin: InstalledPlugin) {
         if (!stopped) scheduleRender(entryId)
     }
 
+    // ---------- окружение Lua ----------
+
     private fun buildGlobals() {
+        // Каждая библиотека LuaJ при загрузке регистрируется в package.loaded. PackageLib мы не подключаем (в нём файловый require,
+        // loadlib и пути поиска — песочнице это не нужно), поэтому на время загрузки даём пустую заглушку package, а потом убираем её.
+        // Без заглушки загрузка падала с «attempt to index ? (a nil value)» и ни один плагин не запускался.
         val pkgStub = LuaTable()
         pkgStub.set("loaded", LuaTable())
         g.set("package", pkgStub)
@@ -976,6 +1072,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         g.load(StringLib())
         g.load(JseMathLib())
         g.load(DebugLib())
+        // ОПАСНО: песочница отключена пользователем для этого плагина — даём luajava (Java-код из Lua).
         if (plugin.unsafeOn) {
             g.load(LuajavaLib())
             unsafeBuilt = true
@@ -985,6 +1082,8 @@ private class LuaInst(val plugin: InstalledPlugin) {
         LuaC.install(g)
         g.set("package", LuaValue.NIL)
 
+        // Ограничения на тяжёлые функции строк: шаблоны (ReDoS), огромные строки (память). Правим оригинальную таблицу —
+        // именно через неё работают вызовы вида ("x"):rep(n) — и уже потом копируем её плагину.
         val strLib = g.get("string").checktable()
         for (n in arrayOf("find", "match", "gmatch", "gsub")) {
             val orig = strLib.get(n)
@@ -994,6 +1093,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
                 orig.invoke(a)
             }
         }
+        // gsub: подстановка длиннее строки, умноженная на число замен, может раздуть результат (16 КБ × 1 МБ) — считаем потолок заранее.
         val origGsub = strLib.get("gsub")
         strLib.fn("gsub") { a ->
             val repl = a.arg(3)
@@ -1003,6 +1103,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
             }
             origGsub.invoke(a)
         }
+        // string.byte(s, 1, -1) на строке в мегабайт вернул бы миллион значений сразу.
         val origByte = strLib.get("byte")
         strLib.fn("byte") { a ->
             val len = a.arg(1).tojstring().length
@@ -1036,11 +1137,13 @@ private class LuaInst(val plugin: InstalledPlugin) {
             origFormat.invoke(a)
         }
 
+        // Своя копия таблицы string: метатаблица строк в LuaJ общая на всё приложение, чужие плагины до неё не должны дотягиваться.
         g.set("string", lxCloneTable(g.get("string").checktable()))
         val origGetmt = g.get("getmetatable")
         g.fn("getmetatable") { a -> if (a.arg(1).type() == LuaValue.TSTRING) LuaValue.NIL else origGetmt.invoke(a) }
         for (n in arrayOf("dofile", "loadfile", "load", "loadstring", "collectgarbage")) g.set(n, LuaValue.NIL)
 
+        // Лимит времени: хук на каждые LX_HOOK_STEP инструкций. После установки debug убирается из окружения.
         g.set("__hook", object : VarArgFunction() {
             override fun invoke(args: Varargs): Varargs {
                 if (System.nanoTime() > deadline) throw LuaTimeout("скрипт работает дольше ${LX_BUDGET_MS / 1000} с")
@@ -1048,6 +1151,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
                 return LuaValue.NONE
             }
         })
+        // Если хук по какой-то причине не поставился, плагин всё равно запускается: от зависания защищает сторож (lxWatchdogCheck).
         try {
             g.load("debug.sethook(__hook, '', $LX_HOOK_STEP)", "=sandbox").call()
         } catch (t: Throwable) {
@@ -1065,6 +1169,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
                         if (i > 1) sb.append('\t')
                         sb.append(args.arg(i).tojstring())
                     }
+                    // Переводы строк заменяем: плагин не должен подделывать чужие строки журнала.
                     AppLog.i("$LX_TAG/$id", sb.toString().map { if (it == '\n' || it == '\r') ' ' else it }.joinToString("").take(500))
                 }
                 return LuaValue.NONE
@@ -1103,6 +1208,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         }
         g.set("plugin", pl)
 
+        // os: только время и дата.
         val os = LuaTable()
         os.fn("time") { a ->
             if (a.istable(1)) {
@@ -1124,6 +1230,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         g.set("os", os)
     }
 
+    /** util: чистые вспомогательные функции без доступа к системе; вход ограничен [LX_MAX_UTIL], поэтому память и время не раздуть. */
     private fun installUtil() {
         val u = LuaTable()
         fun str(a: Varargs, i: Int, what: String): String {
@@ -1152,6 +1259,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
         u.fn("trim") { a -> lxStr(str(a, 1, "trim").trim()) }
         u.fn("starts_with") { a -> LuaValue.valueOf(str(a, 1, "starts_with").startsWith(str(a, 2, "starts_with"))) }
         u.fn("ends_with") { a -> LuaValue.valueOf(str(a, 1, "ends_with").endsWith(str(a, 2, "ends_with"))) }
+        // util.split(строка, разделитель [, максимум_частей]) — разделитель ищется как обычный текст, не шаблон.
         u.fn("split") { a ->
             val sep = str(a, 2, "split")
             if (sep.isEmpty()) throw LuaError("util.split: пустой разделитель")
@@ -1166,6 +1274,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
             val hi = a.checkdouble(3)
             LuaValue.valueOf(a.checkdouble(1).coerceIn(minOf(lo, hi), maxOf(lo, hi)))
         }
+        // util.format_duration(мс) → "3:07" или "1:02:03".
         u.fn("format_duration") { a ->
             val total = (a.checkdouble(1).coerceIn(0.0, 3.6e9) / 1000.0).toLong()
             val h = total / 3600
@@ -1199,11 +1308,14 @@ private class LuaInst(val plugin: InstalledPlugin) {
                 ?: throw LuaError("settings.get: в манифесте нет настройки «$k»")
             lxToLua(plugin.settingsCopy[k] ?: def.default)
         }
+        // settings.all() — таблица «ключ → текущее значение» для всех полей со значением.
         st.fn("all") {
             val t = LuaTable()
             for (d in plugin.manifest.settings) if (d.hasValue) t.set(d.key, lxToLua(plugin.settingsCopy[d.key] ?: d.default))
             t
         }
+        // settings.set(ключ, значение) — плагин сам меняет свою настройку (проверяется как ввод пользователя; событие
+        // setting_changed при этом не приходит, чтобы не зациклиться). Возвращает true, если значение принято.
         st.fn("set") { a ->
             val k = a.checkjstring(1)
             if (k.startsWith(PluginHooks.KEY_PREFIX)) throw LuaError("settings.set: хуки включает и выключает только пользователь")
@@ -1218,6 +1330,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
             }
             val nv = if (raw != null) PluginSystem.normalizeSetting(def, raw) else null
             if (nv != null) {
+                // Скрипт сразу видит новое значение (settings.get); интерфейс и сохранение — на главном потоке.
                 plugin.settingsCopy = HashMap(plugin.settingsCopy).apply { put(k, nv) }
                 post { PluginSystem.setSetting(plugin, k, nv, notify = false) }
             }
@@ -1278,17 +1391,20 @@ private class LuaInst(val plugin: InstalledPlugin) {
             return v
         }
         fun ret(k: Int?): Varargs = if (k == null) LuaValue.NIL else LuaValue.valueOf(k)
+        // ui.alert(заголовок, текст [, on_close]) — окно с кнопкой «Понятно». Возвращает номер окна или nil (слишком часто).
         ui.fn("alert") { a ->
             val cb = fnOrNil(a.arg(3), "ui.alert: on_close")
             ret(openDialog(lxClean(a.arg(1).tojstring(), 80), lxClean(a.arg(2).tojstring(), 600),
                 listOf(Triple("Понятно", "primary", cb)), cb, null, true))
         }
+        // ui.confirm(заголовок, текст, on_yes [, on_no]) — «Отмена» / «ОК». Закрытие без выбора — как «Отмена».
         ui.fn("confirm") { a ->
             val yes = fnOrNil(a.arg(3), "ui.confirm: on_yes")
             val no = fnOrNil(a.arg(4), "ui.confirm: on_no")
             ret(openDialog(lxClean(a.arg(1).tojstring(), 80), lxClean(a.arg(2).tojstring(), 600),
                 listOf(Triple("Отмена", "default", no), Triple("ОК", "primary", yes)), no, null, true))
         }
+        // ui.prompt(заголовок, текст, начальное_значение, on_submit [, on_cancel]) — окно с полем ввода; on_submit(текст).
         ui.fn("prompt") { a ->
             val ok = fnOrNil(a.arg(4), "ui.prompt: on_submit")
             val cancel = fnOrNil(a.arg(5), "ui.prompt: on_cancel")
@@ -1296,6 +1412,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
                 listOf(Triple("Отмена", "default", cancel), Triple("ОК", "primary", ok)), cancel,
                 Triple(a.arg(3).optjstring("").take(500), "", 500), true))
         }
+        // ui.dialog{ title, text, buttons = { {title, style, on_click} }, input = {value, hint, max_length}, cancelable, on_dismiss }
         ui.fn("dialog") { a ->
             val d = a.checktable(1)
             val bt = d.get("buttons")
@@ -1327,12 +1444,17 @@ private class LuaInst(val plugin: InstalledPlugin) {
             ret(openDialog(lxClean(d.get("title").optjstring(""), 80), lxClean(d.get("text").optjstring(""), 600), buttons,
                 fnOrNil(d.get("on_dismiss"), "ui.dialog: on_dismiss"), input, d.get("cancelable").optboolean(true)))
         }
+        // ui.settings_page{ id, title, summary, menu, render } — своя страница настроек. render() вызывается приложением,
+        // когда страницу открывают и после каждого действия пользователя; возвращает список компонентов (см. PLUGINS_LUA.md).
+        // Повторный вызов с тем же id обновляет название, подпись и render страницы.
         ui.fn("settings_page") { a -> registerPage(a.checktable(1), false, "ui.settings_page"); LuaValue.NONE }
+        // ui.sheet{ id, title, summary, render, on_close } — одноразовая нижняя модалка с такими же компонентами; открывается сразу.
         ui.fn("sheet") { a ->
             val pid = registerPage(a.checktable(1), true, "ui.sheet")
             post { PluginSystem.openSheet(plugin.id, pid) }
             LuaValue.valueOf(pid)
         }
+        // ui.open_page(id) — открыть свою страницу настроек нижней модалкой; ui.close_page([id]) — закрыть.
         ui.fn("open_page") { a ->
             val pid = a.checkjstring(1)
             if (pid !in pages) throw LuaError("ui.open_page: нет страницы «$pid»")
@@ -1345,7 +1467,9 @@ private class LuaInst(val plugin: InstalledPlugin) {
             post { PluginSystem.requestCloseSheet(plugin.id, pid) }
             LuaValue.NONE
         }
+        // ui.refresh([id]) — перерисовать страницу (или все свои), если данные изменились не из интерфейса.
         ui.fn("refresh") { a -> scheduleRender(a.optjstring(1, null)); LuaValue.NONE }
+        // ui.remove_page(id) — убрать страницу.
         ui.fn("remove_page") { a ->
             val pid = a.checkjstring(1)
             if (pages.remove(pid) != null) {
@@ -1398,6 +1522,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
             onMain { p().setPlaybackSpeed(v) }
             LuaValue.NONE
         }
+        // Очередь только для чтения: не больше LX_MAX_QUEUE_VIEW треков, начиная с текущего. Номера — с 1, как принято в Lua.
         pl.fn("queue") {
             val items = onMain {
                 val x = p()
@@ -1608,6 +1733,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
             }
         }
         if (plugin.unsafeOn) {
+            // Только при отключённой песочнице: объекты приложения для Java-кода плагина.
             ap.fn("context") { lxCtx?.let { CoerceJavaToLua.coerce(it) } ?: LuaValue.NIL }
             ap.fn("viewmodel") { a ->
                 val vm = luaOnMain(3000L) { lxBridge?.viewModel() }
@@ -1663,10 +1789,12 @@ private class LuaInst(val plugin: InstalledPlugin) {
             val l = handlers.getOrPut(name) { ArrayList() }
             if (l.size >= LX_MAX_HANDLERS) throw LuaError("$what: не больше $LX_MAX_HANDLERS обработчиков на событие")
             if (!once) { l.add(f); return }
+            // once: обёртка снимает сама себя перед вызовом; events.off находит её по исходной функции.
             l.add(LxOnce(f) { self -> handlers[name]?.remove(self) })
         }
         ev.fn("on") { a -> register("events.on", a, false); LuaValue.NONE }
         ev.fn("once") { a -> register("events.once", a, true); LuaValue.NONE }
+        // events.off(имя, функция) — снять обработчик; возвращает true, если он был.
         ev.fn("off") { a ->
             val name = a.checkjstring(1)
             val f = a.checkfunction(2)
@@ -1691,7 +1819,7 @@ private class LuaInst(val plugin: InstalledPlugin) {
                 val bytes = PluginSystem.readFile(plugin, "$path.lua", LX_MAX_SCRIPT)
                     ?: PluginSystem.readFile(plugin, "$path/init.lua", LX_MAX_SCRIPT)
                     ?: throw LuaError("require: модуль «$name» не найден в плагине")
-                modules[name] = LuaValue.TRUE
+                modules[name] = LuaValue.TRUE // защита от циклических require
                 val chunk = g.load(String(bytes, Charsets.UTF_8).removePrefix("\uFEFF"), "@$path.lua")
                 val r = chunk.call(LuaValue.valueOf(name))
                 val res: LuaValue = if (r.isnil()) LuaValue.TRUE else r

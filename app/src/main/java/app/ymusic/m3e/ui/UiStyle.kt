@@ -10,6 +10,10 @@ import androidx.compose.runtime.setValue
 import app.ymusic.m3e.R
 import org.json.JSONObject
 
+/**
+ * Блоки мини-плеера. Порядок в enum — порядок по умолчанию. «Предыдущий», «Следующий» и «Нравится» по умолчанию скрыты
+ * (см. [UiLayout.defaultHidden]) — их можно включить в редакторе интерфейса.
+ */
 internal enum class MiniBlock(override val title: String, override val hint: String) : LayoutBlock {
     Cover("Обложка", "Обложка играющего трека"),
     Info("Название и исполнитель", "Текст трека; занимает всё свободное место"),
@@ -19,6 +23,7 @@ internal enum class MiniBlock(override val title: String, override val hint: Str
     Like("Нравится", "Лайк трека (по умолчанию скрыта)"),
 }
 
+/** Части полного плеера. Порядок в enum — порядок по умолчанию (сверху вниз; в альбомной ориентации обложка слева или справа). */
 internal enum class PlayerPart(override val title: String, override val hint: String) : LayoutBlock {
     Cover("Обложка / текст песни", "Занимает всё свободное место"),
     Info("Название и исполнители", "Название трека, исполнители, альбом"),
@@ -28,9 +33,11 @@ internal enum class PlayerPart(override val title: String, override val hint: St
     Buttons("Нижний ряд кнопок", "Звук, ещё, повтор, текст, дизлайк, лайк — порядок на вкладке «Кнопки плеера»"),
 }
 
+/** Размер шрифта стиля, умноженный на [k] (если размер не задан — стиль без изменений). */
 internal fun androidx.compose.ui.text.TextStyle.scaled(k: Float): androidx.compose.ui.text.TextStyle =
     if (k == 1f || fontSize == androidx.compose.ui.unit.TextUnit.Unspecified) this else copy(fontSize = fontSize * k)
 
+/** Значки блоков, которых нет в основном списке [blockIcon]. */
 internal fun extraBlockIcon(b: Any): Int = when (b) {
     MiniBlock.Cover -> R.drawable.ms_music_note
     MiniBlock.Info -> R.drawable.ms_lyrics
@@ -47,51 +54,72 @@ internal fun extraBlockIcon(b: Any): Int = when (b) {
     else -> R.drawable.ms_music_note
 }
 
+/**
+ * Мелкие размеры и отступы дока, мини-плеера и полного плеера (SharedPreferences «ui_style»).
+ * Всё меняется в редакторе интерфейса; значения по умолчанию совпадают с прежним видом приложения.
+ */
 internal object UiStyle {
     private var prefs: SharedPreferences? = null
 
+    // ---- Док ----
+    /** Боковые поля островка, dp. */
     var dockSide by mutableIntStateOf(0)
         private set
 
+    /** Отступ дока от нижнего края, dp (было 10). */
     var dockBottom by mutableIntStateOf(10)
         private set
 
+    /** Положение островка: 0 — по центру, 1 — слева, 2 — справа. */
     var dockAlign by mutableIntStateOf(0)
         private set
 
+    /** Расстояние между вкладками островка, dp (было 4). */
     var dockSpacing by mutableIntStateOf(4)
         private set
 
+    /** Скругление капсулы, dp (было 32). */
     var dockCorner by mutableIntStateOf(32)
         private set
 
+    /** Горизонтальный отступ внутри вкладки, dp (было 14). */
     var dockPadH by mutableIntStateOf(14)
         private set
 
+    /** Вертикальный отступ внутри вкладки, dp (было 12). */
     var dockPadV by mutableIntStateOf(12)
         private set
 
+    /** Размер подписей вкладок. */
     var dockLabelScale by mutableFloatStateOf(1f)
         private set
 
+    /** Последняя вкладка — отдельной круглой кнопкой справа от капсулы (только в островке). */
     var dockDetachLast by mutableStateOf(false)
         private set
 
+    /** Расстояние между капсулой и отдельной кнопкой, dp. */
     var dockDetachGap by mutableIntStateOf(8)
         private set
 
+    // ---- Мини-плеер ----
     var miniZoom by mutableFloatStateOf(1f)
         private set
 
+    /** Скругление мини-плеера, dp; −1 — как раньше (зависит от «Островка»). */
     var miniCorner by mutableIntStateOf(-1)
         private set
 
+    /** Дополнительные боковые поля, dp. */
     var miniSide by mutableIntStateOf(0)
         private set
 
+    /** Дополнительный отступ снизу, dp. */
     var miniBottom by mutableIntStateOf(0)
         private set
 
+    // ---- Полный плеер ----
+    /** Боковые поля содержимого полного плеера, dp (было 20). */
     var playerSide by mutableIntStateOf(20)
         private set
 
@@ -138,6 +166,7 @@ internal object UiStyle {
     fun updateMiniBottom(v: Int) { miniBottom = v.coerceIn(0, 32); putInt("mini_bottom", miniBottom) }
     fun updatePlayerSide(v: Int) { playerSide = v.coerceIn(0, 48); putInt("player_side", playerSide) }
 
+    /** Мелкие размеры дока — по умолчанию (порядок вкладок и крупные размеры в [UiLayout] не трогаются). */
     fun resetDock() {
         val e = prefs?.edit() ?: return
         listOf("dock_side", "dock_bottom", "dock_align", "dock_spacing", "dock_corner", "dock_pad_h", "dock_pad_v",
@@ -158,6 +187,8 @@ internal object UiStyle {
         prefs?.let { load(it) }
     }
 
+    // ---- Выгрузка / загрузка в составе «Копии раскладки» ----
+
     fun exportInto(o: JSONObject) {
         prefs?.all?.forEach { (k, v) -> o.put("style_$k", v) }
     }
@@ -171,6 +202,7 @@ internal object UiStyle {
             if (!k.startsWith("style_")) continue
             val name = k.removePrefix("style_")
             val v = o.get(k)
+            // JSON пишет 1.0 как «1»: дробные настройки читаем как Number и сохраняем как Float.
             if (name in FLOAT_KEYS && v is Number) { e.putFloat(name, v.toFloat()); continue }
             when (v) {
                 is Boolean -> e.putBoolean(name, v)

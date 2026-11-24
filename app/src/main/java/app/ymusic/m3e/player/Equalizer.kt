@@ -10,6 +10,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlin.math.roundToInt
 
+/** Пресет эквалайзера: gains — усиление в дБ для 5 опорных частот (интерполируется под число полос устройства). */
 data class EqPreset(val id: String, val title: String, val gains: List<Float>?)
 
 object EqPresets {
@@ -39,6 +40,10 @@ data class EqState(
     val maxDb: Float = 15f,
 )
 
+/**
+ * Эквалайзер поверх ExoPlayer (android.media.audiofx.Equalizer на аудио-сессии плеера).
+ * Настройки хранятся в SharedPreferences и применяются при каждом создании сессии.
+ */
 class EqualizerController(context: Context, private val player: ExoPlayer) {
     private val prefs = context.getSharedPreferences("equalizer", Context.MODE_PRIVATE)
     private var effect: Equalizer? = null
@@ -147,6 +152,7 @@ class EqualizerController(context: Context, private val player: ExoPlayer) {
             .apply()
     }
 
+    /** Линейно растягивает/сжимает набор значений до n точек. */
     private fun resample(src: List<Float>, n: Int): List<Float> {
         if (n <= 0) return emptyList()
         if (src.isEmpty()) return List(n) { 0f }

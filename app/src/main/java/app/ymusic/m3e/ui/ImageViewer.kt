@@ -35,7 +35,6 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
@@ -65,6 +64,16 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/**
+ * Полноэкранное окно просмотра фото исполнителя / обложки альбома.
+ *
+ * Крестик — слева сверху, фото — посередине, «Скачать» — снизу. Если фото несколько
+ * (Яндекс Музыка отдаёт все фото исполнителя), их можно листать вправо-влево, а справа сверху
+ * показывается «открытое/все», например «2/7».
+ *
+ * @param images ссылки на картинки в большом размере; первая открывается сразу (см. [startIndex])
+ * @param fileName имя файла при сохранении (к нему добавляется номер, если фото несколько)
+ */
 @Composable
 fun ImageViewerDialog(
     images: List<String>,
@@ -94,6 +103,7 @@ fun ImageViewerDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
+        // Фон чёрный в любой теме, поэтому иконки статус-бара и панели навигации в этом окне — светлые.
         val view = LocalView.current
         SideEffect {
             val window = (view.parent as? DialogWindowProvider)?.window ?: (view as? DialogWindowProvider)?.window
@@ -104,6 +114,7 @@ fun ImageViewerDialog(
             }
         }
         Box(Modifier.fillMaxSize().background(Color.Black)) {
+            // Фото посередине; при нескольких — листается вправо-влево.
             HorizontalPager(
                 state = pager,
                 modifier = Modifier.fillMaxSize(),
@@ -112,6 +123,7 @@ fun ImageViewerDialog(
                 ViewerPage(images[page])
             }
 
+            // Верхняя строка: крестик слева, «открытое/все» справа (только если фото несколько).
             Row(
                 Modifier.fillMaxWidth().statusBarsPadding().padding(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -137,6 +149,7 @@ fun ImageViewerDialog(
                 }
             }
 
+            // Кнопка «Скачать» — внизу по центру.
             Button(
                 onClick = { doSave() },
                 enabled = !saving,
@@ -150,11 +163,13 @@ fun ImageViewerDialog(
                 Text(if (saving) "Сохранение…" else "Скачать")
             }
 
+            // Тост поверх фото (окно просмотра — отдельное окно, и тост из основного экрана здесь не виден).
             AppToastHost(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 92.dp))
         }
     }
 }
 
+/** Одна страница просмотра: фото по центру, пока грузится — индикатор. */
 @Composable
 private fun ViewerPage(url: String) {
     var loading by remember(url) { mutableStateOf(true) }
@@ -176,6 +191,7 @@ private fun ViewerPage(url: String) {
     }
 }
 
+/** Скачивает и сохраняет картинку в галерею, результат показывает тостом (работает, даже если окно уже закрыли). */
 suspend fun saveImageWithToast(app: Context, url: String, name: String) {
     withContext(Dispatchers.IO) {
         val r = ImageSaver.save(app, url, name)

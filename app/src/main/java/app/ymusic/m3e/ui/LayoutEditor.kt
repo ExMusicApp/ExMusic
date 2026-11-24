@@ -30,6 +30,10 @@ import androidx.compose.ui.zIndex
 import app.ymusic.m3e.R
 import kotlin.math.roundToInt
 
+/**
+ * Редактор интерфейса: порядок, видимость и размер блоков всех экранов, кнопки дока и плеера, размеры и весь «Внешний вид»
+ * в одном месте. Блоки переставляются перетаскиванием за «≡» слева или стрелками; нажатие на блок открывает его размер и отступ.
+ */
 private enum class EditorTab(val title: String) {
     Dock("Док"), Mini("Мини-плеер"), Player("Плеер"), Glass("Стекло"), Home("Главная"), Playlists("Плейлисты"), Profile("Профиль"),
     Sizes("Размеры"), Look("Вид"), Links("Ссылки"),
@@ -43,6 +47,14 @@ internal fun LayoutEditorPage(onBack: () -> Unit) {
     val tab = EditorTab.entries.firstOrNull { it.name == tabName } ?: EditorTab.Dock
     Column(Modifier.fillMaxSize()) {
         SubPageBar("Редактор интерфейса", onBack, subtitle = "Тяните «≡» или жмите стрелки; нажатие на блок — размер и отступы")
+        // Режим правки прямо на экране: плавающая кнопка на страницах; выбрали страницу, нажали кнопку, нажали элемент.
+        Box(Modifier.padding(horizontal = 16.dp)) {
+            GlowSwitchRow(
+                "Режим редактора на экране",
+                "На страницах появится плавающая кнопка-карандаш: нажмите её — подсветятся все кнопки страницы, мини-плеера и дока. Нажмите на нужную: растяните её за точки на рамке (как окно в Windows), зажмите и перетащите на другое место или скройте. Панель правки можно двигать и убирать в карандаш — правка при этом продолжает работать",
+                UiLayout.editMode,
+            ) { UiLayout.updateEditMode(it) }
+        }
         Row(
             Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -96,6 +108,7 @@ internal fun LayoutEditorPage(onBack: () -> Unit) {
                         style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(bottom = 8.dp),
                     )
+                    // Внутри редактора страница не добавляет своего отступа: у неё свой прокручиваемый столбец снаружи.
                     AppearanceContent()
                 }
                 EditorTab.Links -> LinksEditor()
@@ -104,6 +117,12 @@ internal fun LayoutEditorPage(onBack: () -> Unit) {
     }
 }
 
+// ---------- Перестановка ----------
+
+/**
+ * Список, строки которого переставляются перетаскиванием за ручку. Высота строки фиксирована ([ROW_H]): строка, протянутая
+ * на полвысоты, меняется местами с соседней, и палец продолжает вести её дальше.
+ */
 @Composable
 private fun <T> ReorderList(
     items: List<T>,
@@ -171,10 +190,14 @@ private fun ArrowButtons(index: Int, count: Int, onMove: (Int, Int) -> Unit) {
     }
 }
 
+// ---------- Блоки экранов ----------
+
 @Composable
 private fun <E> BlockEditor(
     screen: String, all: List<E>, description: String,
+    /** Имена блоков, у которых нет смысла менять размер (например, обложка, занимающая всё место). */
     noZoom: Set<String> = emptySet(),
+    /** Отступы сверху / снизу / по бокам; у кнопок нижнего ряда плеера они не применяются. */
     extras: Boolean = true,
 ) where E : Enum<E>, E : LayoutBlock {
     val ordered = UiLayout.order(screen, all)
@@ -194,7 +217,7 @@ private fun <E> BlockEditor(
             Spacer(Modifier.width(10.dp))
             Column(Modifier.weight(1f)) {
                 Text(
-                    b.title, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    b.label, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     fontWeight = if (selName == b.name) FontWeight.Bold else FontWeight.SemiBold,
                     color = if (hidden) MaterialTheme.colorScheme.outline else MaterialTheme.colorScheme.onSurface,
                 )
@@ -214,7 +237,7 @@ private fun <E> BlockEditor(
     } else {
         Surface(shape = containerShape(20), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
             Column(Modifier.fillMaxWidth().padding(16.dp)) {
-                Text(sel.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(sel.label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 val z = UiLayout.zoom(screen, sel)
                 if (sel.name !in noZoom) {
                     SliderRow("Размер блока: ${(z * 100).roundToInt()}%", z, UiLayout.MIN_ZOOM..UiLayout.MAX_ZOOM, 19) {
@@ -248,6 +271,8 @@ private fun SliderRow(label: String, value: Float, range: ClosedFloatingPointRan
         Slider(value = value.coerceIn(range.start, range.endInclusive), onValueChange = onChange, valueRange = range, steps = steps)
     }
 }
+
+// ---------- Док ----------
 
 @Composable
 private fun DockEditor() {
@@ -310,6 +335,7 @@ private fun DockEditor() {
         modifier = Modifier.padding(top = 8.dp),
     )
 
+    // Мелкие размеры и положение (для режима «Островок»).
     Text("Островок: положение и размеры", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 12.dp))
     GlowSwitchRow(
         "Последняя вкладка — отдельная кнопка",
@@ -341,6 +367,8 @@ private fun DockEditor() {
     }
 }
 
+// ---------- Мини-плеер ----------
+
 @Composable
 private fun MiniEditor() {
     BlockEditor(
@@ -365,6 +393,7 @@ private fun MiniEditor() {
     TextButton(onClick = { UiStyle.resetMini() }) { Text("Вернуть размер и вид мини-плеера") }
 }
 
+/** Уменьшенная копия дока: показывает порядок, подписи и размер. */
 @Composable
 private fun DockPreview(tabs: List<Tab>) {
     val mode = NavSettings.dockLabels
@@ -391,6 +420,8 @@ private fun DockPreview(tabs: List<Tab>) {
         }
     }
 }
+
+// ---------- Размеры ----------
 
 @Composable
 private fun SizesEditor() {
@@ -433,6 +464,8 @@ private fun SizesEditor() {
         )
     }
 }
+
+// ---------- Ссылки и резервная копия ----------
 
 @Composable
 private fun LinksEditor() {

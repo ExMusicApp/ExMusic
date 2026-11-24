@@ -15,10 +15,22 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.platform.LocalContext
 import app.ymusic.m3e.data.LocalMusic
 
+/**
+ * Запрос доступа к музыке на устройстве.
+ *
+ * Если пользователь уже дважды отказал, система больше не показывает диалог: запрос сразу возвращается как «отказано»
+ * (в журнале — «No requestable permission in the request»). Раньше кнопка «Разрешить доступ» в этом случае просто
+ * ничего не делала. Теперь, если по нажатию кнопки ответ пришёл мгновенно (человек не успел бы нажать в диалоге),
+ * открываются настройки приложения, где доступ можно включить вручную.
+ *
+ * Возвращает функцию запуска: аргумент `true` — запрос по нажатию кнопки (с переходом в настройки, если диалога нет),
+ * `false` — автоматический запрос при открытии экрана (в настройки сам не уводит).
+ */
 @Composable
 internal fun rememberAudioAccessRequest(onResult: (Boolean) -> Unit): (Boolean) -> Unit {
     val ctx = LocalContext.current
     val curResult by rememberUpdatedState(onResult)
+    // [0] — время запуска запроса, [1] — 1, если запрос начат по нажатию кнопки.
     val info = remember { LongArray(2) }
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         val quick = SystemClock.elapsedRealtime() - info[0] < NO_DIALOG_MS
@@ -34,6 +46,7 @@ internal fun rememberAudioAccessRequest(onResult: (Boolean) -> Unit): (Boolean) 
     }
 }
 
+/** Открывает настройки приложения с подсказкой, где включить доступ к музыке. */
 internal fun openAudioSettings(ctx: Context) {
     AppToast.show("Откройте «Разрешения» → «Музыка и аудио» и разрешите доступ", long = true)
     runCatching {
@@ -43,4 +56,5 @@ internal fun openAudioSettings(ctx: Context) {
     }
 }
 
+/** Ответ быстрее этого времени (мс) значит, что диалог не показывался: нажать в нём кнопку человек не успевает. */
 private const val NO_DIALOG_MS = 400L

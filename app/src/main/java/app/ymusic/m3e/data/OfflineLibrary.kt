@@ -6,16 +6,23 @@ import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors
 
+/** Сохранённые на устройстве списки аккаунта: «Любимое», плейлисты, их треки, альбомы коллекции и открытые альбомы. */
 data class OfflineSnapshot(
     val liked: List<Track> = emptyList(),
     val playlists: List<PlaylistInfo> = emptyList(),
     val playlistTracks: Map<String, List<Track>> = emptyMap(),
+    /** Открытые альбомы вместе с треками (ключ — id альбома). */
     val albums: Map<String, AlbumInfo> = emptyMap(),
+    /** Альбомы из коллекции аккаунта (без треков) — для раздела «Альбомы» без сети. */
     val likedAlbums: List<AlbumInfo> = emptyList(),
 ) {
     val isEmpty: Boolean get() = liked.isEmpty() && playlists.isEmpty() && likedAlbums.isEmpty()
 }
 
+/**
+ * Кэш списков для работы без интернета. Пишется при каждой успешной загрузке («Любимое», плейлисты, плейлист, альбом),
+ * читается, когда сети нет. Для каждого аккаунта свой файл. Сами песни лежат в [DownloadStore].
+ */
 class OfflineLibrary(private val ctx: Context) {
     private val io = Executors.newSingleThreadExecutor()
     private val memory = HashMap<String, OfflineSnapshot>()
@@ -56,6 +63,7 @@ class OfflineLibrary(private val ctx: Context) {
                 .put("playlists", JSONArray().also { a -> s.playlists.forEach { a.put(it.toJson()) } })
                 .put("playlistTracks", JSONObject().also { j -> s.playlistTracks.forEach { (k, v) -> j.put(k, v.toJsonArray()) } })
                 .put("albums", JSONObject().also { j -> s.albums.forEach { (k, v) -> j.put(k, v.toJson()) } })
+                // Альбомы коллекции — без треков, чтобы файл не раздувался.
                 .put("likedAlbums", JSONArray().also { a -> s.likedAlbums.forEach { a.put(it.copy(tracks = emptyList()).toJson()) } })
             val tmp = File(file(owner).path + ".tmp")
             tmp.writeText(o.toString())
@@ -63,6 +71,7 @@ class OfflineLibrary(private val ctx: Context) {
         }
     }
 
+    /** Сохраняет «Любимое» и плейлисты; [albums] == null — альбомы не менять (не удалось загрузить). */
     fun saveLibrary(owner: String, liked: List<Track>, playlists: List<PlaylistInfo>, albums: List<AlbumInfo>? = null) =
         update(owner) { it.copy(liked = liked, playlists = playlists, likedAlbums = albums ?: it.likedAlbums) }
 
@@ -83,6 +92,10 @@ class OfflineLibrary(private val ctx: Context) {
     }
 }
 
+/**
+ * Альбомы, собранные из скачанных треков: работают без сети и без кэша. Треки группируются по id альбома,
+ * внутри — в порядке скачивания.
+ */
 fun albumsFromDownloads(items: List<DownloadedTrack>): List<AlbumInfo> {
     val groups = LinkedHashMap<String, MutableList<Track>>()
     items.sortedByDescending { it.ts }.forEach { d ->
@@ -108,6 +121,7 @@ fun albumsFromDownloads(items: List<DownloadedTrack>): List<AlbumInfo> {
     }
 }
 
+/** Альбомы коллекции плюс альбомы из скачанного (без повторов): так раздел «Альбомы» полон и без сети. */
 fun mergeAlbums(liked: List<AlbumInfo>, downloaded: List<AlbumInfo>): List<AlbumInfo> {
     val seen = liked.mapTo(HashSet()) { it.id }
     return liked + downloaded.filter { it.id !in seen }

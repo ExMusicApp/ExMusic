@@ -16,19 +16,25 @@ import javax.crypto.spec.SecretKeySpec
 class YandexMusicApi(
     private val http: OkHttpClient,
     private val tokenProvider: () -> String?,
-) {
+) : MusicApi {
+    override val caps = ApiCaps()
+
     private val base = "https://api.music.yandex.net"
     private val FILE_INFO_SIGN_KEY = "kzqU4XhfCaY6B6JTHODeq5"
     private val LYRICS_SIGN_KEY = "p93jhgh689SBReK6ghtw62"
     private val DESKTOP_CLIENT = "YandexMusicDesktopAppWindows/5.95.0"
 
-    @Volatile var plusConfirmedByStream: Boolean = false
+    /** true, если get-file-info реально отдал полный/качественный поток — значит Плюс у аккаунта есть. */
+    @Volatile override var plusConfirmedByStream: Boolean = false
 
+    /** Когда get-file-info последний раз ответил 403 (чтобы не долбить сервер перед каждым треком). */
     @Volatile private var fileInfoDeniedAt: Long = 0L
 
-    @Volatile var highQuality: () -> Boolean = { true }
+    /** Сбрасывает состояние, привязанное к аккаунту (при переключении аккаунта). */
+    /** Высокое качество звука включено? Читается при каждом запросе потока, поэтому переключатель действует сразу. */
+    @Volatile override var highQuality: () -> Boolean = { true }
 
-    fun resetSession() {
+    override fun resetSession() {
         plusConfirmedByStream = false
         fileInfoDeniedAt = 0L
     }
@@ -57,6 +63,7 @@ class YandexMusicApi(
         }
     }
 
+    /** Профиль с login.yandex.ru: запасной источник uid/логина/имени, если /account/status их не вернул. */
     private fun passportInfo(): JSONObject? = runCatching {
         val token = tokenProvider() ?: return@runCatching null
         val req = Request.Builder().url("https://login.yandex.ru/info?format=json")
@@ -66,20 +73,29 @@ class YandexMusicApi(
         }
     }.getOrNull()
 
-    fun account(): Account {
+    override fun account(): Account {
+        // 403 от music-accounts не фатален: uid/логин/имя возьмём из паспорта ниже.
         val acc = try {
             request("/account/status").getJSONObject("result")
         } catch (e: Exception) {
             if (e.message?.contains("HTTP 403") == true) JSONObject() else throw e
         }
         val a = acc.optJSONObject("account") ?: JSONObject()
-        val plus = detectPlus(acc) || plusConfirmedByStream
+        // Только /account/status: поток (lossless/битрейт) о Плюсе не говорит — get-file-info отдаёт его и без подписки.
+        val plus = detectPlus(acc)
+        runCatching {
+            val sub = acc.optJSONObject("subscription")
+            app.ymusic.m3e.data.AppLog.i("Plus", "account/status: hasPlus=$plus, ключи=${acc.keys().asSequence().toList()}, " +
+                "plus=${acc.optJSONObject("plus")}, subscription=${sub?.toString()?.take(300)}, permissions=${acc.optJSONObject("permissions")?.toString()?.take(200)}")
+        }
 
         var uid = a.optLong("uid", 0L)
         var login = a.optString("login")
         var name = a.optString("fullName").ifBlank { a.optString("displayName") }
 
+        // Паспорт нужен и для аватара, и как запасной источник uid/логина/имени.
         val passport = passportInfo()
+        // Для некоторых токенов Яндекс не отдаёт uid в /account/status — берём из паспорта.
         if (uid == 0L || login.isBlank() || name.isBlank()) {
             val p = passport
             if (p != null) {
@@ -88,6 +104,8 @@ class YandexMusicApi(
                 if (name.isBlank()) name = p.optString("real_name").ifBlank { p.optString("display_name") }
             }
         }
+        // Если пользователя определить не удалось (токен без прав на профиль) — не блокируем вход:
+        // поиск, страницы артистов и воспроизведение работают без uid.
 
         val avatarUrl = passport?.let { p0 ->
             val id = p0.optString("default_avatar_id")
@@ -98,6 +116,7 @@ class YandexMusicApi(
         return Account(uid = uid, login = login, name = name, hasPlus = plus, avatarUrl = avatarUrl)
     }
 
+    /** Плюс может быть отмечен по-разному в зависимости от токена/версии API — проверяем все известные признаки. */
     private fun detectPlus(acc: JSONObject): Boolean {
         val plusObj = acc.optJSONObject("plus")
         if (plusObj?.optBoolean("hasPlus") == true) return true
@@ -115,6 +134,7 @@ class YandexMusicApi(
             if (sub.optJSONObject("family") != null) return true
         }
 
+        // Права токена: у подписчиков там есть расширенные пермишены.
         val perms = acc.optJSONObject("permissions")?.optJSONArray("values")
         if (perms != null) {
             for (i in 0 until perms.length()) {
@@ -125,7 +145,8 @@ class YandexMusicApi(
         return false
     }
 
-    fun likedTracks(uid: String, limit: Int = Int.MAX_VALUE): List<Track> {
+    /** Лайкнутые треки: сначала список id, затем подробности пачкой. */
+    override fun likedTracks(uid: String, limit: Int): List<Track> {
         val ids = request("/users/$uid/likes/tracks")
             .getJSONObject("result").getJSONObject("library").getJSONArray("tracks")
         val keys = (0 until minOf(ids.length(), limit)).map {
@@ -136,7 +157,7 @@ class YandexMusicApi(
         return tracksByIds(keys)
     }
 
-    fun tracksByIds(keys: List<String>): List<Track> {
+    override fun tracksByIds(keys: List<String>): List<Track> {
         if (keys.isEmpty()) return emptyList()
         val out = mutableListOf<Track>()
         keys.chunked(100).forEach { chunk ->
@@ -147,7 +168,7 @@ class YandexMusicApi(
         return out
     }
 
-    fun playlists(uid: String): List<PlaylistInfo> {
+    override fun playlists(uid: String): List<PlaylistInfo> {
         val arr = request("/users/$uid/playlists/list").getJSONArray("result")
         return (0 until arr.length()).map { parsePlaylist(arr.getJSONObject(it), uid) }
     }
@@ -162,25 +183,28 @@ class YandexMusicApi(
         ownerLogin = p.optJSONObject("owner")?.optString("login")?.takeIf { s -> s.isNotBlank() && s != "null" },
     )
 
-    fun playlistInfo(ownerUid: String, kind: Int): PlaylistInfo {
+    /** Сведения о плейлисте (название, владелец, видимость): нужны, когда плейлист открывают по ссылке. */
+    override fun playlistInfo(ownerUid: String, kind: Int): PlaylistInfo {
         val res = request("/users/$ownerUid/playlists/$kind").getJSONObject("result")
         return parsePlaylist(res, ownerUid)
     }
 
-    fun playlistInfoByUuid(uuid: String): PlaylistInfo {
+    /** Плейлист по новой ссылке /playlists/<uuid>: сервер сам отдаёт владельца и номер. */
+    override fun playlistInfoByUuid(uuid: String): PlaylistInfo {
         val res = request("/playlist/$uuid").getJSONObject("result")
         val owner = res.optJSONObject("owner")?.optString("uid").orEmpty()
         return parsePlaylist(res, owner)
     }
 
-    fun setPlaylistVisibility(ownerUid: String, kind: Int, isPublic: Boolean) {
+    /** Приватный / публичный плейлист (как в Яндекс Музыке): по ссылке открываются только публичные. */
+    override fun setPlaylistVisibility(ownerUid: String, kind: Int, isPublic: Boolean) {
         request(
             "/users/$ownerUid/playlists/$kind/visibility",
             mapOf("value" to if (isPublic) "public" else "private"),
         )
     }
 
-    fun playlistTracks(ownerUid: String, kind: Int): List<Track> {
+    override fun playlistTracks(ownerUid: String, kind: Int): List<Track> {
         val res = request("/users/$ownerUid/playlists/$kind").getJSONObject("result")
         val tracks = res.optJSONArray("tracks") ?: return emptyList()
         val keys = (0 until tracks.length()).map {
@@ -194,8 +218,11 @@ class YandexMusicApi(
         return tracksByIds(keys)
     }
 
+    // ---- Редактирование плейлистов ----
+
     private class PlaylistSnapshot(val revision: Int, val ids: List<String>)
 
+    /** Свежая ревизия и «сырой» список id треков (включая недоступные) — нужны для изменения плейлиста. */
     private fun playlistSnapshot(ownerUid: String, kind: Int): PlaylistSnapshot {
         val res = request("/users/$ownerUid/playlists/$kind").getJSONObject("result")
         val arr = res.optJSONArray("tracks") ?: JSONArray()
@@ -214,7 +241,7 @@ class YandexMusicApi(
         )
     }
 
-    fun createPlaylist(uid: String, title: String, isPublic: Boolean): PlaylistInfo {
+    override fun createPlaylist(uid: String, title: String, isPublic: Boolean): PlaylistInfo {
         val res = request(
             "/users/$uid/playlists/create",
             mapOf("title" to title, "visibility" to if (isPublic) "public" else "private"),
@@ -222,15 +249,15 @@ class YandexMusicApi(
         return parsePlaylist(res, uid)
     }
 
-    fun renamePlaylist(ownerUid: String, kind: Int, title: String) {
+    override fun renamePlaylist(ownerUid: String, kind: Int, title: String) {
         request("/users/$ownerUid/playlists/$kind/name", mapOf("value" to title))
     }
 
-    fun deletePlaylist(ownerUid: String, kind: Int) {
+    override fun deletePlaylist(ownerUid: String, kind: Int) {
         request("/users/$ownerUid/playlists/$kind/delete", emptyMap())
     }
 
-    fun addTrackToPlaylist(ownerUid: String, kind: Int, track: Track) {
+    override fun addTrackToPlaylist(ownerUid: String, kind: Int, track: Track) {
         val snap = playlistSnapshot(ownerUid, kind)
         if (snap.ids.contains(track.id)) error("Этот трек уже есть в плейлисте")
         val item = JSONObject().put("id", track.id)
@@ -241,7 +268,7 @@ class YandexMusicApi(
         changePlaylist(ownerUid, kind, snap.revision, diff)
     }
 
-    fun removeTrackFromPlaylist(ownerUid: String, kind: Int, track: Track) {
+    override fun removeTrackFromPlaylist(ownerUid: String, kind: Int, track: Track) {
         val snap = playlistSnapshot(ownerUid, kind)
         val index = snap.ids.indexOf(track.id)
         if (index < 0) error("Трек не найден в плейлисте")
@@ -249,35 +276,43 @@ class YandexMusicApi(
         changePlaylist(ownerUid, kind, snap.revision, diff)
     }
 
+    // ---- Лайки и дизлайки ----
+
     private fun trackKey(t: Track): String = if (!t.albumId.isNullOrBlank()) "${t.id}:${t.albumId}" else t.id
 
-    fun likeTrack(uid: String, t: Track) {
+    override fun likeTrack(uid: String, t: Track) {
         request("/users/$uid/likes/tracks/add-multiple", mapOf("track-ids" to trackKey(t)))
     }
 
-    fun unlikeTrack(uid: String, t: Track) {
+    override fun unlikeTrack(uid: String, t: Track) {
         request("/users/$uid/likes/tracks/remove", mapOf("track-ids" to trackKey(t)))
     }
 
-    fun dislikeTrack(uid: String, t: Track) {
+    override fun dislikeTrack(uid: String, t: Track) {
         request("/users/$uid/dislikes/tracks/add-multiple", mapOf("track-ids" to trackKey(t)))
     }
 
-    fun undislikeTrack(uid: String, t: Track) {
+    override fun undislikeTrack(uid: String, t: Track) {
         request("/users/$uid/dislikes/tracks/remove", mapOf("track-ids" to trackKey(t)))
     }
 
-    fun dislikedTrackIds(uid: String): Set<String> {
+    /** id треков, отмеченных «не нравится». */
+    override fun dislikedTrackIds(uid: String): Set<String> {
         val arr = request("/users/$uid/dislikes/tracks")
             .getJSONObject("result").getJSONObject("library").optJSONArray("tracks") ?: return emptySet()
         return (0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.opt("id")?.toString() }.toSet()
     }
 
-    class WaveBatch(val tracks: List<Track>, val batchId: String?)
+    // ---- Моя волна ----
 
     private val waveStation = "user:onyourwave"
 
-    fun waveTracks(afterTrackId: String? = null, station: String = waveStation): WaveBatch {
+    /**
+     * Очередная порция треков волны; afterTrackId — последний трек очереди (продолжение).
+     * [station] — станция: по умолчанию «Моя волна» (user:onyourwave), либо волна по треку / исполнителю / альбому /
+     * плейлисту: track:<id>, artist:<id>, album:<id>, playlist:<владелец>_<kind>.
+     */
+    override fun waveTracks(afterTrackId: String?, station: String): WaveBatch {
         val q = if (afterTrackId != null) "&queue=${URLEncoder.encode(afterTrackId, "UTF-8")}" else ""
         val res = request("/rotor/station/$station/tracks?settings2=true$q").getJSONObject("result")
         val seq = res.optJSONArray("sequence") ?: JSONArray()
@@ -286,7 +321,7 @@ class YandexMusicApi(
         return WaveBatch(parseTracks(arr), res.optString("batchId").takeIf { it.isNotBlank() })
     }
 
-    fun waveSettings(): WaveSettings {
+    override fun waveSettings(): WaveSettings {
         val arr = request("/rotor/station/$waveStation/info").optJSONArray("result")
         val s = arr?.optJSONObject(0)?.optJSONObject("settings2") ?: return WaveSettings()
         return WaveSettings(
@@ -296,17 +331,19 @@ class YandexMusicApi(
         )
     }
 
-    fun saveWaveSettings(s: WaveSettings) {
+    override fun saveWaveSettings(s: WaveSettings) {
         val path = "/rotor/station/$waveStation/settings2"
         val form = mapOf("moodEnergy" to s.moodEnergy, "diversity" to s.diversity, "language" to s.language)
         try {
             request(path, form)
         } catch (e: Exception) {
+            // Запасной вариант: некоторые версии API ждут JSON вместо формы.
             request(path, jsonBody = JSONObject(form).toString())
         }
     }
 
-    fun waveTrackStarted(trackId: String, batchId: String?, station: String = waveStation) {
+    /** Сообщает волне, что трек начал играть (улучшает рекомендации, не критично при ошибке). */
+    override fun waveTrackStarted(trackId: String, batchId: String?, station: String) {
         val body = JSONObject()
             .put("type", "trackStarted")
             .put("timestamp", java.time.Instant.now().toString())
@@ -315,7 +352,8 @@ class YandexMusicApi(
         request("/rotor/station/$station/feedback$q", jsonBody = body.toString())
     }
 
-    fun waveStarted(station: String) {
+    /** Сообщает станции, что её включили (для волны по треку / исполнителю / альбому / плейлисту). Ошибка не критична. */
+    override fun waveStarted(station: String) {
         val body = JSONObject()
             .put("type", "radioStarted")
             .put("timestamp", java.time.Instant.now().toString())
@@ -323,29 +361,37 @@ class YandexMusicApi(
         request("/rotor/station/$station/feedback", jsonBody = body.toString())
     }
 
-    fun search(query: String): List<Track> {
+    override fun search(query: String): List<Track> {
         val q = URLEncoder.encode(query, "UTF-8")
         val res = request("/search?text=$q&type=track&page=0").getJSONObject("result")
         val arr = res.optJSONObject("tracks")?.optJSONArray("results") ?: return emptyList()
         return parseTracks(arr)
     }
 
-    fun streamUrl(trackId: String): String =
+    /**
+     * Прямая ссылка на аудиопоток. Сначала новый get-file-info (HMAC-подпись, transports=raw) —
+     * он отдаёт полный трек для аккаунта с Плюсом; если не вышло, откатываемся на старый download-info.
+     */
+    override fun streamUrl(trackId: String): String =
         fileInfoStreamUrl(trackId) ?: legacyStreamUrl(trackId)
 
-    fun downloadUrl(trackId: String): String =
+    /** Ссылка для скачивания: предпочитаем mp3 (download-info), иначе обычный поток. */
+    override fun downloadUrl(trackId: String): String =
         try { legacyStreamUrl(trackId) } catch (e: Exception) { fileInfoStreamUrl(trackId) ?: throw e }
 
     private fun fileInfoStreamUrl(trackId: String): String? {
+        // После 403 не пробуем get-file-info несколько минут — сразу идём в download-info.
         if (System.currentTimeMillis() - fileInfoDeniedAt < 5 * 60_000L) {
             return null
         }
+        // Лесенка: если на lossless сервер отвечает not-allowed, пробуем более низкие качества.
         val attempts = if (highQuality()) listOf(
             "lossless" to listOf("flac", "aac", "he-aac", "mp3"),
             "hq" to listOf("aac", "he-aac", "mp3"),
             "nq" to listOf("aac", "he-aac", "mp3"),
             "nq" to listOf("mp3"),
         ) else listOf(
+            // Экономный режим: сразу обычное качество, без lossless/hq.
             "nq" to listOf("aac", "he-aac", "mp3"),
             "nq" to listOf("mp3"),
         )
@@ -373,16 +419,17 @@ class YandexMusicApi(
         val q = "ts=$ts&trackId=${URLEncoder.encode(trackId, "UTF-8")}&quality=$quality" +
             "&codecs=${URLEncoder.encode(codecs.joinToString(","), "UTF-8")}" +
             "&transports=$transports&sign=${URLEncoder.encode(sign, "UTF-8")}"
+        // Ключ подписи привязан к заголовку десктопного клиента — иначе сервер отвечает 403.
         val info = request("/get-file-info?$q", extraHeaders = mapOf("X-Yandex-Music-Client" to DESKTOP_CLIENT))
             .getJSONObject("result").getJSONObject("downloadInfo")
         val codec = info.optString("codec")
         val bitrate = info.optInt("bitrate")
-        if (!info.has("trialType") && (codec == "flac" || bitrate >= 192)) plusConfirmedByStream = true
         if (info.optString("transport", "raw") != "raw") return null
         return info.optString("url").takeIf { it.isNotBlank() }
             ?: info.optJSONArray("urls")?.optString(0)?.takeIf { it.isNotBlank() }
     }
 
+    /** Прямая ссылка на аудиопоток через классический download-info + MD5-подпись. */
     private fun legacyStreamUrl(trackId: String): String {
         val list = request("/tracks/$trackId/download-info").getJSONArray("result")
         var bestUrl: String? = null
@@ -393,9 +440,11 @@ class YandexMusicApi(
             val item = list.getJSONObject(i)
             val codec = item.optString("codec")
             val bitrate = item.optInt("bitrateInKbps", 0)
-            if (item.optBoolean("preview", false)) continue
+            if (item.optBoolean("preview", false)) continue // пропускаем 30-секундные превью
             if (codec != "mp3" && codec != "aac") continue
             val isMp3 = codec == "mp3"
+            // mp3 предпочтительнее aac. Высокое качество — наибольший битрейт; экономный режим — наибольший
+            // не выше 128 кбит/с (а если таких нет, то наименьший из доступных).
             val better = if (highQuality()) {
                 bestUrl == null || (isMp3 && !bestIsMp3) || (isMp3 == bestIsMp3 && bitrate > bestBitrate)
             } else {
@@ -447,7 +496,8 @@ class YandexMusicApi(
         return out
     }
 
-    fun artist(id: String): ArtistInfo {
+    /** Страница артиста: имя, обложка и популярные треки. */
+    override fun artist(id: String): ArtistInfo {
         val res = request("/artists/$id/brief-info").getJSONObject("result")
         val a = res.optJSONObject("artist") ?: JSONObject()
         var tracks = res.optJSONArray("popularTracks")?.let { parseTracks(it) }.orEmpty()
@@ -459,9 +509,25 @@ class YandexMusicApi(
             tracks = tracks,
             albums = runCatching { artistAlbums(id) }.getOrDefault(emptyList()),
             allCovers = artistAllCovers(res, a),
+            monthlyListeners = (res.optJSONObject("stats") ?: a.optJSONObject("stats"))?.optLong("lastMonthListeners", 0L) ?: 0L,
+            description = artistDescription(res, a),
         )
     }
 
+    /** Описание исполнителя: объект {text, uri} или строка в artist.description, иначе рукописное описание или поле верхнего уровня. */
+    private fun artistDescription(res: JSONObject, a: JSONObject): String {
+        fun read(v: Any?): String = when (v) {
+            is JSONObject -> v.optString("text")
+            is String -> v
+            else -> ""
+        }.trim().takeIf { it != "null" }.orEmpty()
+        return listOf(
+            a.opt("description"), a.opt("handMadeDescription"), a.opt("hand_made_description"),
+            res.opt("description"), res.opt("handMadeDescription"),
+        ).map { read(it) }.firstOrNull { it.isNotBlank() }.orEmpty()
+    }
+
+    /** Все фото исполнителя: основное первым, затем allCovers из brief-info (без повторов). */
     private fun artistAllCovers(res: JSONObject, a: JSONObject): List<String> {
         val out = LinkedHashSet<String>()
         artistCoverUri(a)?.let { out += it }
@@ -478,6 +544,8 @@ class YandexMusicApi(
         }
         return out.toList()
     }
+
+    // ---- Альбомы ----
 
     private fun parseAlbum(a: JSONObject): AlbumInfo {
         val artists = a.optJSONArray("artists")?.let { arr ->
@@ -499,7 +567,8 @@ class YandexMusicApi(
         arr.optJSONObject(it)?.let { o -> parseAlbum(o) }?.takeIf { a -> a.id.isNotBlank() && a.id != "null" }
     }
 
-    fun album(id: String): AlbumInfo {
+    /** Альбом с треками (все диски подряд). */
+    override fun album(id: String): AlbumInfo {
         val res = request("/albums/$id/with-tracks").getJSONObject("result")
         val base = parseAlbum(res).let { if (it.id.isBlank() || it.id == "null") it.copy(id = id) else it }
         val vols = res.optJSONArray("volumes")
@@ -514,7 +583,8 @@ class YandexMusicApi(
         return base.copy(tracks = tracks, trackCount = if (base.trackCount > 0) base.trackCount else tracks.size)
     }
 
-    fun artistRecentAlbums(id: String): List<AlbumInfo> =
+    /** Альбомы артиста для «Новинок»: свежие первыми (по дате выхода, а если её нет — по году). */
+    override fun artistRecentAlbums(id: String): List<AlbumInfo> =
         artistAlbums(id).sortedByDescending { it.sortDate }
 
     private fun artistAlbums(id: String): List<AlbumInfo> {
@@ -523,7 +593,11 @@ class YandexMusicApi(
         return parseAlbums(arr).sortedByDescending { it.year }
     }
 
-    fun likedAlbums(uid: String): List<AlbumInfo> {
+    /**
+     * Альбомы, добавленные в «Мою коллекцию» (лайкнутые). Запрос с rich=true отдаёт альбом целиком; если сервер
+     * вернул только id, подробности добираются пачкой.
+     */
+    override fun likedAlbums(uid: String): List<AlbumInfo> {
         val arr = request("/users/$uid/likes/albums?rich=true").optJSONArray("result") ?: return emptyList()
         val out = ArrayList<AlbumInfo>()
         val idsOnly = ArrayList<String>()
@@ -546,29 +620,35 @@ class YandexMusicApi(
         return out.distinctBy { it.id }
     }
 
-    fun likeAlbum(uid: String, albumId: String) {
+    /** Добавить альбом в «Мою коллекцию» (лайк альбома). */
+    override fun likeAlbum(uid: String, albumId: String) {
         request("/users/$uid/likes/albums/add-multiple", mapOf("album-ids" to albumId))
     }
 
-    fun unlikeAlbum(uid: String, albumId: String) {
+    /** Убрать альбом из коллекции (снять лайк). */
+    override fun unlikeAlbum(uid: String, albumId: String) {
         request("/users/$uid/likes/albums/remove", mapOf("album-ids" to albumId))
     }
 
-    fun searchAlbums(query: String): List<AlbumInfo> {
+    override fun searchAlbums(query: String): List<AlbumInfo> {
         val q = URLEncoder.encode(query, "UTF-8")
         val res = request("/search?text=$q&type=album&page=0").getJSONObject("result")
         val arr = res.optJSONObject("albums")?.optJSONArray("results") ?: return emptyList()
         return parseAlbums(arr)
     }
 
-    fun searchPodcasts(query: String): List<AlbumInfo> {
+    // ---- Подкасты ----
+
+    /** Подкаст в API — это «альбом» с метой podcast: открывается тем же экраном, эпизоды — его треки. */
+    override fun searchPodcasts(query: String): List<AlbumInfo> {
         val q = URLEncoder.encode(query, "UTF-8")
         val res = request("/search?text=$q&type=podcast&page=0").getJSONObject("result")
         val arr = res.optJSONObject("podcasts")?.optJSONArray("results") ?: return emptyList()
         return parseAlbums(arr)
     }
 
-    fun podcastsLanding(): List<AlbumInfo> {
+    /** Подборка подкастов для страницы «Подкасты» (лендинг; если он недоступен — пусто, тогда вызывающий ищет сам). */
+    override fun podcastsLanding(): List<AlbumInfo> {
         val res = request("/landing3/podcasts").getJSONObject("result")
         val out = LinkedHashMap<String, AlbumInfo>()
         fun walk(n: Any?) {
@@ -589,19 +669,33 @@ class YandexMusicApi(
         return out.values.toList()
     }
 
-    fun chart(): List<Track> {
+    // ---- Чарт ----
+
+    /** Чарт Яндекс Музыки: треки в порядке позиций. */
+    override fun chart(): List<Track> {
         val res = request("/landing3/chart").getJSONObject("result")
         val src = res.optJSONObject("chart")?.optJSONArray("tracks")
             ?: res.optJSONArray("tracks") ?: return emptyList()
         val arr = JSONArray()
         for (i in 0 until src.length()) {
             val o = src.optJSONObject(i) ?: continue
+            // Элемент чарта: {id, track:{…}, chart:{position…}}; иногда сразу трек.
             arr.put(o.optJSONObject("track") ?: o)
         }
         return parseTracks(arr)
     }
 
-    fun trackLyrics(trackId: String, synced: Boolean): String? {
+    // ---- История прослушивания (синхронизируется с аккаунтом: видны треки с других устройств) ----
+
+    /**
+     * История прослушанного с сервера (новые — первыми). Структура ответа у /music-history вложенная и меняется,
+     * поэтому обходим JSON целиком: полные модели треков берём как есть, а где есть только id — догружаем пачкой.
+     */
+    /**
+     * Текст трека из Яндекс Музыки. [synced] = true — формат LRC с таймкодами, иначе обычный текст.
+     * null — текста нет (или нет доступа). Запрос подписывается так же, как в приложении Яндекс Музыки.
+     */
+    override fun trackLyrics(trackId: String, synced: Boolean): String? {
         val ts = System.currentTimeMillis() / 1000
         val mac = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(LYRICS_SIGN_KEY.toByteArray(), "HmacSHA256")) }
         val sign = Base64.getEncoder().encodeToString(mac.doFinal("$trackId$ts".toByteArray()))
@@ -614,20 +708,19 @@ class YandexMusicApi(
         }
     }
 
-    class RemoteHistory(val tracks: List<Track>, val waveTracks: List<Track>)
+    override fun musicHistory(limit: Int): List<Track> = musicHistoryFull(limit).tracks
 
-    fun musicHistory(limit: Int = 60): List<Track> = musicHistoryFull(limit).tracks
-
+    /** Относится ли «контекст» прослушивания к «Моей волне» (радио user:onyourwave). */
     private fun isWaveContext(ctx: JSONObject): Boolean {
         val s = ctx.toString().lowercase()
         return s.contains("onyourwave") || s.contains("моя волна") || s.contains("my wave") || s.contains("my-wave")
     }
 
-    fun musicHistoryFull(limit: Int = 60): RemoteHistory {
+    override fun musicHistoryFull(limit: Int): RemoteHistory {
         val res = request("/music-history?full_models_count=$limit").opt("result")
-        val order = LinkedHashMap<String, Track?>()
-        val keys = HashMap<String, String>()
-        val waveIds = LinkedHashSet<String>()
+        val order = LinkedHashMap<String, Track?>()   // id -> трек (null — только id)
+        val keys = HashMap<String, String>()          // id -> "id:albumId" для догрузки
+        val waveIds = LinkedHashSet<String>()         // id треков, игравших в «Моей волне»
         fun walk(n: Any?, inWave: Boolean) {
             if (order.size >= limit * 2) return
             when (n) {
@@ -669,7 +762,8 @@ class YandexMusicApi(
         return parseTracks(arr)
     }
 
-    fun artistAllTracks(id: String): List<Track> {
+    /** Все треки исполнителя: страницы по 50, пока сервер отдаёт новые (не больше 40 страниц). */
+    override fun artistAllTracks(id: String): List<Track> {
         val out = LinkedHashMap<String, Track>()
         var page = 0
         while (page < 40) {
@@ -686,7 +780,7 @@ class YandexMusicApi(
         return out.values.toList()
     }
 
-    fun searchArtists(query: String): List<ArtistInfo> {
+    override fun searchArtists(query: String): List<ArtistInfo> {
         val q = URLEncoder.encode(query, "UTF-8")
         val res = request("/search?text=$q&type=artist&page=0").getJSONObject("result")
         val arr = res.optJSONObject("artists")?.optJSONArray("results") ?: return emptyList()
@@ -699,6 +793,7 @@ class YandexMusicApi(
         return out
     }
 
+    /** Обложка плейлиста: своя (uri), либо первая картинка «мозаики» (itemsUri), либо ogImage. */
     private fun playlistCoverUri(p: JSONObject): String? {
         val c = p.optJSONObject("cover")
         c?.optString("uri")?.takeIf { it.isNotBlank() }?.let { return it }
@@ -715,6 +810,7 @@ class YandexMusicApi(
 
     private fun parseTracks(arr: JSONArray): List<Track> = (0 until arr.length()).mapNotNull {
         val t = arr.optJSONObject(it) ?: return@mapNotNull null
+        // Для аккаунта с Плюсом трек, доступный только премиум-пользователям, тоже годится.
         if (!t.optBoolean("available", true) && !t.optBoolean("availableForPremiumUsers", false)) return@mapNotNull null
         val artists = t.optJSONArray("artists")?.let { a ->
             (0 until a.length()).joinToString(", ") { i -> a.getJSONObject(i).optString("name") }
@@ -739,6 +835,7 @@ class YandexMusicApi(
         )
     }
 
+    /** Имена из массива строк или объектов {name}, либо из одной строки. */
     private fun namesOf(v: Any?): List<String> = when (v) {
         is JSONArray -> (0 until v.length()).mapNotNull { i ->
             when (val e = v.opt(i)) {
@@ -756,7 +853,11 @@ class YandexMusicApi(
         return "${m.groupValues[3]}.${m.groupValues[2]}.${m.groupValues[1]}"
     }
 
-    fun trackInfo(t: Track): TrackInfo {
+    /**
+     * Подробности о треке: альбом, год, дата выхода, жанр, лейбл, авторы. Что сервер не отдал — остаётся пустым.
+     * Авторы текста берутся из «supplement» трека (поля writers и т. п.), авторы музыки — из исполнителей с пометкой composer.
+     */
+    override fun trackInfo(t: Track): TrackInfo {
         val key = if (t.albumId != null) "${t.id}:${t.albumId}" else t.id
         val o = request("/tracks", mapOf("track-ids" to key)).getJSONArray("result").optJSONObject(0)
             ?: error("Нет данных о треке")

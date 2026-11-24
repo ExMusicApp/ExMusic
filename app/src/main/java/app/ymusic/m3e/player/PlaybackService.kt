@@ -24,10 +24,13 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/** Фоновое воспроизведение, уведомление и управление с экрана блокировки (в том числе лайк и дизлайк). */
 class PlaybackService : MediaSessionService() {
     private var session: MediaSession? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
+    // Виджет плеера перерисовывается при смене трека, паузе/воспроизведении и обновлении метаданных;
+    // кнопки лайка/дизлайка в шторке — при смене трека.
     private val widgetListener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
             if (events.containsAny(
@@ -47,6 +50,7 @@ class PlaybackService : MediaSessionService() {
             session: MediaSession,
             controller: MediaSession.ControllerInfo,
         ): MediaSession.ConnectionResult {
+            // Лайк/дизлайк (действия с аккаунтом) доступны только самому приложению и системным контроллерам.
             val b = MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
             if (controller.packageName == packageName || controller.isTrusted) {
                 b.add(SessionCommand(CMD_LIKE, Bundle.EMPTY)).add(SessionCommand(CMD_DISLIKE, Bundle.EMPTY))
@@ -73,7 +77,9 @@ class PlaybackService : MediaSessionService() {
 
     override fun onCreate() {
         super.onCreate()
+        // применяем сохранённые настройки эквалайзера, даже если UI закрыт (сбой эффекта не должен ронять сервис)
         runCatching { App.instance.equalizer }
+        runCatching { App.instance.crossfade.start() }
         val openApp = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
@@ -84,16 +90,19 @@ class PlaybackService : MediaSessionService() {
             .setSessionActivity(openApp)
             .build()
         session = s
+        // Без явного addSession уведомление не появляется, пока к сервису не подключился контроллер.
         addSession(s)
         App.instance.player.addListener(widgetListener)
         PlayerWidget.update(this)
         refreshButtons()
+        // Значки лайка/дизлайка перерисовываются, когда меняются списки лайков (из приложения или отсюда).
         scope.launch {
             combine(App.instance.likedIds, App.instance.dislikedIds) { _, _ -> }.collect { refreshButtons() }
         }
         loadLikesIfNeeded()
     }
 
+    /** Если сервис поднялся без интерфейса — узнаём лайки сами, чтобы сердечко в шторке горело правильно. */
     private fun loadLikesIfNeeded() {
         val app = App.instance
         if (app.likedIds.value.isNotEmpty() || app.likeBridge != null) return
@@ -105,6 +114,8 @@ class PlaybackService : MediaSessionService() {
             }
         }
     }
+
+    // ---- Лайк / дизлайк из шторки ----
 
     private fun accountApiId(): String? {
         val ts = App.instance.tokenStore
@@ -132,6 +143,7 @@ class PlaybackService : MediaSessionService() {
     private fun toggle(dislike: Boolean) {
         val t = currentTrack() ?: return
         if (t.isLocal) return
+        // Приложение открыто (или его ViewModel жив) — пусть всё делает оно: обновится и интерфейс.
         val bridge = App.instance.likeBridge
         if (bridge != null) {
             if (dislike) bridge.toggleDislike(t) else bridge.toggleLike(t)
@@ -140,6 +152,7 @@ class PlaybackService : MediaSessionService() {
         toggleDirect(t, dislike)
     }
 
+    /** Приложение закрыто, музыка играет: ставим отметку напрямую через API с откатом при ошибке. */
     private fun toggleDirect(t: Track, dislike: Boolean) {
         val app = App.instance
         val uid = accountApiId() ?: return
@@ -150,6 +163,7 @@ class PlaybackService : MediaSessionService() {
         if (dislike) {
             app.dislikedIds.value = if (wasDisliked) prevDis - t.id else prevDis + t.id
             app.likedIds.value = prevLiked - t.id
+            // Как в Яндекс Музыке: дизлайк играющего трека пропускает его.
             if (!wasDisliked && app.player.hasNextMediaItem()) app.player.seekToNextMediaItem()
         } else {
             app.likedIds.value = if (wasLiked) prevLiked - t.id else prevLiked + t.id
@@ -180,6 +194,7 @@ class PlaybackService : MediaSessionService() {
         }
     }
 
+    /** Кнопки «Не нравится» и «Нравится» в шторке; заполненный значок — если отметка уже стоит. */
     private fun refreshButtons() {
         val s = session ?: return
         val t = currentTrack()
@@ -211,6 +226,7 @@ class PlaybackService : MediaSessionService() {
 
     override fun onDestroy() {
         runCatching { App.instance.player.removeListener(widgetListener) }
+        runCatching { App.instance.crossfade.stop() }
         scope.cancel()
         session?.release()
         session = null

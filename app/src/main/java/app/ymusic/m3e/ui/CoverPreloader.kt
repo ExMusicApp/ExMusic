@@ -16,9 +16,15 @@ import coil3.toBitmap
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
+/**
+ * Предзагрузка обложек: картинки заранее кладутся в кэш Coil (память + диск), поэтому при смене трека,
+ * открытии списка или плеера обложка появляется сразу, без «пустой» заглушки.
+ * Ключ кэша памяти совпадает с тем, что использует [Cover] (extra «retry» = 0).
+ */
 internal object CoverPreloader {
     private val seen = LinkedHashSet<String>()
 
+    /** Ставит обложки в очередь загрузки; уже запрошенные ссылки повторно не запрашиваются. */
     fun preload(context: Context, urls: Collection<String?>) {
         if (urls.isEmpty()) return
         val ctx = context.applicationContext
@@ -39,9 +45,15 @@ internal object CoverPreloader {
         }
     }
 
+    /** Забыть запомненные ссылки (после возвращения сети — чтобы не загруженные обложки запросились снова). */
     fun reset() { synchronized(seen) { seen.clear() } }
 }
 
+/**
+ * Мягко размытая обложка для фона на Android 8–11, где у слоя нет настоящего размытия. Раньше обложка брала размер 40 px
+ * и растягивалась — выходила «пиксельная». Теперь она берётся в 96 px и размывается по-настоящему (три прохода box blur),
+ * а при растягивании рисуется с билинейной фильтрацией — получается плавный фон без квадратиков.
+ */
 @Composable
 internal fun rememberSoftBlurredCover(url: String?, sizePx: Int = 96, radius: Int = 8): ImageBitmap? {
     val ctx = LocalContext.current

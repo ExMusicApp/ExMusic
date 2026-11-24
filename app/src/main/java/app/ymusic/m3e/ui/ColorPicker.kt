@@ -17,7 +17,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -37,8 +36,13 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.dp
 
+/** Цвет в виде «RRGGBB» (без прозрачности). */
 fun colorHex(argb: Int): String = "%06X".format(argb and 0xFFFFFF)
 
+/**
+ * Окно выбора цвета: квадрат «насыщенность — яркость», полоса оттенка и поле HEX.
+ * [initial] — с какого цвета начать; [onReset] — если задан, появляется кнопка «Сбросить» (вернуть цвет по умолчанию).
+ */
 @Composable
 fun ColorPickerDialog(
     title: String,
@@ -55,6 +59,7 @@ fun ColorPickerDialog(
     var hue by remember { mutableFloatStateOf(start[0]) }
     var sat by remember { mutableFloatStateOf(start[1]) }
     var value by remember { mutableFloatStateOf(start[2]) }
+    // Текст, который сейчас вводят в поле HEX; null — поле показывает текущий цвет.
     var typed by remember { mutableStateOf<String?>(null) }
     val color = Color.hsv(hue.coerceIn(0f, 360f), sat.coerceIn(0f, 1f), value.coerceIn(0f, 1f))
 
@@ -63,6 +68,7 @@ fun ColorPickerDialog(
         title = { Text(title) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                // Квадрат: по горизонтали насыщенность, по вертикали яркость.
                 Box(
                     Modifier.fillMaxWidth().height(180.dp).clip(RoundedCornerShape(16.dp))
                         .pointerInput(Unit) {
@@ -89,6 +95,7 @@ fun ColorPickerDialog(
                             drawCircle(color, 8.dp.toPx(), c)
                         },
                 )
+                // Полоса оттенка.
                 Box(
                     Modifier.fillMaxWidth().height(28.dp).clip(RoundedCornerShape(14.dp))
                         .pointerInput(Unit) {

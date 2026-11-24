@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -23,6 +22,12 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import app.ymusic.m3e.data.StationCookies
 
+/**
+ * Вход в Яндекс для управления колонкой по Wi-Fi (Glagol).
+ *
+ * Как в PulseSync: cookies берутся из сессии браузера (там — Electron session, здесь — WebView), из них main-часть получает
+ * x_token и «производный» music_token (см. data/YandexStation.kt). Cookies хранит сам WebView, приложение их никуда не копирует и не логирует.
+ */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun StationLoginDialog(onDone: () -> Unit, onDismiss: () -> Unit) {
@@ -75,6 +80,7 @@ fun StationLoginDialog(onDone: () -> Unit, onDismiss: () -> Unit) {
                                 private fun maybeDone(view: WebView, url: String?) {
                                     if (finished) return
                                     val u = url.orEmpty()
+                                    // Вход завершён: появилась сессия, и мы ушли со страниц авторизации.
                                     val onAuthPage = u.contains("passport.yandex.") && (u.contains("/auth") || u.contains("/registration"))
                                     if (!onAuthPage && StationCookies.hasSession()) {
                                         finished = true

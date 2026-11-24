@@ -24,19 +24,25 @@ import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
+/** Устройство из списка «Подключить» Яндекс Музыки: Яндекс Станция, телевизор, другой телефон и т. п. */
 data class ConnectDevice(
     val id: String,
     val title: String,
+    /** SMART_SPEAKER, ANDROID, IOS, WEB, WEB_TV, ANDROID_TV, APPLE_TV … */
     val type: String,
     val appName: String,
+    /** Устройство умеет проигрывать музыку (колонки, ТВ, приложения). */
     val canPlay: Boolean,
     val offline: Boolean,
+    /** Громкость 0..1 (−1 — неизвестна). */
     val volume: Double,
+    /** Число делений громкости (0 — громкость удалённо менять нельзя). */
     val volumeSteps: Int,
 ) {
     val isSpeaker: Boolean get() = type == "SMART_SPEAKER"
     val isTv: Boolean get() = type == "WEB_TV" || type == "ANDROID_TV" || type == "APPLE_TV"
 
+    /** Человекочитаемое описание типа устройства. */
     val kindLabel: String
         get() = when (type) {
             "SMART_SPEAKER" -> "Умная колонка"
@@ -51,18 +57,29 @@ data class ConnectState(
     val connecting: Boolean = false,
     val connected: Boolean = false,
     val devices: List<ConnectDevice> = emptyList(),
+    /** Устройство, которое сейчас активно в аккаунте (на любом клиенте). */
     val activeId: String? = null,
+    /** Устройство, на котором музыку запустили мы. */
     val remoteId: String? = null,
     val error: String? = null,
     val paused: Boolean = true,
     val progressMs: Long = 0,
     val durationMs: Long = 0,
+    /** id трека, который сейчас играет на удалённом устройстве. */
     val currentTrackId: String? = null,
     val currentIndex: Int = -1,
     val receivedAtMs: Long = 0,
+    /** Для управления колонкой по Wi-Fi (Glagol) нужен вход в Яндекс через WebView. */
     val stationLoginRequired: Boolean = false,
 )
 
+/**
+ * Управление колонками и другими устройствами Яндекса через Ynison — тот же протокол синхронизации, которым
+ * пользуется официальное приложение Яндекс Музыки (кнопка «Подключить»). Телефон здесь — пульт: очередь и
+ * позиция отправляются на выбранное устройство, оно само берёт поток с серверов Яндекса и играет.
+ *
+ * Протокол неофициальный (JSON поверх WebSocket); если Яндекс его изменит, поломается только этот файл.
+ */
 class YandexConnect(
     ctx: Context,
     base: OkHttpClient,
@@ -79,11 +96,14 @@ class YandexConnect(
     private val _state = MutableStateFlow(ConnectState())
     val state: StateFlow<ConnectState> = _state
 
+    // ---- Колонки по Wi-Fi (Glagol, порт из PulseSync): работает рядом с Ynison, а не вместо него ----
     private val stationPrefix = "glagol:"
     private var ynisonDevices: List<ConnectDevice> = emptyList()
     private var stationDevices: List<ConnectDevice> = emptyList()
+    /** platform найденных по Wi-Fi колонок (id без префикса → platform): по нему подбирается название модели, если настоящего имени нет. */
     private var stationPlatforms: Map<String, String?> = emptyMap()
 
+    /** Колонка по Wi-Fi не ответила / пропала: слушатель должен забрать музыку обратно на телефон (AppViewModel.releaseConnect). */
     @Volatile var onRemoteLost: ((String) -> Unit)? = null
 
     private val station = YandexStation(ctx, base, tokenProvider) { msg -> stationLost(msg) }
@@ -92,6 +112,7 @@ class YandexConnect(
         scope.launch { station.state.collect { onStation(it) } }
     }
 
+    /** Название модели колонки по platform из Glagol (если известно). */
     private fun speakerModelName(platform: String?): String? = when (platform?.trim()?.lowercase()) {
         "yandexstation" -> "Яндекс Станция"
         "yandexstation_2" -> "Яндекс Станция Макс"
@@ -110,12 +131,14 @@ class YandexConnect(
 
     private fun normTitle(s: String) = s.trim().lowercase().replace(Regex("\\s+"), " ")
 
+    /** Колонка из Ynison, которая уже найдена по Wi-Fi, показывается один раз (локальной записью). */
     private fun mergeDevices(): List<ConnectDevice> {
         val st = stationDevices
         if (st.isEmpty()) return ynisonDevices
         val ids = st.map { it.id.removePrefix(stationPrefix).lowercase() }.toSet()
         val names = st.map { normTitle(it.title) }.toSet()
         val rest = ynisonDevices.filterNot { it.isSpeaker && (it.id.lowercase() in ids || normTitle(it.title) in names) }
+        // Если имя колонки по Wi-Fi служебное (YandexIOReceiver…), берём настоящее из списка устройств Ynison (тот же device_id).
         val usedYn = HashSet<String>()
         val genericCount = st.count { isGenericSpeakerName(it.title) }
         val named = st.map { d ->
@@ -124,9 +147,11 @@ class YandexConnect(
             val byId = ynisonDevices.firstOrNull {
                 it.isSpeaker && it.id.equals(rawId, ignoreCase = true) && !isGenericSpeakerName(it.title)
             }
+            // Один безымянный колонка и ровно одна колонка с именем в Ynison — это она (id в Ynison мог записаться иначе).
             val y = byId ?: ynisonDevices.filter { it.isSpeaker && !isGenericSpeakerName(it.title) && it.id !in usedYn }
                 .takeIf { genericCount == 1 && it.size == 1 }?.first()
             if (y != null) { usedYn += y.id; return@map d.copy(title = y.title) }
+            // Настоящего имени нет нигде — хотя бы модель по platform («Яндекс Станция Мини»), а не безликое «Яндекс Станция».
             val model = speakerModelName(stationPlatforms[rawId])
             if (model != null) d.copy(title = model) else d
         }
@@ -173,10 +198,13 @@ class YandexConnect(
         if (cb != null) cb(msg) else _state.update { it.copy(remoteId = null, paused = true) }
     }
 
+    /** Вход в Яндекс через WebView завершён — пересчитать токены для колонок. */
     fun stationLoginDone() = station.afterLogin()
 
+    /** Повторный поиск колонок в Wi-Fi. */
     fun stationRescan() = station.rescan()
 
+    /** Постоянный id этого приложения как «устройства» в аккаунте. */
     private val deviceId: String = ctx.getSharedPreferences("yandex_connect", Context.MODE_PRIVATE).let { p ->
         p.getString("device_id", null) ?: run {
             val chars = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -191,11 +219,15 @@ class YandexConnect(
     private var reconnectJob: Job? = null
     private var reconnectAttempts = 0
 
+    /** Последнее полное состояние плеера с сервера — из него собираются команды «следующий/предыдущий». */
     private var lastPlayerState: JSONObject? = null
     private var verQueue = 0L
     private var verStatus = 0L
     private var startedAtMs = 0L
 
+    // ---------- Подключение ----------
+
+    /** Открывает сессию, если она ещё не открыта. Список устройств приходит сам и потом обновляется на лету. */
     fun ensureConnected() {
         station.start()
         val s = _state.value
@@ -219,6 +251,7 @@ class YandexConnect(
         }
     }
 
+    /** Закрывает соединение (если мы никем не управляем) — чтобы не держать сокет и не тратить батарею. */
     fun disconnect() {
         reconnectJob?.cancel()
         session?.cancel()
@@ -235,6 +268,7 @@ class YandexConnect(
 
     private suspend fun open(token: String) {
         var last: Exception? = null
+        // Сначала так, как это делает веб-клиент; если сервер отклонит — повторяем без «теневого» флага.
         for (shadow in listOf(true, false)) {
             try {
                 val (host, ticket) = redirect(token)
@@ -263,6 +297,7 @@ class YandexConnect(
             .header("Authorization", "OAuth $token")
             .build()
 
+    /** Шаг 1: редиректор говорит, к какому серверу Ynison подключаться, и выдаёт одноразовый билет. */
     private suspend fun redirect(token: String): Pair<String, String> {
         val got = CompletableDeferred<JSONObject>()
         val ws = http.newWebSocket(
@@ -300,6 +335,7 @@ class YandexConnect(
         }
     }
 
+    /** Шаг 2: основное соединение. Сервер сразу присылает полное состояние: очередь, устройства, активное устройство. */
     private suspend fun openState(token: String, host: String, ticket: String, shadow: Boolean) {
         val first = CompletableDeferred<Unit>()
         val ws = http.newWebSocket(
@@ -336,10 +372,11 @@ class YandexConnect(
         _state.update { it.copy(connecting = false, connected = true, error = null) }
     }
 
+    /** Сокет упал уже после успешного подключения — помечаем и, если играем на колонке, пробуем переподключиться. */
     private fun dropped(ws: WebSocket, msg: String) {
         if (socket !== ws) return
         socket = null
-        if (!_state.value.connected) return
+        if (!_state.value.connected) return // обрыв на этапе подключения обрабатывает open()
         ynisonDevices = emptyList()
         _state.update { it.copy(connected = false, connecting = false, error = msg, devices = mergeDevices()) }
         if (_state.value.remoteId != null && !stationRemote() && reconnectAttempts < 5) {
@@ -357,6 +394,8 @@ class YandexConnect(
         socket = null
         _state.update { it.copy(connecting = false, connected = false, error = msg) }
     }
+
+    // ---------- Сообщения ----------
 
     private fun ver(v: Long): JSONObject =
         JSONObject().put("device_id", deviceId).put("version", v.toString()).put("timestamp_ms", "0")
@@ -414,6 +453,7 @@ class YandexConnect(
             .put("activity_interception_type", "DO_NOT_INTERCEPT_BY_DEFAULT")
     }
 
+    /** int64 в JSON приходит то числом, то строкой. */
     private fun lng(o: JSONObject?, key: String): Long {
         val v = o?.opt(key) ?: return 0L
         return when (v) {
@@ -517,14 +557,19 @@ class YandexConnect(
         return ws.send(body.toString())
     }
 
+    // ---------- Управление ----------
+
+    /** Музыка играет на удалённом устройстве, которое мы выбрали (и его никто не перехватил). */
     fun isRemoteActive(): Boolean {
         val s = _state.value
         val id = s.remoteId ?: return false
         if (isStationId(id)) return true
         if (s.activeId == id) return true
+        // Сразу после выбора сервер ещё не подтвердил смену активного устройства — даём ему несколько секунд.
         return System.currentTimeMillis() - startedAtMs < 8_000
     }
 
+    /** Позиция на удалённом устройстве с поправкой на прошедшее время (сервер шлёт её только при изменениях). */
     fun estimatedProgress(): Long {
         val s = _state.value
         if (s.paused) return s.progressMs
@@ -543,6 +588,10 @@ class YandexConnect(
         return o
     }
 
+    /**
+     * Запускает [tracks] с позиции [index] / [positionMs] на устройстве [device].
+     * Файлы с телефона колонка проиграть не может — они пропускаются. Возвращает false, если играть нечего или нет связи.
+     */
     fun playOn(device: ConnectDevice, tracks: List<Track>, index: Int, positionMs: Long, repeat: String = "NONE"): Boolean {
         val cur = tracks.getOrNull(index) ?: return false
         if (cur.localUri != null) {
@@ -550,10 +599,12 @@ class YandexConnect(
             return false
         }
         if (isStationId(device.id)) return playOnStation(device, tracks, index, positionMs, repeat)
+        // Переключаемся с колонки по Wi-Fi на устройство Ynison: колонку ставим на паузу.
         if (stationRemote()) {
             station.release()
             _state.update { it.copy(remoteId = null) }
         }
+        // Окно вокруг текущего трека: JSON не должен разрастаться на тысячи элементов.
         val from = (index - 20).coerceAtLeast(0)
         val to = minOf(tracks.size, from + 250)
         val arr = JSONArray()
@@ -610,6 +661,7 @@ class YandexConnect(
         return true
     }
 
+    /** Запуск на колонке по Wi-Fi: очередь ведёт телефон, колонка играет по одному треку (playMusic). */
     private fun playOnStation(device: ConnectDevice, tracks: List<Track>, index: Int, positionMs: Long, repeat: String): Boolean {
         val sp = station.speaker(device.id.removePrefix(stationPrefix))
         if (sp == null) {
@@ -628,6 +680,7 @@ class YandexConnect(
             list += t
         }
         synchronized(lock) {
+            // Если до этого играло устройство Ynison — ставим его на паузу и снимаем активность.
             val prev = _state.value
             if (prev.remoteId != null && !isStationId(prev.remoteId)) {
                 runCatching {
@@ -697,6 +750,7 @@ class YandexConnect(
         }
     }
 
+    /** На [delta] треков вперёд (1) или назад (−1) в очереди колонки. */
     fun skip(delta: Int): Boolean = synchronized(lock) {
         if (stationRemote()) return@synchronized station.skip(delta)
         val ps = lastPlayerState?.let { JSONObject(it.toString()) } ?: return@synchronized false
@@ -707,6 +761,7 @@ class YandexConnect(
         jumpTo(ps, q, idx)
     }
 
+    /** Перейти к элементу очереди колонки по id трека (смена трека на телефоне — например, из шторки уведомлений). */
     fun skipToTrack(trackId: String): Boolean = synchronized(lock) {
         if (stationRemote()) return@synchronized station.skipToTrack(trackId)
         val ps = lastPlayerState?.let { JSONObject(it.toString()) } ?: return@synchronized false
@@ -744,6 +799,7 @@ class YandexConnect(
         return true
     }
 
+    /** Громкость устройства 0..1 (округляется до делений, которые оно поддерживает). */
     fun setVolume(device: ConnectDevice, v: Double) {
         if (isStationId(device.id)) {
             station.setVolume(v)
@@ -768,6 +824,10 @@ class YandexConnect(
         }
     }
 
+    /**
+     * Вернуть музыку на телефон: колонка ставится на паузу и перестаёт быть активной.
+     * Возвращает (id трека, позиция, играло ли) на момент возврата, чтобы телефон продолжил с того же места.
+     */
     fun release(): Triple<String?, Long, Boolean> = synchronized(lock) {
         val s = _state.value
         val pos = estimatedProgress()
@@ -788,5 +848,6 @@ class YandexConnect(
         Triple(id, pos, wasPlaying)
     }
 
+    /** Забыть ошибку после показа. */
     fun clearError() = _state.update { it.copy(error = null) }
 }

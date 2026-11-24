@@ -44,8 +44,17 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
+/*
+ * Индикаторы прогресса Material 3 Expressive, нарисованные на Canvas:
+ *  - линейный: плоский (любой толщины) и волнистый;
+ *  - круговой: плоский и волнистый.
+ * Активная часть отделена от дорожки зазором (как в M3E), у плоской дорожки есть «стоп-точка» справа.
+ * Интерактивные версии (M3SeekBar / M3CircularSeek) умеют тап и перетаскивание.
+ */
+
 private const val TWO_PI = (2 * PI).toFloat()
 
+/** Фаза бегущей волны (0..2π). Для неволнистых — константа, анимация не запускается. */
 @Composable
 private fun wavePhase(wavy: Boolean): State<Float> {
     if (!wavy || ThemeSettings.optimize) return remember { mutableFloatStateOf(0f) }
@@ -58,19 +67,26 @@ private fun wavePhase(wavy: Boolean): State<Float> {
     )
 }
 
+/** Амплитуда волны в dp для заданной толщины линии. */
 private fun waveAmplitudeDp(thicknessDp: Float) = 2f + thicknessDp * 0.25f
 
+/**
+ * Размер кругового индикатора, при котором линия (вместе с гребнями волны внутрь) не заходит на центральную кнопку
+ * диаметром [button] и остаётся зазор [gap]. [waveAmplitude] — своя амплитуда волны (по умолчанию от толщины).
+ */
 fun circularRingSize(button: Dp, thickness: Dp, wavy: Boolean, gap: Dp = 4.dp, waveAmplitude: Dp? = null): Dp {
     val amp = if (wavy) (waveAmplitude?.value ?: waveAmplitudeDp(thickness.value)) else 0f
     return ((button.value / 2f + gap.value + thickness.value + 2f * amp) * 2f).dp
 }
 
+/** Высота линейного индикатора (с учётом амплитуды волны и ручки). */
 private fun linearHeight(wavy: Boolean, thickness: Dp, handle: Boolean): Dp {
     val amp = if (wavy) waveAmplitudeDp(thickness.value) else 0f
     val handleH = if (handle) max(thickness.value + 12f, 24f) else 0f
     return max(thickness.value + amp * 2f, handleH).dp
 }
 
+/** Линейный индикатор прогресса (0..1). [handle] — вертикальная ручка, как у слайдера M3E. */
 @Composable
 fun M3LinearBar(
     progress: Float,
@@ -98,11 +114,13 @@ fun M3LinearBar(
         val activeEnd = end - half
         val trackStart = end + half
 
+        // Дорожка + стоп-точка
         if (trackStart < maxX) {
             drawLine(trackColor, Offset(trackStart, cy), Offset(maxX, cy), strokeWidth = trackTh, cap = StrokeCap.Round)
             if (maxX - trackStart > 10.dp.toPx()) drawCircle(color, radius = 2.dp.toPx().coerceAtMost(trackTh / 2f), center = Offset(maxX, cy))
         }
 
+        // Активная часть
         if (activeEnd > minX + 0.5f) {
             if (wavy) {
                 val a = waveAmplitudeDp(thickness.value).dp.toPx() * amplitude.coerceIn(0f, 1f)
@@ -133,11 +151,14 @@ fun M3LinearBar(
     }
 }
 
+/** На сколько делений разбита перемотка для «тиков» вибро: один тик на каждое деление. */
 private const val HAPTIC_STEPS = 40
 
+/** Номер «деления» вибро-тика при свайпе на [distancePx] из [widthPx]: те же 40 шагов на ширину, что и у ползунка. */
 internal fun swipeTickStep(distancePx: Float, widthPx: Float): Int =
     (kotlin.math.abs(distancePx) / widthPx.coerceAtLeast(1f) * HAPTIC_STEPS).toInt()
 
+/** Линейный индикатор с тапом и перетаскиванием. Значение 0..1. */
 @Composable
 fun M3SeekBar(
     value: Float,
@@ -148,6 +169,7 @@ fun M3SeekBar(
     thickness: Dp = 4.dp,
     amplitude: Float = 1f,
     minTouchHeight: Dp = 36.dp,
+    /** Виброотклик: щелчок при касании и отпускании, лёгкие «тики» по ходу перемотки. Включается только для перемотки трека. */
     haptic: Boolean = false,
 ) {
     val change by rememberUpdatedState(onValueChange)
@@ -192,6 +214,7 @@ fun M3SeekBar(
     }
 }
 
+/** Круговой индикатор прогресса (0..1) с содержимым в центре. */
 @Composable
 fun M3CircularBar(
     progress: Float,
@@ -202,6 +225,7 @@ fun M3CircularBar(
     amplitude: Float = 1f,
     color: Color = MaterialTheme.colorScheme.primary,
     trackColor: Color = MaterialTheme.colorScheme.secondaryContainer,
+    /** Своя высота гребня волны (по умолчанию зависит от толщины). */
     waveAmplitude: Dp? = null,
     content: @Composable BoxScope.() -> Unit = {},
 ) {
@@ -261,6 +285,7 @@ fun M3CircularBar(
     }
 }
 
+/** Круговой индикатор с перетаскиванием по кольцу. Касание внутри кольца (на центральной кнопке) игнорируется. */
 @Composable
 fun M3CircularSeek(
     value: Float,
@@ -271,8 +296,10 @@ fun M3CircularSeek(
     wavy: Boolean = false,
     thickness: Dp = 6.dp,
     amplitude: Float = 1f,
+    /** Ширина кольцевой зоны касания от внешнего края (в мини-плеере уже, чтобы не задевать кнопку в центре). */
     ringBand: Dp = 22.dp,
     waveAmplitude: Dp? = null,
+    /** Виброотклик перемотки трека (см. [M3SeekBar]). */
     haptic: Boolean = false,
     content: @Composable BoxScope.() -> Unit = {},
 ) {
@@ -337,6 +364,7 @@ fun M3CircularSeek(
     )
 }
 
+/** Статичный образец стиля (прогресс 40 %) для экрана настроек. */
 @Composable
 fun SeekStylePreview(style: SeekBarStyle, modifier: Modifier = Modifier) {
     if (style.circular) {

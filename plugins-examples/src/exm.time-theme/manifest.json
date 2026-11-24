@@ -1,0 +1,23 @@
+{
+  "id": "exm.time-theme",
+  "name": "Тема по времени суток",
+  "version": "1.2.0",
+  "author": "ExMusic",
+  "description": "Меняет цвет акцента утром, днём, вечером и ночью. Ночью может включать чёрный AMOLED-фон.",
+  "api": 2,
+  "icon": "icon.png",
+  "contributes": {
+    "lua": {
+      "main": "main.lua"
+    },
+    "settings": [
+      {
+        "key": "amoled_night",
+        "type": "switch",
+        "title": "Чёрный фон ночью",
+        "summary": "С 22:00 до 05:00 включать AMOLED-фон",
+        "default": true
+      }
+    ]
+  }
+}

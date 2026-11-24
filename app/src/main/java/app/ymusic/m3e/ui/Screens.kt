@@ -151,16 +151,20 @@ import android.os.Build
 import app.ymusic.m3e.R
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.ymusic.m3e.AppViewModel
+import app.ymusic.m3e.provider
 import app.ymusic.m3e.playlistSourceKey
 import app.ymusic.m3e.DEFAULT_WAVE
 import app.ymusic.m3e.data.AlbumInfo
 import app.ymusic.m3e.data.ArtistInfo
 import app.ymusic.m3e.data.ArtistRef
 import app.ymusic.m3e.data.DownloadMode
+import app.ymusic.m3e.data.canDownload
+import app.ymusic.m3e.data.isDownloadBlocked
 import app.ymusic.m3e.data.DownloadNetwork
 import app.ymusic.m3e.data.TrackInfo
 import app.ymusic.m3e.data.LyricLine
 import app.ymusic.m3e.data.LyricsSource
+import app.ymusic.m3e.data.LyricsCandidate
 import androidx.compose.foundation.horizontalScroll
 import app.ymusic.m3e.LyricsState
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -183,6 +187,7 @@ import coil3.request.crossfade
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -190,6 +195,7 @@ import kotlinx.coroutines.withContext
 import app.ymusic.m3e.data.DeviceCode
 import app.ymusic.m3e.recognition.FoundAction
 import app.ymusic.m3e.recognition.RecognitionSettings
+import app.ymusic.m3e.recognition.Recognizer
 import app.ymusic.m3e.data.LocalFilesSettings
 import app.ymusic.m3e.data.LocalFolders
 import app.ymusic.m3e.data.LocalMusic
@@ -209,12 +215,18 @@ import app.ymusic.m3e.data.PluginSystem
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 
+/** Открыть поиск (кнопка поиска на главной): вкладка «Поиск», а если её убрали из панели — отдельная страница поверх. */
 private val LocalOpenSearch = staticCompositionLocalOf<() -> Unit> { {} }
 
+/** Растёт, когда сеть вернулась: обложки, которые не успели загрузиться, пробуют ещё раз. */
 private val LocalNetEpoch = compositionLocalOf { 0 }
 
+/**
+ * Обложка: заглушка с нотой под картинкой + плавное появление; пустого места не бывает.
+ * Если картинка не загрузилась (не было сети), при возвращении сети она запрашивается заново сама.
+ */
 @Composable
-private fun Cover(model: Any?, modifier: Modifier = Modifier, placeholder: Int = R.drawable.ms_music_note) {
+internal fun Cover(model: Any?, modifier: Modifier = Modifier, placeholder: Int = R.drawable.ms_music_note) {
     val epoch = LocalNetEpoch.current
     var failed by remember(model) { mutableStateOf(false) }
     var attempt by remember(model) { mutableIntStateOf(0) }
@@ -245,11 +257,16 @@ private fun Cover(model: Any?, modifier: Modifier = Modifier, placeholder: Int =
     }
 }
 
+/** Клик с «пружинным» сжатием при нажатии. */
 @Composable
-private fun Modifier.pressable(shape: Shape, onClick: () -> Unit): Modifier {
+private fun Modifier.pressable(shape: Shape, onClick: () -> Unit): Modifier = pressableHold(shape, true, onClick)
+
+/** То же, что [pressable], но [hold] = false отключает тики при удержании (кнопка «Профиль»: удержание открывает смену аккаунта). */
+@Composable
+private fun Modifier.pressableHold(shape: Shape, hold: Boolean, onClick: () -> Unit): Modifier {
     val source = remember { MutableInteractionSource() }
     val pressed by source.collectIsPressedAsState()
-    HoldHaptics(pressed, downTick = false)
+    HoldHaptics(pressed && hold, downTick = false)
     val scale by animateFloatAsState(
         targetValue = if (pressed) 0.94f else 1f,
         animationSpec = fxSpring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMedium),
@@ -261,6 +278,10 @@ private fun Modifier.pressable(shape: Shape, onClick: () -> Unit): Modifier {
         .foundationClickable(interactionSource = source, indication = LocalIndication.current, onClick = withHaptic(HapticKind.Tick, onClick))
 }
 
+/**
+ * Клик по всей карточке с «пружинным» сжатием, но без обрезки по форме: рябь рисуется отдельно
+ * (Modifier.indication на обложке с тем же source), поэтому скругление не задевает текст под обложкой.
+ */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun Modifier.pressCard(source: MutableInteractionSource, onClick: () -> Unit, onLongClick: (() -> Unit)? = null): Modifier {
@@ -276,6 +297,11 @@ private fun Modifier.pressCard(source: MutableInteractionSource, onClick: () -> 
         .combinedClickable(interactionSource = source, indication = null, onLongClick = onLongClick, onClick = onClick)
 }
 
+/**
+ * Все `Modifier.clickable` в этом файле перекрыты этой версией: строки списков, пункты настроек, вкладки дока
+ * и прочие нажимаемые элементы получают ту же пружинную анимацию нажатия, что и кнопка «Моя волна»
+ * (сжатие + рябь), без правок на местах.
+ */
 private fun Modifier.clickable(
     enabled: Boolean = true,
     onClickLabel: String? = null,
@@ -302,6 +328,9 @@ private fun Modifier.clickable(
         )
 }
 
+// ---------- Обновление свайпом сверху вниз + выразительные элементы Material 3 Expressive ----------
+
+/** «Потяни, чтобы обновить»: PullToRefreshBox с выразительным индикатором загрузки (LoadingIndicator) из M3E. */
 @Composable
 private fun Refreshable(
     refreshing: Boolean,
@@ -326,16 +355,27 @@ private fun Refreshable(
     )
 }
 
+/**
+ * Счётчик «вернуться наверх»: растёт при нажатии на левый верхний угол экрана (как на iPhone) и при повторном
+ * нажатии на уже выбранную вкладку в доке. Все прокручиваемые экраны подписаны на него через [ScrollToTopEffect].
+ */
 private val LocalScrollTopTick = compositionLocalOf { 0 }
 
+/**
+ * Внутренние страницы вкладок (открытый плейлист, «Чарт», «Любимое»...). Пока такая страница открыта, она
+ * регистрируется здесь; нажатие на уже выбранную вкладку в доке закрывает все такие страницы и возвращает
+ * к главной странице раздела. Если закрывать нечего, нажатие прокручивает экран наверх.
+ */
 private class InnerPages {
     private val resets = LinkedHashMap<Any, () -> Unit>()
     fun register(key: Any, reset: () -> Unit) { resets[key] = reset }
     fun unregister(key: Any) { resets.remove(key) }
 
+    /** Сколько открытых окон сейчас запрещают листать вкладки свайпом в сторону (см. [PagerLockEffect]). */
     var pagerLocks by androidx.compose.runtime.mutableIntStateOf(0)
     val pagerLocked: Boolean get() = pagerLocks > 0
 
+    /** true — была открыта хотя бы одна внутренняя страница, и она закрыта. */
     fun resetAll(): Boolean {
         if (resets.isEmpty()) return false
         resets.values.toList().forEach { it() }
@@ -345,13 +385,20 @@ private class InnerPages {
 
 private val LocalInnerPages = staticCompositionLocalOf { InnerPages() }
 
+/**
+ * Страница вкладки сейчас на экране? Вкладки держатся собранными заранее (TabPager), чтобы смена вкладки не собирала экран
+ * с нуля. Скрытая страница не должна перехватывать «назад», блокировать свайп вкладок, влиять на кнопку «вверх» и
+ * реагировать на «наверх» — всё это учитывает только активная.
+ */
 internal val LocalPageActive = compositionLocalOf { true }
 
+/** Обычный BackHandler, но у скрытой (предсобранной) вкладки не срабатывает. Остальной код вызывает его как раньше. */
 @Composable
 private fun BackHandler(enabled: Boolean = true, onBack: () -> Unit) {
     androidx.activity.compose.BackHandler(enabled = enabled && LocalPageActive.current, onBack = onBack)
 }
 
+/** Пока окно на экране, вкладки нельзя листать свайпом в сторону: жест остаётся за самим окном («назад»). */
 @Composable
 private fun PagerLockEffect() {
     val pages = LocalInnerPages.current
@@ -363,6 +410,7 @@ private fun PagerLockEffect() {
     }
 }
 
+/** Пока [open] — страница [key] считается внутренней; [reset] возвращает на главную страницу раздела. */
 @Composable
 private fun InnerPageEffect(key: Any, open: Boolean, reset: () -> Unit) {
     val pages = LocalInnerPages.current
@@ -374,6 +422,10 @@ private fun InnerPageEffect(key: Any, open: Boolean, reset: () -> Unit) {
     }
 }
 
+/**
+ * Учёт прокрутки для кнопки «вверх»: каждый прокручиваемый экран сообщает, можно ли ему прокрутиться назад
+ * (то есть он не на самом верху). У каждого слоя (вкладки, исполнитель, альбом) свой учёт; настройки его не получают.
+ */
 private class ScrollTracker {
     val scrolled = mutableStateMapOf<Any, Boolean>()
     val canScrollUp: Boolean get() = scrolled.values.any { it }
@@ -381,16 +433,33 @@ private class ScrollTracker {
 
 private val LocalScrollTracker = staticCompositionLocalOf<ScrollTracker?> { null }
 
+/**
+ * Экран прокручен достаточно далеко, чтобы кнопка «вверх» была нужна: не на пару пикселей от верха и не «залипший» список
+ * (его уже убрали с экрана или он опустел, а состояние помнит старую позицию).
+ */
+private fun androidx.compose.foundation.gestures.ScrollableState.farFromTop(): Boolean = when (this) {
+    is LazyListState ->
+        canScrollBackward && layoutInfo.totalItemsCount > 0 && layoutInfo.visibleItemsInfo.isNotEmpty() &&
+            (firstVisibleItemIndex > 0 || firstVisibleItemScrollOffset > layoutInfo.viewportSize.height / 3)
+    is LazyGridState ->
+        canScrollBackward && layoutInfo.totalItemsCount > 0 && layoutInfo.visibleItemsInfo.isNotEmpty() &&
+            (firstVisibleItemIndex > 0 || firstVisibleItemScrollOffset > layoutInfo.viewportSize.height / 3)
+    is androidx.compose.foundation.ScrollState -> value > 240
+    else -> canScrollBackward
+}
+
 @Composable
 private fun ReportScroll(state: androidx.compose.foundation.gestures.ScrollableState) {
     val tracker = LocalScrollTracker.current ?: return
+    // Скрытая вкладка не должна включать кнопку «вверх» на чужом экране.
     if (!LocalPageActive.current) return
     DisposableEffect(tracker, state) { onDispose { tracker.scrolled.remove(state) } }
     LaunchedEffect(tracker, state) {
-        snapshotFlow { state.canScrollBackward }.collect { tracker.scrolled[state] = it }
+        snapshotFlow { state.farFromTop() }.collect { tracker.scrolled[state] = it }
     }
 }
 
+/** Выполняет [action] при каждом сигнале «наверх» (но не при первом показе экрана — иначе собьётся своя прокрутка). */
 @Composable
 private fun ScrollToTopEffect(action: suspend () -> Unit) {
     val tick = LocalScrollTopTick.current
@@ -400,6 +469,11 @@ private fun ScrollToTopEffect(action: suspend () -> Unit) {
     LaunchedEffect(tick) { if (tick != initial && pageActive) current() }
 }
 
+/**
+ * Плавная прокрутка наверх по кнопке «вверх», левому верхнему углу и повторному нажатию на вкладку: один непрерывный
+ * заезд с торможением в конце (длительность растёт с расстоянием, но не дольше ~0,6 с). Раньше список сначала мгновенно
+ * «телепортировался» к началу, а потом доезжал пружиной — выглядело рывком.
+ */
 private fun topScrollSpec(distancePx: Float): androidx.compose.animation.core.AnimationSpec<Float> {
     val ms = (320 + distancePx / 7f).toInt().coerceIn(320, 620)
     return tween(animMs(ms), easing = EmphasizedDecelerate)
@@ -408,6 +482,7 @@ private fun topScrollSpec(distancePx: Float): androidx.compose.animation.core.An
 private suspend fun LazyListState.scrollToTop() {
     if (!canScrollBackward) return
     val vp = (layoutInfo.viewportEndOffset - layoutInfo.viewportStartOffset).toFloat().coerceAtLeast(1f)
+    // Очень далеко: сначала быстрый разгон на пару экранов, затем подхватываем рядом с началом и плавно тормозим.
     if (firstVisibleItemIndex > 8) {
         animateScrollBy(-vp * 1.4f, tween(animMs(170), easing = FastOutLinearInEasing))
         if (firstVisibleItemIndex > 6) scrollToItem(6)
@@ -420,6 +495,7 @@ private suspend fun LazyListState.scrollToTop() {
     }
     val distance = firstVisibleItemIndex * step + firstVisibleItemScrollOffset
     if (distance > 0f) animateScrollBy(-distance, topScrollSpec(distance))
+    // Оценка высот могла быть неточной — дотягиваем до самого верха без анимации.
     if (canScrollBackward) scrollToItem(0)
 }
 
@@ -443,19 +519,22 @@ private suspend fun LazyGridState.scrollToTop() {
     if (canScrollBackward) scrollToItem(0)
 }
 
+/** Прокрутка обычного (не ленивого) экрана наверх тем же плавным заездом. */
 private suspend fun ScrollState.smoothToTop() {
     if (value <= 0) return
     animateScrollTo(0, topScrollSpec(value.toFloat()))
 }
 
+/** Состояние прокрутки обычного экрана: откликается на «наверх» (левый верхний угол, повторное нажатие на вкладку). */
 @Composable
-private fun rememberTopScrollState(): ScrollState {
+internal fun rememberTopScrollState(): ScrollState {
     val s = rememberScrollState()
     ScrollToTopEffect { s.smoothToTop() }
     ReportScroll(s)
     return s
 }
 
+/** То же для экрана на LazyColumn. */
 @Composable
 private fun rememberTopListState(): LazyListState {
     val s = rememberLazyListState()
@@ -464,6 +543,13 @@ private fun rememberTopListState(): LazyListState {
     return s
 }
 
+/**
+ * «Наверх» по нажатию в верхней части экрана, как тап по статус-бару на iPhone и в Chrome. Android не передаёт
+ * приложению касания по самой строке состояния («шторке»), поэтому зона начинается сразу под ней и занимает
+ * верхний левый угол (примерно высота верхней панели). Касание считается, только если его не обработал
+ * никто другой: кнопки, строки и прокрутка в этой зоне работают как обычно, а нажатие по пустому месту
+ * или заголовку возвращает наверх.
+ */
 @Composable
 private fun Modifier.cornerTapToTop(onTap: () -> Unit): Modifier {
     val density = LocalDensity.current
@@ -474,6 +560,7 @@ private fun Modifier.cornerTapToTop(onTap: () -> Unit): Modifier {
         awaitEachGesture {
             val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
             if (down.position.x > zoneW || down.position.y > zoneH) return@awaitEachGesture
+            // Ждём отпускания на проходе Final: к этому моменту дочерние элементы уже сказали, обработали ли они касание.
             var handledByOthers = false
             var upTime = -1L
             while (upTime < 0L) {
@@ -488,13 +575,17 @@ private fun Modifier.cornerTapToTop(onTap: () -> Unit): Modifier {
     }
 }
 
+/** Общий размер обложки и кнопки play/pause в мини-плеере. */
 private val MiniControlSize = 48.dp
 
+/** Высота гребня волны в круговом индикаторе мини-плеера: небольшая, чтобы кольцо не наезжало на кнопку play/pause. */
 private val MiniWaveAmp = 2.dp
 
+/** Размер кольца вокруг кнопки play/pause мини-плеера (кнопка — [MiniControlSize] минус 12 dp): волна на кнопку не заходит. */
 private fun miniRingSize(wavy: Boolean): Dp =
     maxOf(MiniControlSize + 4.dp, circularRingSize(MiniControlSize - 12.dp, 3.dp, wavy, gap = 2.dp, waveAmplitude = MiniWaveAmp))
 
+/** Положение шторки полного плеера: 0 — открыта, [closedPx] — спрятана под нижним краем. Тянется пальцем и пружинит. */
 private class PlayerSheetState(
     val offset: Animatable<Float, AnimationVector1D>,
     val closedPx: Float,
@@ -504,15 +595,21 @@ private class PlayerSheetState(
     fun close() { scope.launch { offset.animateTo(closedPx, tween(animMs(220), easing = FastOutSlowInEasing)) } }
     fun dragBy(dy: Float) { scope.launch { offset.snapTo((offset.value + dy).coerceIn(0f, closedPx)) } }
 
+    /** Отпустили, вытягивая плеер вверх от мини-плеера: короткого свайпа или рывка достаточно. */
     fun settleOpening(velocityY: Float) {
         if (velocityY < -900f || offset.value < closedPx * 0.9f) open() else close()
     }
 
+    /** Отпустили, утягивая открытый плеер вниз. */
     fun settleClosing(velocityY: Float) {
         if (velocityY > 1500f || offset.value > closedPx * 0.18f) close() else open()
     }
 }
 
+/**
+ * Нижняя панель, которая при скрытии не оставляет пустого места: высота плавно сжимается до [minHeightPx]
+ * (высота системной панели навигации), а содержимое уезжает вниз и растворяется. [fraction]: 0 — показана, 1 — скрыта.
+ */
 @Composable
 private fun CollapsingDock(
     fraction: State<Float>,
@@ -536,6 +633,7 @@ private fun CollapsingDock(
     }
 }
 
+/** Нижний отступ + высота нижней панели: экран уходит под док, а последний элемент остаётся над ним. */
 @Composable
 private fun PaddingValues.withDockInset(): PaddingValues {
     val ld = androidx.compose.ui.platform.LocalLayoutDirection.current
@@ -546,6 +644,7 @@ private fun PaddingValues.withDockInset(): PaddingValues {
     )
 }
 
+/** LazyColumn, обновляемый свайпом вниз: [AppViewModel.pullRefresh] перезагружает данные текущего экрана. */
 @Composable
 private fun PullLazyColumn(
     vm: AppViewModel,
@@ -561,6 +660,7 @@ private fun PullLazyColumn(
     val padded = contentPadding.withDockInset()
     val wide = LocalWide.current
     Refreshable(ui.refreshing, { vm.pullRefresh(searchQuery) }, modifier) {
+        // На планшете строки не растягиваются на весь экран: список центрируется и занимает не больше 900 dp.
         LazyColumn(
             (if (wide) Modifier.fillMaxHeight().widthIn(max = 900.dp).align(Alignment.TopCenter) else Modifier.fillMaxSize()),
             state = state, contentPadding = padded, content = content,
@@ -568,6 +668,7 @@ private fun PullLazyColumn(
     }
 }
 
+/** LazyVerticalGrid, обновляемый свайпом вниз. */
 @Composable
 private fun PullLazyGrid(
     vm: AppViewModel,
@@ -597,6 +698,11 @@ private fun PullLazyGrid(
     }
 }
 
+/**
+ * Страница «шапка + список» (альбом, плейлист, исполнитель...). На телефоне — одна лента: шапка, кнопки, потом список.
+ * На планшете — две колонки: слева шапка и кнопки в своей карточке (со своей прокруткой), справа список треков.
+ * [header] и [content] — две части одной и той же ленты, поэтому на телефоне всё выглядит как раньше.
+ */
 @Composable
 private fun SplitPullColumn(
     vm: AppViewModel,
@@ -632,9 +738,15 @@ private fun SplitPullColumn(
     )
 }
 
+/** Motion blur включён (настройка, не «Оптимизация», Android 12+). */
 internal fun motionBlurActive(): Boolean =
     ThemeSettings.motionBlur && !ThemeSettings.optimize && android.os.Build.VERSION.SDK_INT >= 31
 
+/**
+ * Размытие по горизонтали, пропорциональное скорости сдвига [velocityPxPerSec] (px/с). Вызывать из graphicsLayer, где
+ * в том же блоке читается значение самой анимации, — тогда блок перерисовывается каждый кадр. Пока сдвиг стоит или
+ * ведётся пальцем (snapTo), скорость нулевая и размытия нет.
+ */
 internal fun androidx.compose.ui.graphics.GraphicsLayerScope.horizontalMotionBlur(velocityPxPerSec: Float, maxPx: Float = 28f) {
     if (!motionBlurActive()) return
     val k = ThemeSettings.motionBlurStrength
@@ -642,6 +754,7 @@ internal fun androidx.compose.ui.graphics.GraphicsLayerScope.horizontalMotionBlu
     if (b > 0.8f) renderEffect = androidx.compose.ui.graphics.BlurEffect(b, 0f, androidx.compose.ui.graphics.TileMode.Clamp)
 }
 
+/** Плавное пропадание и смещение элементов списка; выключается в Настройки → Внешний вид → Анимации. */
 private fun androidx.compose.foundation.lazy.LazyItemScope.removeAnim(): Modifier =
     if (ThemeSettings.animRemove && !ThemeSettings.optimize) {
         Modifier.animateItem(
@@ -650,6 +763,7 @@ private fun androidx.compose.foundation.lazy.LazyItemScope.removeAnim(): Modifie
         )
     } else Modifier.animateItem(placementSpec = null, fadeOutSpec = null)
 
+/** То же для элементов сетки (плейлисты). */
 private fun androidx.compose.foundation.lazy.grid.LazyGridItemScope.removeAnim(): Modifier =
     if (ThemeSettings.animRemove && !ThemeSettings.optimize) {
         Modifier.animateItem(
@@ -658,6 +772,7 @@ private fun androidx.compose.foundation.lazy.grid.LazyGridItemScope.removeAnim()
         )
     } else Modifier.animateItem(placementSpec = null, fadeOutSpec = null)
 
+/** Switch в стиле M3E: в положении «включено» на бегунке появляется галочка. */
 @Composable
 internal fun ExpressiveSwitch(checked: Boolean, onCheckedChange: ((Boolean) -> Unit)?) {
     Switch(
@@ -669,6 +784,7 @@ internal fun ExpressiveSwitch(checked: Boolean, onCheckedChange: ((Boolean) -> U
     )
 }
 
+/** Метка explicit (18+) рядом с названием трека. */
 @Composable
 private fun ExplicitMark(modifier: Modifier = Modifier, size: Int = 16) {
     Icon(
@@ -678,17 +794,20 @@ private fun ExplicitMark(modifier: Modifier = Modifier, size: Int = 16) {
     )
 }
 
+/** Плавное появление элемента списка (с небольшой задержкой по номеру); index < 0 — без анимации. */
 @Composable
 private fun Modifier.appear(index: Int): Modifier {
     val p = remember { Animatable(if (index < 0 || ThemeSettings.optimize) 1f else 0f) }
     LaunchedEffect(Unit) {
         if (index >= 0 && !ThemeSettings.optimize) {
             delay(index.coerceAtMost(8) * 30L)
+            // Короткий tween вместо длинной пружины: десятки строк не «дрожат» по секунде каждая — меньше кадров на анимацию.
             p.animateTo(1f, tween(fxMs(260), easing = FastOutSlowInEasing))
         }
     }
     return graphicsLayer {
         val v = p.value
+        // Анимация закончилась — слой не трогаем (без лишнего полупрозрачного слоя на каждой строке списка).
         if (v < 1f) {
             alpha = v.coerceIn(0f, 1f)
             scaleX = 0.9f + 0.1f * v
@@ -698,31 +817,54 @@ private fun Modifier.appear(index: Int): Modifier {
     }
 }
 
+/** Что играет прямо сейчас ("liked" / "pl:<owner>:<kind>"), а если музыка на паузе — null. По нему светятся карточки плейлистов. */
 private val LocalPlayingSource = compositionLocalOf<String?> { null }
 
+/** Открывает страницу артиста; предоставляется в AppRoot и используется строками треков. */
+/** Открыть плейлист страницей (переключает на вкладку «Плейлисты»). */
 private val LocalShowPlaylist = staticCompositionLocalOf<(PlaylistInfo) -> Unit> { {} }
 private val LocalOpenArtist = staticCompositionLocalOf<(ArtistRef) -> Unit> { {} }
 
+/** Открывает диалог «Добавить в плейлист» для трека; предоставляется в AppRoot. */
 private val LocalAddToPlaylist = staticCompositionLocalOf<(Track) -> Unit> { {} }
 
+/** Открывает страницу альбома по id (и названию для заголовка); предоставляется в AppRoot. */
 private val LocalOpenAlbum = staticCompositionLocalOf<(String, String?) -> Unit> { { _, _ -> } }
 
+/** Состояние скачанных песен (для меню трека); предоставляется в AppRoot. */
 private val LocalDownloads = compositionLocalOf { DownloadsState() }
 
+/** Скачать трек / удалить скачанный; предоставляется в AppRoot. */
 private val LocalToggleDownload = staticCompositionLocalOf<(Track) -> Unit> { {} }
 
+/** Скачать трек в выбранное место (файлом / в приложение / и туда и туда); предоставляется в AppRoot. */
 private val LocalDownloadTo = staticCompositionLocalOf<(Track, DownloadMode) -> Unit> { { _, _ -> } }
 
+/** Удалить скачанный трек; предоставляется в AppRoot. */
 private val LocalRemoveDownload = staticCompositionLocalOf<(Track) -> Unit> { {} }
 
+/** Спросить, куда скачать трек (окно выбора режима); предоставляется в AppRoot. */
 private val LocalPickDownloadMode = staticCompositionLocalOf<(Track) -> Unit> { {} }
 
+/** Открывает окно «Информация о треке»; предоставляется в AppRoot. */
 private val LocalShowTrackInfo = staticCompositionLocalOf<(Track) -> Unit> { {} }
 
+/** Открывает окно «Изменить название, исполнителя и обложку» для файла с устройства; предоставляется в AppRoot. */
 private val LocalEditLocalTrack = staticCompositionLocalOf<(Track) -> Unit> { {} }
 
+/** Окно «Изменить» своего трека (false) или альбома (true) SoundCloud по id. */
+private val LocalEditScItem = staticCompositionLocalOf<(String, Boolean) -> Unit> { { _, _ -> } }
+
+/** Id исполнителя (с префиксом SoundCloud) для активного аккаунта SoundCloud; null — аккаунт другой. Нужен, чтобы узнать «свои» треки и альбомы. */
+private val LocalScMyId = staticCompositionLocalOf<String?> { null }
+
+/** Нет сети: треки, которых нет на устройстве, показываются приглушёнными. */
 private val LocalOffline = compositionLocalOf { false }
 
+/**
+ * Запуск волны «по…» из карточек, страниц и меню трека (в плеере для этого есть [WaveFromSheet]).
+ * Предоставляется в AppRoot; null — волны нет (режим «Локальные файлы» или нет сети), кнопки тогда не показываются.
+ */
 private class WaveActions(
     val track: (Track) -> Unit,
     val album: (AlbumInfo) -> Unit,
@@ -733,6 +875,7 @@ private class WaveActions(
 
 private val LocalWaveActions = staticCompositionLocalOf<WaveActions?> { null }
 
+/** Маленькая круглая кнопка с волной в углу обложки карточки: включает волну по этому альбому / исполнителю / плейлисту. */
 @Composable
 private fun WaveBadge(onClick: () -> Unit, modifier: Modifier = Modifier, size: Dp = 36.dp) {
     Box(
@@ -748,9 +891,11 @@ private fun WaveBadge(onClick: () -> Unit, modifier: Modifier = Modifier, size: 
     }
 }
 
+/** id лайкнутых и id скачанных треков — для значков в списках; предоставляются в AppRoot. */
 private val LocalLikedIds = compositionLocalOf<Set<String>> { emptySet() }
 private val LocalDownloadedIds = compositionLocalOf<Set<String>> { emptySet() }
 
+/** Значки рядом с треком: «скачан» и «в лайках». Если показывать нечего — ничего не рисуется. */
 @Composable
 private fun TrackMarks(t: Track, modifier: Modifier = Modifier) {
     val liked = t.id in LocalLikedIds.current
@@ -768,6 +913,32 @@ private fun TrackMarks(t: Track, modifier: Modifier = Modifier) {
     }
 }
 
+/** Пункт меню «Выбрать для микса» / «Убрать из выбора» (выбор двух треков для микса, см. [MixPicker]). */
+@Composable
+private fun MixPickMenuItem(t: Track, close: () -> Unit) {
+    val sel = MixPicker.indexOf(t) >= 0
+    DropdownMenuItem(
+        text = { Text(if (sel) "Убрать из выбора для микса" else "Выбрать для микса") },
+        leadingIcon = { Icon(painterResource(R.drawable.ms_graphic_eq), null) },
+        onClick = { close(); MixPicker.toggle(t) },
+    )
+}
+
+/** Пункт меню плеера: запустить микс текущего трека со следующим прямо сейчас. */
+@Composable
+private fun MixNextMenuItem(vm: AppViewModel, close: () -> Unit) {
+    DropdownMenuItem(
+        text = { Text("Запустить микс со следующим") },
+        leadingIcon = { Icon(painterResource(R.drawable.ms_graphic_eq), null) },
+        enabled = vm.canMixNext(),
+        onClick = { close(); vm.mixWithNext() },
+    )
+}
+
+/**
+ * Пункты меню трека про скачивание и информацию (общие для меню строки трека и меню «⋮» в плеере).
+ * Не скачан — «Скачать» (по настройке) и «Скачать как…»; скачан частично — можно доложить недостающее; всегда — «Информация о треке».
+ */
 @Composable
 private fun TrackActionItems(t: Track, close: () -> Unit) {
     val dl = LocalDownloads.current
@@ -780,6 +951,18 @@ private fun TrackActionItems(t: Track, close: () -> Unit) {
     when {
         busy -> DropdownMenuItem(
             text = { Text("Скачивается…") },
+            leadingIcon = { Icon(painterResource(R.drawable.ms_download), null) },
+            enabled = false,
+            onClick = {},
+        )
+        // SoundCloud: автор запретил скачивание — пункт показываем, но недоступный, с пояснением.
+        d == null && t.isDownloadBlocked() -> DropdownMenuItem(
+            text = {
+                Column {
+                    Text("Скачать")
+                    Text(app.ymusic.m3e.data.ScDownloads.FORBIDDEN, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
             leadingIcon = { Icon(painterResource(R.drawable.ms_download), null) },
             enabled = false,
             onClick = {},
@@ -819,11 +1002,22 @@ private fun TrackActionItems(t: Track, close: () -> Unit) {
             )
         }
     }
+    // Свой трек SoundCloud: можно поменять название, описание, жанр, теги, обложку и видимость.
+    val scMyId = LocalScMyId.current
+    val editScItem = LocalEditScItem.current
+    if (scMyId != null && app.ymusic.m3e.data.ScIds.isSc(t.id) && t.artistRefs.any { it.id == scMyId }) {
+        DropdownMenuItem(
+            text = { Text("Изменить трек") },
+            leadingIcon = { Icon(painterResource(R.drawable.ms_edit), null) },
+            onClick = { close(); editScItem(t.id, false) },
+        )
+    }
     DropdownMenuItem(
         text = { Text("Информация о треке") },
         leadingIcon = { Icon(painterResource(R.drawable.ms_info), null) },
         onClick = { close(); showInfo(t) },
     )
+    // Поделиться: у трека Яндекс Музыки — ссылка, у файла с устройства — сам файл.
     val shareCtx = LocalContext.current
     DropdownMenuItem(
         text = { Text(if (t.isLocal) "Поделиться файлом" else "Поделиться") },
@@ -832,12 +1026,16 @@ private fun TrackActionItems(t: Track, close: () -> Unit) {
             close()
             if (t.isLocal) ShareLinks.shareFile(shareCtx, t)
             else ShareLinks.track(t)?.let { link ->
-                ShareLinks.shareText(shareCtx, t.title, "${t.title} — ${t.artists}\n$link")
+                ShareQrHost.open(t.title, "${t.title} — ${t.artists}\n$link", link)
             }
         },
     )
 }
 
+/**
+ * Окно выбора, куда скачивать: файлами, только в приложении или и то и другое.
+ * [showRemember] — добавляет «Не показывать снова»: выбранный способ станет основным, и окно больше не появится.
+ */
 @Composable
 private fun DownloadModeDialog(
     title: String,
@@ -915,6 +1113,7 @@ private fun InfoRow(label: String, value: String) {
     )
 }
 
+/** «Информация о треке»: как в Яндекс Музыке — исполнитель, альбом, год, лейбл, авторы и т. д. Пустые поля не показываются. */
 @Composable
 private fun TrackInfoSheet(vm: AppViewModel, t: Track, onDismiss: () -> Unit) {
     var loading by remember(t.id) { mutableStateOf(true) }
@@ -923,6 +1122,7 @@ private fun TrackInfoSheet(vm: AppViewModel, t: Track, onDismiss: () -> Unit) {
         info = vm.fetchTrackInfo(t)
         loading = false
     }
+    // Подписка только на загрузку этого трека: перерисовки шторки от чужих загрузок зациклили бы её анимацию (см. RecentTracksSheet).
     val dNow by remember(vm, t.id) {
         vm.downloads.map { st -> st.items.firstOrNull { it.id == t.id } }.distinctUntilChanged()
     }.collectAsStateWithLifecycle(initialValue = vm.downloads.value.items.firstOrNull { it.id == t.id })
@@ -978,6 +1178,9 @@ private fun TrackInfoSheet(vm: AppViewModel, t: Track, onDismiss: () -> Unit) {
     }
 }
 
+
+// ---------- Режим «Локальные файлы» (без Яндекс Музыки) ----------
+
 private enum class LocalTab(val title: String, val icon: Int) {
     Files("Файлы", R.drawable.ms_folder),
     Playlists("Плейлисты", R.drawable.ms_library_music),
@@ -989,6 +1192,10 @@ private fun List<Track>.filterByQuery(q: String): List<Track> =
             (it.albumTitle?.contains(q, ignoreCase = true) == true)
     }
 
+/**
+ * Приложение без Яндекс Музыки: музыка с устройства и свои плейлисты из неё. Плеер (мини и полный) — те же, что и в
+ * обычном режиме. Включается кнопкой «Пропустить» на экране входа; из него можно вернуться ко входу в Яндекс.
+ */
 @Composable
 private fun LocalModeRoot(vm: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -1003,6 +1210,7 @@ private fun LocalModeRoot(vm: AppViewModel) {
     LaunchedEffect(state.error) { state.error?.let { AppToast.error(it); vm.dismissError() } }
     LaunchedEffect(state.message) { state.message?.let { AppToast.show(it); vm.dismissMessage() } }
 
+    // Доступ к аудио: диалог показываем один раз, дальше — кнопка «Разрешить доступ».
     var granted by remember { mutableStateOf(LocalMusic.hasPermission(ctx)) }
     val request = rememberAudioAccessRequest { ok ->
         granted = ok
@@ -1021,10 +1229,12 @@ private fun LocalModeRoot(vm: AppViewModel) {
         } else if (now) vm.loadLocalTracks()
     }
 
+    // Полный плеер — шторка поверх, как в обычном режиме.
     val sheetScope = rememberCoroutineScope()
     val closedPx = with(LocalDensity.current) {
         androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp * ctx.resources.displayMetrics.density
     }
+    // Поворот экрана пересоздаёт Activity: открытый плеер должен остаться открытым (раньше он «вылетал» на главную).
     var playerWasOpen by rememberSaveable { mutableStateOf(false) }
     val sheet = remember { PlayerSheetState(Animatable(if (playerWasOpen) 0f else closedPx), closedPx, sheetScope) }
     LaunchedEffect(sheet) { snapshotFlow { sheet.offset.value < sheet.closedPx * 0.5f }.collect { playerWasOpen = it } }
@@ -1045,6 +1255,10 @@ private fun LocalModeRoot(vm: AppViewModel) {
 
     Box(Modifier.fillMaxSize()) {
         Scaffold(
+            modifier = Modifier.playerGlassBackdrop(
+                enabled = GlassSettings.playerGlass && !ThemeSettings.optimize && state.nowPlaying != null,
+                progress = { 1f - sheet.offset.value / sheet.closedPx.coerceAtLeast(1f) },
+            ),
             snackbarHost = { AppToastHost() },
             bottomBar = {
                 Column {
@@ -1105,6 +1319,7 @@ private fun LocalModeRoot(vm: AppViewModel) {
     }
 }
 
+/** Строка трека режима «Локальные файлы»: обложка, название, исполнитель и меню (добавить в плейлист / убрать из него). */
 @Composable
 private fun DeviceTrackRow(t: Track, onAdd: (() -> Unit)? = null, onRemove: (() -> Unit)? = null, onClick: () -> Unit) {
     val editLocal = LocalEditLocalTrack.current
@@ -1112,7 +1327,12 @@ private fun DeviceTrackRow(t: Track, onAdd: (() -> Unit)? = null, onRemove: (() 
     ListItem(
         headlineContent = { Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
         supportingContent = { Text(t.artists, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-        leadingContent = { Cover(model = t.cover(200), modifier = Modifier.size(52.dp).clip(rounded(14))) },
+        leadingContent = {
+            Box {
+                Cover(model = t.cover(200), modifier = Modifier.size(52.dp).clip(rounded(14)))
+                MixPickBadge(t, Modifier.size(52.dp))
+            }
+        },
         trailingContent = {
             run {
                 var menu by remember { mutableStateOf(false) }
@@ -1128,6 +1348,7 @@ private fun DeviceTrackRow(t: Track, onAdd: (() -> Unit)? = null, onRemove: (() 
                                 onClick = { menu = false; onAdd() },
                             )
                         }
+                        MixPickMenuItem(t) { menu = false }
                         DropdownMenuItem(
                             text = { Text("Изменить название, исполнителя и обложку") },
                             leadingIcon = { Icon(painterResource(R.drawable.ms_edit), null) },
@@ -1149,11 +1370,16 @@ private fun DeviceTrackRow(t: Track, onAdd: (() -> Unit)? = null, onRemove: (() 
                 }
             }
         },
-        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-        modifier = Modifier.padding(horizontal = 8.dp).clip(containerShape(24)).clickable(onClick = onClick),
+        colors = MixPicker.rowColors(t),
+        modifier = Modifier.padding(horizontal = 8.dp).clip(containerShape(24))
+            .combinedClickable(
+                onClick = { if (MixPicker.active) MixPicker.toggle(t) else onClick() },
+                onLongClick = { MixPicker.toggle(t) },
+            ),
     )
 }
 
+/** «Слушать» и «Вперемешку» в одну строку. */
 @Composable
 private fun DevicePlayRow(enabled: Boolean, onPlay: () -> Unit, onShuffle: () -> Unit) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -1164,18 +1390,19 @@ private fun DevicePlayRow(enabled: Boolean, onPlay: () -> Unit, onShuffle: () ->
             modifier = groupWeight(playSrc, listOf(shuffleSrc)).height(52.dp),
             interactionSource = playSrc,
         ) {
-            Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); Text("Слушать", maxLines = 1)
+            Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); FitText("Слушать")
         }
         FilledTonalButton(
             onClick = onShuffle, enabled = enabled,
             modifier = groupWeight(shuffleSrc, listOf(playSrc)).height(52.dp),
             interactionSource = shuffleSrc,
         ) {
-            Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); Text("Вперемешку", maxLines = 1)
+            Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); FitText("Вперемешку")
         }
     }
 }
 
+/** Заголовок вкладки режима «Локальные файлы» с кнопкой возврата ко входу в Яндекс. */
 @Composable
 private fun DeviceHeader(title: String, subtitle: String, onExit: () -> Unit, action: (@Composable () -> Unit)? = null) {
     Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1210,6 +1437,7 @@ private fun DeviceSearchField(query: String, onChange: (String) -> Unit) {
     )
 }
 
+/** Вкладка «Файлы»: вся музыка с устройства, поиск, «Слушать» / «Вперемешку», меню «Добавить в плейлист». */
 @Composable
 private fun LocalFilesTab(
     vm: AppViewModel,
@@ -1281,6 +1509,7 @@ private fun LocalFilesTab(
     }
 }
 
+/** Вкладка «Плейлисты»: свои плейлисты из файлов устройства. */
 @Composable
 private fun LocalPlaylistsTab(
     vm: AppViewModel, onOpen: (DevicePlaylist) -> Unit, onCreate: () -> Unit, onFolder: () -> Unit, onExit: () -> Unit,
@@ -1331,6 +1560,7 @@ private fun LocalPlaylistsTab(
     }
 }
 
+/** Страница плейлиста из файлов устройства: слушать, добавить треки, переименовать, удалить. */
 @Composable
 private fun LocalPlaylistPage(vm: AppViewModel, pl: DevicePlaylist, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -1350,7 +1580,7 @@ private fun LocalPlaylistPage(vm: AppViewModel, pl: DevicePlaylist, onBack: () -
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
             if (pl.folder == null) {
                 FilledTonalButton(onClick = { showPicker = true }, modifier = Modifier.weight(1f).height(48.dp)) {
-                    Icon(painterResource(R.drawable.ms_add), null); Spacer(Modifier.width(6.dp)); Text("Добавить треки", maxLines = 1)
+                    Icon(painterResource(R.drawable.ms_add), null); Spacer(Modifier.width(6.dp)); FitText("Добавить треки")
                 }
             } else Spacer(Modifier.weight(1f))
             IconButton(onClick = { showRename = true }) {
@@ -1403,6 +1633,7 @@ private fun LocalPlaylistPage(vm: AppViewModel, pl: DevicePlaylist, onBack: () -
     }
 }
 
+/** Окно выбора треков с устройства для плейлиста: галочки, поиск, кнопка «Добавить (N)». */
 @Composable
 private fun DeviceSongPicker(tracks: List<Track>, already: Set<String>, onDismiss: () -> Unit, onAdd: (List<String>) -> Unit) {
     var query by remember { mutableStateOf("") }
@@ -1447,6 +1678,7 @@ private fun DeviceSongPicker(tracks: List<Track>, already: Set<String>, onDismis
     }
 }
 
+/** Выбор плейлиста для трека из меню «Добавить в плейлист» (или создание нового плейлиста с этим треком). */
 @Composable
 private fun DevicePlaylistChooser(track: Track, onDismiss: () -> Unit) {
     val ctx = LocalContext.current
@@ -1497,6 +1729,10 @@ private fun DevicePlaylistChooser(track: Track, onDismiss: () -> Unit) {
     )
 }
 
+/**
+ * Плейлист из папки: системное окно выбора папки (внутренняя память или SD-карта), затем окно с названием —
+ * по умолчанию это имя папки, его можно сразу поменять. Возвращает действие «открыть выбор папки».
+ */
 @Composable
 private fun rememberFolderPlaylistPicker(onCreated: (DevicePlaylist) -> Unit): () -> Unit {
     var pending by remember { mutableStateOf<String?>(null) }
@@ -1517,6 +1753,7 @@ private fun rememberFolderPlaylistPicker(onCreated: (DevicePlaylist) -> Unit): (
     return { runCatching { launcher.launch(null) } }
 }
 
+/** Окно с полем «название» для создания и переименования плейлиста из файлов устройства. */
 @Composable
 private fun DevicePlaylistNameDialog(
     title: String, initial: String, confirm: String, onDismiss: () -> Unit, onConfirm: (String) -> Unit,
@@ -1538,14 +1775,25 @@ private fun DevicePlaylistNameDialog(
     )
 }
 
+
+// ---------- Режим «Локальные файлы» в основном интерфейсе ----------
+// Те же вкладки, док-панель, плеер и настройки, что и с аккаунтом. Вместо данных Яндекс Музыки — файлы телефона:
+// альбомы, исполнители, имена файлов, свои плейлисты и поиск. Вход через Яндекс — в профиле и в настройках.
+
+/** Доступ к аудиофайлам устройства: выдан ли он и как его запросить; предоставляется в AppRoot. */
 private class AudioAccess(val granted: Boolean, val request: () -> Unit)
 
 private val LocalAudioAccess = compositionLocalOf { AudioAccess(true) {} }
 
+/**
+ * Страницы режима «Локальные файлы», открытые поверх вкладок (стопкой): "files", "albums", "artists", "playlists",
+ * "history", "album:<ключ>", "artist:<имя>", "pl:<id плейлиста>". Нажатие на вкладку в доке закрывает их все.
+ */
 private class DeviceNav {
     val stack = mutableStateListOf<String>()
     val top: String? get() = stack.lastOrNull()
     private fun detail(p: String?) = p != null && (p.startsWith("album:") || p.startsWith("artist:") || p.startsWith("pl:"))
+    /** Страница альбома, исполнителя или плейлиста, открытая из такой же страницы, заменяет её, а не ложится сверху. */
     fun open(page: String) {
         val top = stack.lastOrNull()
         if (top == page) return
@@ -1557,18 +1805,36 @@ private class DeviceNav {
 
 private val LocalDeviceNav = staticCompositionLocalOf { DeviceNav() }
 
+/** Ключ в [UiState.playingSource], когда играют «Все файлы». */
 private const val DEVICE_SOURCE = "device"
 
 private fun plural(n: Int, one: String, few: String, many: String): String {
     val m10 = n % 10
     val m100 = n % 100
-    return if (m10 == 1 && m100 != 11) one else if (m10 in 2..4 && m100 !in 12..14) few else many
+    // Английский: только «один» и «много»; русский и белорусский — три формы. Слова переводятся словарём.
+    if (AppLang.code == "en") return AppLang.tr(if (n == 1) one else many)
+    return AppLang.tr(if (m10 == 1 && m100 != 11) one else if (m10 in 2..4 && m100 !in 12..14) few else many)
+}
+
+/** «1 234 567 слушателей в месяц» (число с неразрывными пробелами между разрядами). */
+private fun listenersText(n: Long): String {
+    val num = String.format(java.util.Locale.US, "%,d", n).replace(',', '\u00A0')
+    // Форма слова зависит от последних цифр числа.
+    val k = (n % 1_000_000_000L).toInt()
+    return "$num " + plural(k, "слушатель", "слушателя", "слушателей") + " " + AppLang.tr("в месяц")
+}
+
+/** «1 234 подписчика»: у SoundCloud слушателей нет, только подписчики. */
+private fun followersText(n: Long): String {
+    val num = String.format(java.util.Locale.US, "%,d", n).replace(',', '\u00A0')
+    return "$num " + plural((n % 1_000_000_000L).toInt(), "подписчик", "подписчика", "подписчиков")
 }
 
 private fun tracksWord(n: Int) = "$n " + plural(n, "трек", "трека", "треков")
 private fun albumsWord(n: Int) = "$n " + plural(n, "альбом", "альбома", "альбомов")
 private fun artistsWord(n: Int) = "$n " + plural(n, "исполнитель", "исполнителя", "исполнителей")
 
+/** Поиск по файлам: название, исполнитель, альбом и имя файла. */
 private fun List<Track>.filterFiles(q: String): List<Track> =
     if (q.isEmpty()) this else filter {
         it.title.contains(q, ignoreCase = true) || it.artists.contains(q, ignoreCase = true) ||
@@ -1576,9 +1842,11 @@ private fun List<Track>.filterFiles(q: String): List<Track> =
             (it.fileName?.contains(q, ignoreCase = true) == true)
     }
 
+/** Треки плейлиста из файлов устройства (те, что ещё лежат на телефоне), по порядку. */
 private fun DevicePlaylist.resolve(byId: Map<String, Track>, all: List<Track>): List<Track> =
     if (folder != null) LocalFolders.tracksIn(all, folder) else trackIds.mapNotNull { byId[it] }
 
+/** Блок «Нужен доступ к музыке»: кнопка запроса и переход в настройки приложения. */
 @Composable
 private fun DeviceAccessNotice() {
     val access = LocalAudioAccess.current
@@ -1611,6 +1879,7 @@ private fun DeviceAccessNotice() {
     }
 }
 
+/** Пустой список или загрузка под шапкой: «читаем файлы», «ничего не найдено» или просьба о доступе. */
 private fun LazyListScope.deviceStatusItems(loading: Boolean, empty: Boolean, granted: Boolean, emptyText: String) {
     if (!granted) {
         item(key = "dev_access") { DeviceAccessNotice() }
@@ -1627,6 +1896,10 @@ private fun LazyListScope.deviceStatusItems(loading: Boolean, empty: Boolean, gr
     }
 }
 
+/**
+ * Строка трека из файлов устройства: обложка, название, «исполнитель · альбом» и имя файла. Меню: добавить в плейлист,
+ * перейти к исполнителю и к альбому, убрать из плейлиста (если строка внутри плейлиста).
+ */
 @Composable
 private fun DeviceRow(t: Track, modifier: Modifier = Modifier, onRemove: (() -> Unit)? = null, onClick: () -> Unit) {
     val nav = LocalDeviceNav.current
@@ -1698,6 +1971,7 @@ private fun DeviceRow(t: Track, modifier: Modifier = Modifier, onRemove: (() -> 
     )
 }
 
+/** Карточка плейлиста из файлов устройства — как карточка плейлиста Яндекс Музыки. */
 @Composable
 private fun DevicePlaylistCard(
     name: String,
@@ -1720,8 +1994,8 @@ private fun DevicePlaylistCard(
                 .clip(rounded(28))
                 .indication(source, LocalIndication.current),
         )
-        Text(
-            name, maxLines = 1, overflow = TextOverflow.Ellipsis,
+        FitText(
+            name, maxLines = 2,
             style = MaterialTheme.typography.titleSmall,
             modifier = Modifier.padding(top = 8.dp, start = 4.dp, end = 4.dp),
         )
@@ -1734,6 +2008,7 @@ private fun DevicePlaylistCard(
     }
 }
 
+/** Верхний блок главной в режиме «Локальные файлы»: сколько музыки на телефоне и кнопки «Слушать» / «Вперемешку». */
 @Composable
 private fun DeviceHero(
     tracks: Int,
@@ -1782,7 +2057,7 @@ private fun DeviceHero(
                     contentPadding = PaddingValues(horizontal = 12.dp),
                     interactionSource = playSrc,
                 ) {
-                    Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); Text("Слушать", maxLines = 1)
+                    Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); FitText("Слушать")
                 }
                 FilledTonalButton(
                     onClick = onShuffle, enabled = tracks > 0,
@@ -1790,12 +2065,14 @@ private fun DeviceHero(
                     contentPadding = PaddingValues(horizontal = 12.dp),
                     interactionSource = shuffleSrc,
                 ) {
-                    Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); Text("Вперемешку", maxLines = 1)
+                    Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); FitText("Вперемешку")
                 }
             }
         }
     }
 }
+
+// ---- Главная ----
 
 @Composable
 private fun LocalHomeScreen(vm: AppViewModel) {
@@ -1933,11 +2210,14 @@ private fun LocalHomeScreen(vm: AppViewModel) {
         ModalBottomSheet(onDismissRequest = { showRecognize = false }) {
             RecognitionContent(
                 onClose = { showRecognize = false },
-                onOpenInApp = { r -> showRecognize = false; vm.requestSearch(r.query) },
+                inApp = true,
+                onOpenInApp = { r -> showRecognize = false; vm.requestRecognizedSearch(r.query); Recognizer.reset() },
             )
         }
     }
 }
+
+// ---- Плейлисты ----
 
 @Composable
 private fun LocalPlaylistsScreen(vm: AppViewModel) {
@@ -2006,19 +2286,20 @@ private fun LocalPlaylistsScreen(vm: AppViewModel) {
                     modifier = Modifier.weight(1f).height(56.dp),
                 ) {
                     Icon(painterResource(R.drawable.ms_add), null)
-                    Spacer(Modifier.width(8.dp)); Text("Новый плейлист", maxLines = 1)
+                    Spacer(Modifier.width(8.dp)); FitText("Новый плейлист")
                 }
                 FilledTonalButton(
                     onClick = pickFolder,
                     modifier = Modifier.weight(1f).height(56.dp),
                 ) {
                     Icon(painterResource(R.drawable.ms_folder), null)
-                    Spacer(Modifier.width(8.dp)); Text("Из папки", maxLines = 1)
+                    Spacer(Modifier.width(8.dp)); FitText("Из папки")
                 }
             }
         }
         deviceStatusItems(state.localLoading, tracks.isEmpty(), access.granted, "Музыки на устройстве не найдено")
 
+        // ---- Плейлисты ----
         item(key = "playlists_title") {
             Box(Modifier.padding(top = 8.dp)) { SectionLink("Плейлисты") { nav.open("playlists") } }
         }
@@ -2047,6 +2328,7 @@ private fun LocalPlaylistsScreen(vm: AppViewModel) {
             }
         }
 
+        // ---- Альбомы ----
         item(key = "albums_title") { SectionLink("Альбомы", count = lib.albums.size.takeIf { it > 0 }) { nav.open("albums") } }
         if (lib.albums.isEmpty()) {
             item(key = "albums_empty") {
@@ -2067,6 +2349,7 @@ private fun LocalPlaylistsScreen(vm: AppViewModel) {
             }
         }
 
+        // ---- Исполнители ----
         item(key = "artists_title") { SectionLink("Исполнители", count = lib.artists.size.takeIf { it > 0 }) { nav.open("artists") } }
         if (lib.artists.isEmpty()) {
             item(key = "artists_empty") {
@@ -2105,16 +2388,20 @@ private fun LocalPlaylistsScreen(vm: AppViewModel) {
     }
 }
 
+// ---- Поиск ----
+
 @Composable
 private fun LocalSearchScreen(vm: AppViewModel, active: Boolean = true) {
     val state by vm.state.collectAsStateWithLifecycle()
     val nav = LocalDeviceNav.current
     val access = LocalAudioAccess.current
     var query by rememberSaveable { mutableStateOf("") }
+    // Запрос из распознавания музыки: подставляем в поле.
     val searchRequest by vm.searchRequest.collectAsStateWithLifecycle()
     LaunchedEffect(searchRequest) {
         searchRequest?.let { r -> query = r; vm.consumeSearchRequest() }
     }
+    // Поиск идёт по уже прочитанным файлам, с небольшой задержкой после последней буквы.
     var q by remember { mutableStateOf(query.trim()) }
     LaunchedEffect(query) { delay(150); q = query.trim() }
     val lib = state.localLib
@@ -2147,6 +2434,7 @@ private fun LocalSearchScreen(vm: AppViewModel, active: Boolean = true) {
     LaunchedEffect(active) {
         if (!active) { keyboard?.hide(); focusManager.clearFocus() }
     }
+    // Кнопка поиска на главной: ставим курсор в поле и открываем клавиатуру.
     val focusPending by vm.searchFocusRequest.collectAsStateWithLifecycle()
     LaunchedEffect(focusPending, active) {
         if (focusPending && active) {
@@ -2157,6 +2445,7 @@ private fun LocalSearchScreen(vm: AppViewModel, active: Boolean = true) {
             vm.consumeSearchFocus()
         }
     }
+    // Прокрутили список — клавиатура прячется.
     LaunchedEffect(listState) {
         snapshotFlow { listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > 12 }
             .distinctUntilChanged()
@@ -2295,6 +2584,8 @@ private fun LocalSearchScreen(vm: AppViewModel, active: Boolean = true) {
     }
 }
 
+// ---- Профиль ----
+
 @Composable
 private fun DeviceStat(value: Int, label: String, modifier: Modifier = Modifier) {
     Surface(modifier = modifier, shape = rounded(20), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
@@ -2381,6 +2672,9 @@ private fun LocalProfileScreen(vm: AppViewModel, onOpenSettings: () -> Unit, onL
     } else profilePane()
 }
 
+// ---- Страницы поверх вкладок ----
+
+/** Нужная страница режима «Локальные файлы» по её ключу (см. [DeviceNav]). */
 @Composable
 private fun DevicePageHost(vm: AppViewModel, page: String) {
     when {
@@ -2395,6 +2689,7 @@ private fun DevicePageHost(vm: AppViewModel, page: String) {
     }
 }
 
+/** Все файлы с устройства: слушать, вперемешку, поиск по названию, исполнителю, альбому и имени файла. */
 @Composable
 private fun DeviceFilesPage(vm: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -2438,6 +2733,7 @@ private fun DeviceFilesPage(vm: AppViewModel) {
     }
 }
 
+/** Все альбомы из файлов устройства сеткой. */
 @Composable
 private fun DeviceAlbumsPage(vm: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -2471,6 +2767,7 @@ private fun DeviceAlbumsPage(vm: AppViewModel) {
     }
 }
 
+/** Все исполнители из файлов устройства сеткой. */
 @Composable
 private fun DeviceArtistsPage(vm: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -2504,6 +2801,7 @@ private fun DeviceArtistsPage(vm: AppViewModel) {
     }
 }
 
+/** Все плейлисты из файлов устройства сеткой. */
 @Composable
 private fun DevicePlaylistsPage(vm: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -2531,14 +2829,14 @@ private fun DevicePlaylistsPage(vm: AppViewModel) {
                             modifier = Modifier.weight(1f).height(56.dp),
                         ) {
                             Icon(painterResource(R.drawable.ms_add), null)
-                            Spacer(Modifier.width(8.dp)); Text("Новый плейлист", maxLines = 1)
+                            Spacer(Modifier.width(8.dp)); FitText("Новый плейлист")
                         }
                         FilledTonalButton(
                             onClick = pickFolder,
                             modifier = Modifier.weight(1f).height(56.dp),
                         ) {
                             Icon(painterResource(R.drawable.ms_folder), null)
-                            Spacer(Modifier.width(8.dp)); Text("Из папки", maxLines = 1)
+                            Spacer(Modifier.width(8.dp)); FitText("Из папки")
                         }
                     }
                 }
@@ -2578,6 +2876,7 @@ private fun DevicePlaylistsPage(vm: AppViewModel) {
     }
 }
 
+/** История прослушанных файлов. */
 @Composable
 private fun DeviceHistoryPage(vm: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -2611,6 +2910,7 @@ private fun DeviceHistoryPage(vm: AppViewModel) {
     }
 }
 
+/** Альбом из файлов устройства: обложка, исполнитель, год, треки по порядку номеров и имена файлов. */
 @Composable
 private fun DeviceAlbumPage(vm: AppViewModel, key: String) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -2660,6 +2960,7 @@ private fun DeviceAlbumPage(vm: AppViewModel, key: String) {
     }
 }
 
+/** Исполнитель из файлов устройства: его альбомы и все треки с именами файлов. */
 @Composable
 private fun DeviceArtistPage(vm: AppViewModel, name: String) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -2714,6 +3015,7 @@ private fun DeviceArtistPage(vm: AppViewModel, name: String) {
                 if (artist.albums.isNotEmpty()) {
                     item { SectionTitle("Альбомы") }
                     item {
+                        // Три карточки в ряд, остальные листаются — как на странице артиста Яндекс Музыки.
                         BoxWithConstraints(Modifier.fillMaxWidth()) {
                             val cardW = ((maxWidth - 32.dp - 24.dp) / 3).coerceAtLeast(96.dp)
                             LazyRow(
@@ -2736,11 +3038,13 @@ private fun DeviceArtistPage(vm: AppViewModel, name: String) {
     }
 }
 
+/** Плейлист из файлов устройства: слушать, добавить треки, переименовать (нажатие на название или обложку), удалить. */
 @Composable
 private fun DevicePlaylistPage(vm: AppViewModel, id: String) {
     val state by vm.state.collectAsStateWithLifecycle()
     val nav = LocalDeviceNav.current
     val pl = DevicePlaylists.items.firstOrNull { it.id == id }
+    // Плейлист удалили — страница закрывается сама.
     LaunchedEffect(pl == null) { if (pl == null) nav.back() }
     if (pl == null) return
     val byId = remember(state.localTracks) { state.localTracks.associateBy { it.id } }
@@ -2762,6 +3066,7 @@ private fun DevicePlaylistPage(vm: AppViewModel, id: String) {
                     subtitle = pl.folder,
                 )
             }
+            // Кнопки без подписей, в один-два ряда.
             item(key = "device_pl_actions") {
                 IconActionRows(
                     listOfNotNull(
@@ -2824,23 +3129,39 @@ private fun DevicePlaylistPage(vm: AppViewModel, id: String) {
 @Composable
 fun AppRoot(vm: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
+    // Сервис активного аккаунта (Яндекс / VK): от него зависят подписи и доступные кнопки.
+    val activeProvider = state.provider
+    SideEffect {
+        ActiveProvider.value = activeProvider
+        ActiveProvider.caps = vm.apiCaps()
+    }
+    // Планшетная раскладка (боковая панель, две колонки): окно шире 600 dp. Настраивается в Настройки → Внешний вид → Планшеты.
     val wide = rememberIsWide()
     val compactH = rememberIsCompactHeight()
+    // Режим «Локальные файлы»: включается кнопкой «Пропустить» на экране входа. Тот же интерфейс (вкладки, док, плеер,
+    // настройки), но вместо Яндекс Музыки — музыка с телефона; войти в Яндекс можно в профиле и в настройках.
     val local = !state.loggedIn && LocalModeSettings.enabled
     if (!state.loggedIn && !local) {
         LoginScreen(
+            vm = vm,
             error = state.error,
             onToken = { vm.onTokenReceived(it) },
             onSkip = { LocalModeSettings.updateEnabled(true); vm.loadLocalHistory() },
         )
         return
     }
+    // Вошли в Яндекс Музыку — режим «Локальные файлы» выключается: после выхода из аккаунта снова будет экран входа.
     if (state.loggedIn) {
         LaunchedEffect(Unit) { if (LocalModeSettings.enabled) LocalModeSettings.updateEnabled(false) }
     }
+    // Ссылки music.yandex.* должны открываться в этом приложении: один раз предлагаем включить это в настройках системы.
     LinkHandlingPrompt()
+    // Аккаунт VK: окно с тем, что нужно сделать для корректной работы (с галочкой «Больше не показывать»).
+    if (state.loggedIn) VkFirstRunPrompt()
+    // Выбор платформы для входа поверх локального режима (кнопка в профиле и в настройках).
     var showLogin by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(state.loggedIn) { if (state.loggedIn) showLogin = false }
+    // Доступ к аудиофайлам: диалог показываем один раз, дальше — кнопка «Разрешить доступ».
     val appCtx = LocalContext.current
     var audioGranted by remember { mutableStateOf(LocalMusic.hasPermission(appCtx)) }
     val requestAudio = rememberAudioAccessRequest { ok ->
@@ -2853,6 +3174,7 @@ fun AppRoot(vm: AppViewModel) {
             if (audioGranted) vm.loadLocalTracks()
             else if (!audioAsked) { audioAsked = true; requestAudio(false) }
         }
+        // Вернулись в приложение: доступ могли выдать или отозвать в настройках, а файлы — измениться.
         LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
             val now = LocalMusic.hasPermission(appCtx)
             audioGranted = now
@@ -2861,10 +3183,16 @@ fun AppRoot(vm: AppViewModel) {
     }
     val deviceNav = remember { DeviceNav() }
     val deviceTracker = remember { ScrollTracker() }
+    // Выход из режима (вход в аккаунт): открытые страницы файлов закрываем.
     LaunchedEffect(local) { if (!local) deviceNav.clear() }
 
+    // rememberSaveable: Android убивает процесс, когда разрешение меняют в системных настройках;
+    // после возврата пользователь остаётся на том же экране, а не выбрасывается на главную.
+    // Набор и порядок экранов настраиваются (Настройки → Внешний вид → Навигация).
     val tabs = NavSettings.tabs
     var tab by rememberSaveable { mutableStateOf(NavSettings.tabs.first()) }
+    // История переходов между вкладками: системная кнопка «назад» возвращает на предыдущую вкладку
+    // (например, с «Поиска», открытого с главной, — обратно на главную), а с первой вкладки выходит из приложения.
     val tabHistory = remember { mutableStateListOf<Tab>() }
     val goTab: (Tab) -> Unit = { t ->
         if (t != tab) {
@@ -2874,13 +3202,18 @@ fun AppRoot(vm: AppViewModel) {
             tab = t
         }
     }
+    // Экран убрали из панели, пока он был открыт, — переходим на первый из оставшихся.
     LaunchedEffect(tabs) {
         tabHistory.removeAll { it !in tabs }
         if (tab !in tabs) tab = tabs.first()
     }
+    // Поиск как отдельная страница поверх — нужна, только если вкладку «Поиск» убрали из панели.
     var searchOverlay by rememberSaveable { mutableStateOf(false) }
     val searchTracker = remember { ScrollTracker() }
+    // Вернулись в приложение, а оно всё ещё «офлайн», хотя сеть уже есть, — пробуем загрузить заново.
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.retryIfOffline() }
+    // Предзагрузка обложек: текущий трек, соседние и ближайшие в очереди (во всех размерах, что нужны плееру, мини-плееру
+    // и фону) грузятся заранее, а с ними — первые строки списков (любимое, история, поиск, плейлисты).
     LaunchedEffect(state.netEpoch) { if (state.netEpoch > 0) CoverPreloader.reset() }
     val preloadNowId = state.nowPlaying?.id
     LaunchedEffect(preloadNowId, state.netEpoch) {
@@ -2902,11 +3235,15 @@ fun AppRoot(vm: AppViewModel) {
             tr.flatMap { listOf(it.cover(200), it.cover(300)) } + state.playlists.take(14).flatMap { listOf(it.cover(), it.cover(200)) },
         )
     }
+    // Полный плеер — шторка: её вытягивают свайпом вверх от мини-плеера (как в Яндекс Музыке), открывают нажатием
+    // на мини-плеер или кнопкой виджета. Положение шторки хранится в одном Animatable.
     val sheetScope = rememberCoroutineScope()
     val closedPx = with(LocalDensity.current) {
+        // В физических пикселях: масштаб интерфейса меняет плотность, и «dp экрана → px» дал бы неверную высоту.
         androidx.compose.ui.platform.LocalConfiguration.current.screenHeightDp *
             LocalContext.current.resources.displayMetrics.density
     }
+    // Поворот экрана пересоздаёт Activity: открытый плеер должен остаться открытым (раньше он «вылетал» на главную).
     var playerWasOpen by rememberSaveable { mutableStateOf(false) }
     val sheet = remember { PlayerSheetState(Animatable(if (playerWasOpen) 0f else closedPx), closedPx, sheetScope) }
     LaunchedEffect(sheet) { snapshotFlow { sheet.offset.value < sheet.closedPx * 0.5f }.collect { playerWasOpen = it } }
@@ -2919,8 +3256,10 @@ fun AppRoot(vm: AppViewModel) {
         }
     }
     LaunchedEffect(state.nowPlaying == null) { if (state.nowPlaying == null) sheet.close() }
+    // «Наверх»: левый верхний угол экрана или повторное нажатие на выбранную вкладку.
     var scrollTopTick by remember { mutableIntStateOf(0) }
     var lastProfileTap by remember { mutableLongStateOf(0L) }
+    var resyncTick by remember { mutableIntStateOf(0) }
     val tabsTracker = remember { ScrollTracker() }
     val artistTracker = remember { ScrollTracker() }
     val albumTracker = remember { ScrollTracker() }
@@ -2928,12 +3267,23 @@ fun AppRoot(vm: AppViewModel) {
     val snackbar = remember { SnackbarHostState() }
     var trackToAdd by remember { mutableStateOf<Track?>(null) }
     var showCreateForTrack by remember { mutableStateOf(false) }
+    // «Информация о треке» и «Скачать как…» для отдельного трека.
     var infoTrack by remember { mutableStateOf<Track?>(null) }
     var editLocalTrack by remember { mutableStateOf<Track?>(null) }
+    // Свой трек/альбом SoundCloud, который сейчас редактируется (id, это альбом).
+    var editSc by remember { mutableStateOf<Pair<String, Boolean>?>(null) }
+    val scMyId = remember(state.accounts, state.activeToken) {
+        state.accounts.firstOrNull { it.token == state.activeToken && it.provider == app.ymusic.m3e.data.Provider.SOUNDCLOUD }
+            ?.let { app.ymusic.m3e.data.ScProfile.fromJson(it.scInfo) }?.let { app.ymusic.m3e.data.ScIds.PREFIX + it.id }
+    }
     var modeTrack by remember { mutableStateOf<Track?>(null) }
+    // «Включить волну» из меню трека: окно выбора (по треку / исполнителю / альбому).
     var waveTrack by remember { mutableStateOf<Track?>(null) }
     var showSettings by rememberSaveable { mutableStateOf(false) }
+    // Окно «чем поделились» (Редактор интерфейса → Ссылки → «Открывать модалкой»).
     var previewLink by remember { mutableStateOf<SharedLink?>(null) }
+    // Мини-плеер показываем/прячем с небольшой задержкой на скрытие: короткие «пустые» моменты
+    // при смене очереди не должны запускать анимацию выезда/появления заново.
     val hasTrack = state.nowPlaying != null
     var miniVisible by remember { mutableStateOf(hasTrack) }
     LaunchedEffect(hasTrack) {
@@ -2946,6 +3296,7 @@ fun AppRoot(vm: AppViewModel) {
         state.message?.let { AppToast.show(it); vm.dismissMessage() }
     }
 
+    // Док-панель: автоскрытие при прокрутке вниз (если включено в Настройки → Оформление).
     val autoHide = ThemeSettings.dockAutoHide
     var dockHidden by remember { mutableStateOf(false) }
     LaunchedEffect(autoHide, tab, showSettings, scrollTopTick) { dockHidden = false }
@@ -2955,10 +3306,13 @@ fun AppRoot(vm: AppViewModel) {
         label = "dockHide",
     )
     val navInsetPx = WindowInsets.navigationBars.getBottom(LocalDensity.current)
+    // Подложка дока: размытый экран позади (по умолчанию), сплошная панель (блюр выключен) или ничего (островок).
     val backdrop = rememberDockBackdrop()
+    // Мини-плеер и фон полного плеера берут размытый экран из того же слоя («Матовое стекло»).
     GlassHost.backdrop = backdrop
-    val fullBackdrop = rememberDockBackdrop()
-    GlassHost.fullBackdrop = fullBackdrop
+    // Матовое стекло полного плеера: всё приложение под плеером (вместе с доком и мини-плеером) размывается прямо на месте,
+    // сила размытия растёт вместе с выезжающей шторкой. Отдельная запись экрана в слой для этого не нужна.
+    // Островок тоже получает размытие под собой (с мягкой верхней кромкой); без размытия под ним ничего нет, как раньше.
     val dockMode = when {
         ThemeSettings.dockBlur && !ThemeSettings.optimize -> DockBackdropMode.Blur
         ThemeSettings.dockIsland -> DockBackdropMode.None
@@ -2975,6 +3329,7 @@ fun AppRoot(vm: AppViewModel) {
         }
     }
 
+    // Нажатия на вкладки дока: повторное нажатие на выбранную — наверх; двойное нажатие на «Профиль» — настройки.
     val onDockSelect: (Tab) -> Unit = { t ->
         val now = android.os.SystemClock.uptimeMillis()
         val doubleProfile = !wide && t == Tab.Profile && now - lastProfileTap < 450L
@@ -2988,10 +3343,13 @@ fun AppRoot(vm: AppViewModel) {
             showSettings = true
         } else {
             if (t == tab) {
+                // Нажатие на текущий раздел: закрываем всё открытое поверх него (настройки, исполнитель, альбом,
+                // плейлист, «Чарт»...) и возвращаемся на его главную страницу. Если и так на ней — прокрутка наверх.
                 val hadOverlay = showSettings || searchOverlay || state.openedArtist != null || state.openedAlbum != null ||
                     deviceNav.top != null
                 val hadInner = innerPages.resetAll()
                 if (!hadOverlay && !hadInner) scrollTopTick++
+                resyncTick++
             }
             goTab(t)
             showSettings = false
@@ -3001,7 +3359,10 @@ fun AppRoot(vm: AppViewModel) {
         }
     }
 
+    // Переход на «Поиск» по кнопке с главной идёт с анимацией (плавное затухание → появление поиска), даже если
+    // между ними есть другие вкладки. Флаг гасится сам, когда пейджер взял его в работу.
     var searchJump by remember { mutableStateOf(false) }
+    // Кнопка поиска на главной: открыть поиск и поставить курсор в поле.
     val openSearch: () -> Unit = {
         showSettings = false
         deviceNav.clear()
@@ -3013,6 +3374,7 @@ fun AppRoot(vm: AppViewModel) {
         } else searchOverlay = true
     }
 
+    // Распознанный трек: открываем «Поиск» и ищем его (SearchScreen сам подхватит запрос).
     val searchRequest by vm.searchRequest.collectAsStateWithLifecycle()
     LaunchedEffect(searchRequest) {
         if (searchRequest != null) {
@@ -3025,6 +3387,7 @@ fun AppRoot(vm: AppViewModel) {
         }
     }
 
+    // Ссылка, которой поделились (трек, альбом, исполнитель, плейлист): закрываем лишнее и открываем страницу.
     val linkRequest by vm.linkRequest.collectAsStateWithLifecycle()
     LaunchedEffect(linkRequest) {
         val link = linkRequest ?: return@LaunchedEffect
@@ -3037,6 +3400,7 @@ fun AppRoot(vm: AppViewModel) {
         vm.consumeLinkRequest()
         AppLog.i("Link", "открываем: $link, модалка=${UiLayout.linkModal}")
         val isPlaylist = link is SharedLink.PlaylistLink || link is SharedLink.PlaylistUuidLink
+        // Модалка — по настройке; профиль всегда окном; плейлист страницей нужен вкладке «Плейлисты» — если её нет в доке, тоже окном.
         if (UiLayout.linkModal || link is SharedLink.UserLink || (isPlaylist && Tab.Playlists !in tabs) || local) {
             previewLink = link
         } else {
@@ -3045,17 +3409,28 @@ fun AppRoot(vm: AppViewModel) {
         }
     }
 
+    // Ссылка Яндекс Музыки в буфере обмена: предлагаем открыть (если система не передала её приложению).
     val clipLink by vm.clipLink.collectAsStateWithLifecycle()
     clipLink?.let { cl ->
         AlertDialog(
             onDismissRequest = { vm.dismissClipLink() },
             title = { Text("Открыть ссылку?") },
-            text = { Text("В буфере обмена ссылка на Яндекс Музыку (${linkKindTitle(cl)}). Открыть её в приложении?") },
+            text = {
+                Text(
+                    if (cl is SharedLink.SoundCloudLink) "В буфере обмена ссылка на SoundCloud. Открыть её в приложении?"
+                    else if (cl is SharedLink.VkTrackLink || cl is SharedLink.VkAlbumLink || cl is SharedLink.VkArtistLink) "В буфере обмена ссылка на VK Музыку (${linkKindTitle(cl)}). Открыть её в приложении?"
+                    else "В буфере обмена ссылка на Яндекс Музыку (${linkKindTitle(cl)}). Открыть её в приложении?"
+                )
+            },
             confirmButton = { TextButton(onClick = { vm.dismissClipLink(); vm.requestLink(cl) }) { Text("Открыть") } },
             dismissButton = { TextButton(onClick = { vm.dismissClipLink() }) { Text("Не сейчас") } },
         )
     }
 
+    // Окно «Поделиться» с QR-кодом (открывается кнопками «Поделиться» у трека, альбома, исполнителя, плейлиста, профиля).
+    ShareQrHost.request?.let { r -> ShareQrSheet(r, onDismiss = { ShareQrHost.close() }) }
+
+    // Исполнитель или альбом из файлов, выбранный в плеере: открываем его страницу в режиме «Локальные файлы».
     val localNavRequest by vm.localNavRequest.collectAsStateWithLifecycle()
     LaunchedEffect(localNavRequest) {
         val r = localNavRequest ?: return@LaunchedEffect
@@ -3074,9 +3449,14 @@ fun AppRoot(vm: AppViewModel) {
         vm.consumeLocalNav()
     }
 
+    // Смена аккаунта по удержанию «Профиля» в доке: табличка поверх приложения, под ней размытие.
+    val accountSwitcher = remember { AccountSwitcherState() }
+    var showAccountPicker by remember { mutableStateOf(false) }
+    SideEffect { accountSwitcher.enabled = !local && state.accounts.isNotEmpty() }
     val downloadsState by vm.downloads.collectAsStateWithLifecycle()
     val likedIds = remember(state.liked) { state.liked.mapTo(HashSet()) { it.id } }
     val downloadedIds = remember(downloadsState.items) { downloadsState.items.mapTo(HashSet()) { it.id } }
+    // Волна «по…» с карточек и страниц; в режиме «Локальные файлы» и без сети её нет.
     val waveActions = remember(vm, local, state.offline) {
         if (local || state.offline) null else WaveActions(
             track = { t -> waveTrack = t },
@@ -3099,6 +3479,8 @@ fun AppRoot(vm: AppViewModel) {
         LocalPickDownloadMode provides { t: Track -> modeTrack = t },
         LocalShowTrackInfo provides { t: Track -> infoTrack = t },
         LocalEditLocalTrack provides { t: Track -> editLocalTrack = t },
+        LocalEditScItem provides { id: String, album: Boolean -> editSc = id to album },
+        LocalScMyId provides scMyId,
         LocalOffline provides state.offline,
         LocalPlayingSource provides (if (state.isPlaying) state.playingSource else null),
         LocalNetEpoch provides state.netEpoch,
@@ -3111,17 +3493,22 @@ fun AppRoot(vm: AppViewModel) {
         LocalAddToPlaylist provides { t: Track -> trackToAdd = t },
         LocalOpenAlbum provides { id: String, title: String? -> vm.openAlbum(id, title) },
         LocalOpenSearch provides openSearch,
+        LocalOpenSettings provides { showSettings = true },
         LocalAudioAccess provides AudioAccess(audioGranted) { requestAudio(true) },
         LocalDeviceNav provides deviceNav,
         LocalWide provides wide,
         LocalCompactHeight provides compactH,
+        LocalAccountSwitcher provides accountSwitcher,
     ) {
+    // «Назад» на вкладке: на предыдущую из истории, а если истории нет — на первую вкладку. Слои поверх
+    // (настройки, исполнитель, альбом, плеер, внутренние страницы) регистрируют свои обработчики позже и срабатывают раньше.
     BackHandler(enabled = !searchOverlay && (tabHistory.isNotEmpty() || tab != tabs.first())) {
         val prev = if (tabHistory.isNotEmpty()) tabHistory.removeAt(tabHistory.lastIndex) else null
         tab = prev?.takeIf { it in tabs } ?: tabs.first()
     }
     BackHandler(enabled = searchOverlay) { searchOverlay = false }
-    Box(Modifier.fillMaxSize().cornerTapToTop { scrollTopTick++ }) {
+    Box(Modifier.fillMaxSize().cornerTapToTop { scrollTopTick++ }.accountSwitcherBlur(accountSwitcher).editPanelAutoHide()) {
+    // Мини-плеер: в обычной раскладке стоит над доком, в планшетной — внизу области справа от боковой панели.
     val miniBlock: @Composable () -> Unit = {
         androidx.compose.animation.AnimatedVisibility(
             visible = miniVisible,
@@ -3133,15 +3520,19 @@ fun AppRoot(vm: AppViewModel) {
             }
         }
     }
+    // Боковая панель — только в широкой раскладке и если выбрана; иначе внизу тот же док / островок, плывущий поверх контента.
     val railMode = wide && TabletSettings.sideRail
+    // Планшет + островок: вертикальный островок только со значками, справа поверх контента; внизу остаётся лишь мини-плеер.
     val sideIsland = wide && !railMode && ThemeSettings.dockIsland && TabletSettings.islandPos != IslandPos.Bottom
     val scaffoldBlock: @Composable () -> Unit = {
     Scaffold(
+        // В планшетной раскладке слева стоит боковая панель — она сама учитывает левый край, а здесь он не нужен.
         contentWindowInsets = if (railMode) WindowInsets.systemBars.only(WindowInsetsSides.Top + WindowInsetsSides.End)
         else ScaffoldDefaults.contentWindowInsets,
         snackbarHost = {
             Column {
                 UpdateBanner()
+                MixPickerBar(vm)
                 AppToastHost()
             }
         },
@@ -3154,6 +3545,7 @@ fun AppRoot(vm: AppViewModel) {
                     Spacer(Modifier.windowInsetsBottomHeight(WindowInsets.navigationBars))
                 }
             } else Column(
+                // Подложка рисуется позади мини-плеера и дока: свечение мини-плеера ложится поверх неё и не обрезается.
                 Modifier.dockBackdropStrip(
                     backdrop, dockMode,
                     solid = MaterialTheme.colorScheme.surfaceContainer,
@@ -3162,6 +3554,8 @@ fun AppRoot(vm: AppViewModel) {
                     softEdge = if (ThemeSettings.dockIsland) 40.dp else 0.dp,
                 ),
             ) {
+                // Мини-плеер остаётся на месте и при скрытии дока просто опускается к нижней системной панели,
+                // потому что сам док сжимает свою высоту (CollapsingDock) и пустого места не оставляет.
                 if (wide) Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.BottomCenter) {
                     Box(Modifier.widthIn(max = 760.dp)) { miniBlock() }
                 } else miniBlock()
@@ -3174,6 +3568,7 @@ fun AppRoot(vm: AppViewModel) {
             }
         },
     ) { pad ->
+        // Экран занимает всю высоту и уходит ПОД нижнюю панель (за ней он размыт); нижний отступ списков — dockInset().
         val layoutDir = androidx.compose.ui.platform.LocalLayoutDirection.current
         CompositionLocalProvider(LocalDockInset provides pad.calculateBottomPadding()) {
         Box(
@@ -3202,6 +3597,8 @@ fun AppRoot(vm: AppViewModel) {
                     }
                 }
             }
+            // Листание экранов свайпом (отключается в Настройки → Внешний вид → Навигация). Пока открыты настройки,
+            // исполнитель, альбом или поиск поверх, листание выключено, чтобы не сдвигать экран под ними.
             val overlayOpen = showSettings || searchOverlay || state.openedArtist != null || state.openedAlbum != null ||
                 deviceNav.top != null
             if ((NavSettings.swipeTabs || ThemeSettings.animTabScroll) && tabs.size > 1) {
@@ -3209,6 +3606,7 @@ fun AppRoot(vm: AppViewModel) {
                     tabs = tabs, selected = tab, onSelected = { goTab(it) },
                     swipeEnabled = NavSettings.swipeTabs && !overlayOpen && !innerPages.pagerLocked, content = pageContent,
                     searchJump = searchJump, onSearchJumpConsumed = { searchJump = false },
+                    resyncTick = resyncTick,
                 )
             } else {
                 AnimatedContent(
@@ -3220,6 +3618,7 @@ fun AppRoot(vm: AppViewModel) {
                     label = "tabs",
                 ) { target -> pageContent(target) }
             }
+            // Поиск отдельной страницей — только если вкладку «Поиск» убрали из панели.
             AnimatedVisibility(
                 visible = searchOverlay,
                 enter = fadeIn(tween(animMs(220))) + slideInVertically(tween(animMs(320))) { it / 6 },
@@ -3238,6 +3637,8 @@ fun AppRoot(vm: AppViewModel) {
                     }
                 }
             }
+            // Настройки рисуются раньше исполнителя и альбома: если страница исполнителя/альбома
+            // открыта при открытых настройках (например, из полного плеера), она должна быть поверх.
             AnimatedVisibility(
                 visible = showSettings,
                 enter = fadeIn(tween(animMs(220))) + slideInVertically(tween(animMs(320))) { it / 6 },
@@ -3247,6 +3648,8 @@ fun AppRoot(vm: AppViewModel) {
                     SettingsScreen(vm, local = local, onLogin = { showSettings = false; showLogin = true }) { showSettings = false }
                 }
             }
+            // Исполнитель и альбом живут в одном слое: страница, открытая из другой (альбом → исполнитель и наоборот),
+            // заменяет её плавной сменой, а не наезжает поверх. Открытие с нуля и закрытие — как раньше (справа / вправо).
             val pageLayer: String? = when {
                 state.openedAlbum != null -> "album"
                 state.openedArtist != null -> "artist"
@@ -3278,6 +3681,7 @@ fun AppRoot(vm: AppViewModel) {
                     else -> Unit
                 }
             }
+            // Режим «Локальные файлы»: страницы альбома, исполнителя, плейлиста, всех файлов и т. д. поверх вкладок.
             if (local) {
                 var lastDevicePage by remember { mutableStateOf<String?>(null) }
                 deviceNav.top?.let { lastDevicePage = it }
@@ -3300,6 +3704,7 @@ fun AppRoot(vm: AppViewModel) {
             if (state.loading) {
                 LoadingIndicator(Modifier.align(Alignment.TopCenter).padding(top = 12.dp))
             }
+            // Кнопка «вверх»: появляется, когда верхний слой прокручен, исчезает на самом верху; в настройках её нет.
             val topTracker = when {
                 deviceNav.top != null -> deviceTracker
                 state.openedAlbum != null -> albumTracker
@@ -3326,12 +3731,13 @@ fun AppRoot(vm: AppViewModel) {
     }
     }
     Box(
-        Modifier.fillMaxSize().dockBackdropSource(
-            fullBackdrop,
-            record = GlassSettings.playerGlass && !ThemeSettings.optimize && playerVisible && state.nowPlaying != null,
+        Modifier.fillMaxSize().playerGlassBackdrop(
+            enabled = GlassSettings.playerGlass && !ThemeSettings.optimize && state.nowPlaying != null,
+            progress = { 1f - sheet.offset.value / sheet.closedPx.coerceAtLeast(1f) },
         ),
     ) {
     if (railMode) {
+        // Планшет: слева боковая панель с экранами, справа — сам экран с мини-плеером внизу.
         Row(Modifier.fillMaxSize()) {
             AppRail(tabs = tabs, tab = tab, compact = compactH, onSelect = onDockSelect)
             Box(Modifier.weight(1f).fillMaxHeight()) { scaffoldBlock() }
@@ -3359,22 +3765,40 @@ fun AppRoot(vm: AppViewModel) {
         }
     }
     }
+    // Добавление ещё одного аккаунта: сразу страница входа через Яндекс (выбирать тип учётной записи не нужно);
+    // «назад» закрывает экран входа и возвращает в настройки.
     if (state.addingAccount) {
         LoginScreen(
+            vm = vm,
             error = state.error,
             onToken = { vm.onTokenReceived(it) },
             onCancel = { vm.cancelAddAccount() },
-            startOnYandex = true,
+            startOn = state.addStart,
         )
     }
+    // Добавление аккаунта из режима «Локальные файлы»: без приветственной страницы — сразу нижнее окно выбора платформы,
+    // а после выбора открывается страница входа этого сервиса. После входа режим выключается, плейлисты из файлов остаются.
     if (local && showLogin) {
-        LoginScreen(
-            error = state.error,
-            onToken = { vm.onTokenReceived(it) },
-            onCancel = { showLogin = false },
-            startOnYandex = true,
+        ProviderPickerSheet(
+            onPick = { showLogin = false; vm.startAddAccount(it) },
+            onDismiss = { showLogin = false },
         )
     }
+    }
+
+    // Табличка смены аккаунта (удержание «Профиля» в доке) и выбор сервиса для нового аккаунта.
+    AccountSwitcherOverlay(
+        state = accountSwitcher,
+        accounts = state.accounts,
+        activeToken = state.activeToken,
+        onSwitch = { vm.switchAccount(it) },
+        onAdd = { showAccountPicker = true },
+    )
+    if (showAccountPicker) {
+        ProviderPickerSheet(
+            onPick = { showAccountPicker = false; vm.startAddAccount(it) },
+            onDismiss = { showAccountPicker = false },
+        )
     }
 
     if (playerVisible && state.nowPlaying != null) {
@@ -3383,6 +3807,7 @@ fun AppRoot(vm: AppViewModel) {
 
     trackToAdd?.let { track ->
         if (local) {
+            // Режим «Локальные файлы»: плейлисты из файлов устройства.
             DevicePlaylistChooser(track, onDismiss = { trackToAdd = null })
         } else if (showCreateForTrack) {
             CreatePlaylistDialog(
@@ -3413,11 +3838,22 @@ fun AppRoot(vm: AppViewModel) {
                 }
                 vm.openLink(l)
             },
-            onDismiss = { previewLink = null },
+            // Убираем окно, только если оно всё ещё про эту ссылку: запоздавшее закрытие не должно гасить новую.
+            onDismiss = { if (previewLink == l) previewLink = null },
         )
     }
     infoTrack?.let { t -> TrackInfoSheet(vm, t) { infoTrack = null } }
     editLocalTrack?.let { t -> EditLocalTrackDialog(vm, t) { editLocalTrack = null } }
+    editSc?.let { (id, isAlbum) ->
+        ScEditDialog(
+            vm, id, isAlbum, onDismiss = { editSc = null },
+            onSave = { title, description, genre, tags, isPublic, cover ->
+                if (isAlbum) vm.editScAlbum(id, title, description, genre, tags, isPublic)
+                else vm.editScTrack(id, title, description, genre, tags, isPublic, cover)
+            },
+        )
+    }
+    // Плагины: окно установки снизу и сообщение, если файл не получилось прочитать.
     PluginSystem.pending?.let { pv -> PluginInstallSheet(pv) }
     PluginSystem.error?.let { msg ->
         AlertDialog(
@@ -3428,6 +3864,7 @@ fun AppRoot(vm: AppViewModel) {
         )
     }
     PluginSystem.luaDialogs.lastOrNull()?.let { d -> key(d.pluginId, d.key) { PluginLuaDialog(d) } }
+    // Нижняя модалка, которую открыл сам плагин (ui.sheet / ui.open_page).
     PluginSystem.sheetReq?.let { r ->
         val sp = PluginSystem.plugins.firstOrNull { it.id == r.pluginId }
         if (sp != null && sp.uiEntries.any { it.id == r.entryId }) {
@@ -3446,17 +3883,32 @@ fun AppRoot(vm: AppViewModel) {
             onPick = { m, _ -> modeTrack = null; vm.downloadTrack(t, m) },
         )
     }
+    // Окно запущенного микса (кнопка «Замиксовать»): старый трек, настройка перехода, следующий трек и плеер.
+    MixPlayerHost(vm)
+    // После аварийного закрытия: предложить сохранить журнал и отправить его на форум.
+    CrashReportPrompt()
+    // Режим редактора на экране: плавающая кнопка и панель правки поверх всего (включается в редакторе интерфейса).
+    LayoutEditOverlay(tab = tab, playerOpen = playerVisible && state.nowPlaying != null, miniShown = miniVisible, hideFab = showSettings || searchOverlay)
     }
 }
 
+/** Название типа ссылки для окон. */
 private fun linkKindTitle(l: SharedLink): String = when (l) {
     is SharedLink.TrackLink -> "трек"
     is SharedLink.AlbumLink -> "альбом"
     is SharedLink.ArtistLink -> "исполнитель"
     is SharedLink.PlaylistLink, is SharedLink.PlaylistUuidLink -> "плейлист"
     is SharedLink.UserLink -> "профиль"
+    is SharedLink.SoundCloudLink -> "ссылка SoundCloud"
+    is SharedLink.VkTrackLink -> "трек VK"
+    is SharedLink.VkAlbumLink -> "плейлист VK"
+    is SharedLink.VkArtistLink -> "исполнитель VK"
 }
 
+/**
+ * Окно «чем поделились»: плейлист, альбом, трек, исполнитель или профиль открываются нижней модалкой — с обложкой,
+ * кнопками «Слушать» / «Вперемешку» и списком треков (у профиля — публичные плейлисты). «Открыть страницу» ведёт на полную страницу.
+ */
 @Composable
 private fun SharedLinkSheet(vm: AppViewModel, link: SharedLink, onOpenPage: () -> Unit, onDismiss: () -> Unit) {
     var preview by remember(link) { mutableStateOf<AppViewModel.LinkPreview?>(null) }
@@ -3472,12 +3924,19 @@ private fun SharedLinkSheet(vm: AppViewModel, link: SharedLink, onOpenPage: () -
             failure = e.message ?: "Не удалось открыть ссылку"
         }
     }
+    // Любое закрытие анимированное (кнопки, «Открыть страницу», касание фона, «назад»): сначала шторка плавно уезжает вниз,
+    // и только потом окно убирается. Повторные нажатия во время анимации игнорируются.
     val sheetState = rememberModalBottomSheetState()
     val closeScope = rememberCoroutineScope()
-    val close: () -> Unit = {
-        closeScope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() }
+    var closing by remember(link) { mutableStateOf(false) }
+    val closeThen: (() -> Unit) -> Unit = { after ->
+        if (!closing) {
+            closing = true
+            closeScope.launch { sheetState.hide() }.invokeOnCompletion { after() }
+        }
     }
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
+    val close: () -> Unit = { closeThen(onDismiss) }
+    ModalBottomSheet(onDismissRequest = close, sheetState = sheetState) {
         val pv = preview
         val err = failure
         when {
@@ -3495,7 +3954,7 @@ private fun SharedLinkSheet(vm: AppViewModel, link: SharedLink, onOpenPage: () -
                     Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                         Cover(
                             model = pv.coverUri?.let { app.ymusic.m3e.data.buildCoverUrl(it, 400) },
-                            modifier = Modifier.size(104.dp).clip(if (pv.link is SharedLink.ArtistLink) ThemeSettings.avatarShape.asShape() else rounded(24)),
+                            modifier = Modifier.size(104.dp).clip(if (pv.link is SharedLink.ArtistLink || pv.link is SharedLink.VkArtistLink) ThemeSettings.avatarShape.asShape() else rounded(24)),
                             placeholder = if (pv.link is SharedLink.UserLink) R.drawable.ms_person else R.drawable.ms_music_note,
                         )
                         Spacer(Modifier.width(16.dp))
@@ -3522,8 +3981,8 @@ private fun SharedLinkSheet(vm: AppViewModel, link: SharedLink, onOpenPage: () -
                                 Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); Text("Вперемешку")
                             }
                         }
-                        if (pv.link !is SharedLink.TrackLink && pv.link !is SharedLink.UserLink) {
-                            OutlinedButton(onClick = onOpenPage) { Text("Открыть страницу") }
+                        if (pv.link !is SharedLink.TrackLink && pv.link !is SharedLink.VkTrackLink && pv.link !is SharedLink.UserLink) {
+                            OutlinedButton(onClick = { closeThen(onOpenPage) }) { Text("Открыть страницу") }
                         }
                     }
                 }
@@ -3554,6 +4013,10 @@ private fun SharedLinkSheet(vm: AppViewModel, link: SharedLink, onOpenPage: () -
     }
 }
 
+/**
+ * Кнопка «вверх»: при нажатии стрелка «улетает» вверх и возвращается снизу с пружинкой, а сам список в это время плавно
+ * едет к началу (см. [topScrollSpec]).
+ */
 @Composable
 private fun ToTopButton(onClick: () -> Unit) {
     val lift = remember { Animatable(0f) }
@@ -3584,6 +4047,11 @@ private fun ToTopButton(onClick: () -> Unit) {
     }
 }
 
+/** Док-панель: обычная (на всю ширину) или «островок» — плавающая капсула, где подпись только у выбранной вкладки. */
+/**
+ * Боковая панель экранов для планшетов (вместо нижнего дока): значки по центру по вертикали, у выбранного — «пилюля»
+ * Material 3 Expressive, которая плавно меняет цвет и ширину. Тот же набор экранов и порядок, что в доке.
+ */
 @Composable
 private fun AppRail(tabs: List<Tab>, tab: Tab, compact: Boolean, onSelect: (Tab) -> Unit) {
     Surface(
@@ -3615,9 +4083,11 @@ private fun RailItem(t: Tab, selected: Boolean, compact: Boolean, onClick: () ->
         label = "railIndicator",
     )
     val fg = if (selected) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
+    val sw = LocalAccountSwitcher.current
     Column(
         Modifier.width(if (compact) 72.dp else 84.dp)
-            .pressable(rounded(20)) { onClick() }
+            .accountSwitcherGesture(t)
+            .pressableHold(rounded(20), hold = !(t == Tab.Profile && sw?.enabled == true)) { onClick() }
             .padding(vertical = if (compact) 4.dp else 6.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
@@ -3636,6 +4106,7 @@ private fun RailItem(t: Tab, selected: Boolean, compact: Boolean, onClick: () ->
     }
 }
 
+/** Островок планшета: вертикальная капсула справа поверх контента, только значки (название — по долгому нажатию). */
 @Composable
 private fun SideIsland(tabs: List<Tab>, tab: Tab, pos: IslandPos, onSelect: (Tab) -> Unit) {
     val vertical = pos == IslandPos.Left || pos == IslandPos.Right
@@ -3667,9 +4138,12 @@ private fun SideIsland(tabs: List<Tab>, tab: Tab, pos: IslandPos, onSelect: (Tab
                     label = "sideIslandBg",
                 )
                 val fg = if (sel) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
+                val sw = LocalAccountSwitcher.current
+                val switcher = t == Tab.Profile && sw?.enabled == true
                 Box(
-                    Modifier.hintOnLongPress(tip.state, NavSettings.hints)
-                        .pressable(rounded((UiStyle.dockCorner - 6).coerceAtLeast(6))) { onSelect(t) }
+                    Modifier.accountSwitcherGesture(t)
+                        .hintOnLongPress(tip.state, NavSettings.hints && !switcher)
+                        .pressableHold(rounded((UiStyle.dockCorner - 6).coerceAtLeast(6)), hold = !switcher) { onSelect(t) }
                         .background(bg)
                         .padding(UiStyle.dockPadH.dp),
                     contentAlignment = Alignment.Center,
@@ -3693,6 +4167,8 @@ private fun SideIsland(tabs: List<Tab>, tab: Tab, pos: IslandPos, onSelect: (Tab
 
 @Composable
 private fun AppDock(tabs: List<Tab>, tab: Tab, island: Boolean, onSelect: (Tab) -> Unit) {
+    // Превращение панели в островок и обратно: старый вид сжимается к низу и растворяется, новый вырастает
+    // пружиной; высота меняется плавно (SizeTransform).
     AnimatedContent(
         targetState = island,
         transitionSpec = {
@@ -3720,9 +4196,14 @@ private fun AppDock(tabs: List<Tab>, tab: Tab, island: Boolean, onSelect: (Tab) 
 @Composable
 private fun DockContent(tabs: List<Tab>, tab: Tab, island: Boolean, onSelect: (Tab) -> Unit) {
     if (!island) {
+        // Выразительная короткая панель навигации Material 3 Expressive.
+        // При максимальном размере экрана или шрифта вкладки не помещаются в ряд, и последняя уезжала за край (но
+        // оставалась нажимаемой). В этом случае подпись показывается только у выбранной вкладки, а масштаб шрифта
+        // подписей ограничен — все вкладки остаются на месте.
         val cfg = androidx.compose.ui.platform.LocalConfiguration.current
         val dens = LocalDensity.current
         val mode = NavSettings.dockLabels
+        // «Рядом» занимает больше ширины, чем «под значком», поэтому порог для узкого режима выше.
         val need = if (mode == DockLabels.Beside) 128f else 92f
         val narrow = mode != DockLabels.Hidden &&
             (cfg.screenWidthDp.toFloat() / tabs.size.coerceAtLeast(1) < need * UiLayout.dockZoom || dens.fontScale > 1.2f)
@@ -3731,11 +4212,14 @@ private fun DockContent(tabs: List<Tab>, tab: Tab, island: Boolean, onSelect: (T
         ) {
             ShortNavigationBar(containerColor = Color.Transparent) {
                 tabs.forEach {
-                    val press = rememberPress(true, hold = true, downTick = false)
+                    // Тики при удержании и на вкладках дока; нажатие уже даёт отклик в onSelect, поэтому без отдельного тика «вниз».
+                    // «Профиль»: удержание открывает смену аккаунта, поэтому тиков при удержании на нём нет.
+                    val switcherOn = it == Tab.Profile && LocalAccountSwitcher.current?.enabled == true
+                    val press = rememberPress(true, hold = !switcherOn, downTick = false)
                     ShortNavigationBarItem(
                         selected = tab == it,
                         onClick = { onSelect(it) },
-                        modifier = Modifier.pressScale(press, 0.08f),
+                        modifier = Modifier.pressScale(press, 0.08f).layoutEdit(LScreen.DOCK, it).accountSwitcherGesture(it),
                         interactionSource = press.source,
                         iconPosition = if (mode == DockLabels.Beside) NavigationItemIconPosition.Start else NavigationItemIconPosition.Top,
                         icon = { ZoomBox(UiLayout.dockIconZoom) { Icon(painterResource(it.icon), if (narrow || mode == DockLabels.Hidden) it.title else null) } },
@@ -3748,6 +4232,7 @@ private fun DockContent(tabs: List<Tab>, tab: Tab, island: Boolean, onSelect: (T
         }
         return
     }
+    // Островок: вкладки в капсуле. Размеры, отступы, положение и «отдельная последняя кнопка» — в редакторе интерфейса.
     val lastDetached = UiStyle.dockDetachLast && tabs.size >= 2
     val mainTabs = if (lastDetached) tabs.dropLast(1) else tabs
     val glassOn = GlassSettings.islandGlass && !ThemeSettings.optimize
@@ -3763,6 +4248,7 @@ private fun DockContent(tabs: List<Tab>, tab: Tab, island: Boolean, onSelect: (T
     @Composable
     fun IslandItem(t: Tab, iconOnly: Boolean) {
         val sel = t == tab
+        // В островке у невыбранных вкладок только значок — долгое нажатие показывает название.
         val tip = rememberButtonHint()
         val bg by animateColorAsState(
             if (sel) MaterialTheme.colorScheme.primaryContainer else Color.Transparent,
@@ -3771,12 +4257,15 @@ private fun DockContent(tabs: List<Tab>, tab: Tab, island: Boolean, onSelect: (T
         )
         val fg = if (sel) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant
         val lm = NavSettings.dockLabels
+        // «Под значком» и «Рядом» показывают подписи у всех вкладок; «Скрыть» — только значки.
         val showAll = lm != DockLabels.Hidden && (lm == DockLabels.Below || tabs.size <= 3)
         val showTitle = !iconOnly && lm != DockLabels.Hidden && (sel || showAll)
         val padH = if (iconOnly) UiStyle.dockPadH else UiStyle.dockPadH + (if (sel || showTitle) 2 else 0)
         val padV = if (iconOnly) UiStyle.dockPadH else if (lm == DockLabels.Below) (UiStyle.dockPadV - 4).coerceAtLeast(2) else UiStyle.dockPadV
-        val itemMod = Modifier.hintOnLongPress(tip.state, NavSettings.hints && !showTitle)
-            .pressable(rounded(itemCorner)) { onSelect(t) }
+        val switcherOn = t == Tab.Profile && LocalAccountSwitcher.current?.enabled == true
+        val itemMod = Modifier.layoutEdit(LScreen.DOCK, t).accountSwitcherGesture(t)
+            .hintOnLongPress(tip.state, NavSettings.hints && !showTitle && !switcherOn)
+            .pressableHold(rounded(itemCorner), hold = !switcherOn) { onSelect(t) }
             .background(bg)
             .padding(horizontal = padH.dp, vertical = padV.dp)
             .animateContentSize(fxSpring(dampingRatio = Spring.DampingRatioLowBouncy, stiffness = Spring.StiffnessMediumLow))
@@ -3830,6 +4319,7 @@ private fun DockContent(tabs: List<Tab>, tab: Tab, island: Boolean, onSelect: (T
                 }
             }
             if (lastDetached) {
+                // Отдельная круглая кнопка справа от капсулы (например, «Профиль» / настройки).
                 Surface(
                     shape = capsuleShape,
                     color = capsuleColor,
@@ -3845,6 +4335,10 @@ private fun DockContent(tabs: List<Tab>, tab: Tab, island: Boolean, onSelect: (T
     }
 }
 
+/**
+ * Экраны вкладок, которые листаются свайпом влево/вправо. Страница и выбранная вкладка дока связаны в обе стороны:
+ * свайп меняет вкладку, нажатие на вкладку в доке листает к странице.
+ */
 @Composable
 private fun TabPager(
     tabs: List<Tab>,
@@ -3854,6 +4348,7 @@ private fun TabPager(
     content: @Composable (Tab) -> Unit,
     searchJump: Boolean = false,
     onSearchJumpConsumed: () -> Unit = {},
+    resyncTick: Int = 0,
 ) {
     val pager = rememberPagerState(initialPage = tabs.indexOf(selected).coerceAtLeast(0)) { tabs.size }
     val curTabs by rememberUpdatedState(tabs)
@@ -3861,15 +4356,20 @@ private fun TabPager(
     val onSel by rememberUpdatedState(onSelected)
     val curSearchJump by rememberUpdatedState(searchJump)
     val onJumpConsumed by rememberUpdatedState(onSearchJumpConsumed)
+    // Эффект перехода на поиск: 1 — страница видна полностью, 0 — скрыта (затухание + лёгкое сжатие и сдвиг вниз).
     val jumpFx = remember { Animatable(1f) }
+    // Сколько вкладок уже собрано заранее (см. прогрев ниже и перед анимацией перехода).
     var warm by remember { mutableIntStateOf(0) }
+    // Вертикальная смена вкладки: -1..1, 0 — страница на месте; знак — в какую сторону уезжает / откуда приезжает страница.
     val slideFx = remember { Animatable(0f) }
+    // Стиль анимации: по горизонтали, по вертикали или по положению панели (боковая — вертикально, нижняя — горизонтально).
     val verticalStyle = when (ThemeSettings.tabAnimStyle) {
         1 -> true
         2 -> LocalWide.current
         else -> false
     }
     val curVertical by rememberUpdatedState(verticalStyle)
+    // Motion blur при листании: размытие по горизонтали растёт со скоростью страницы (Android 12+).
     val mbOn = ThemeSettings.motionBlur && !ThemeSettings.optimize && android.os.Build.VERSION.SDK_INT >= 31
     val mbStrength = ThemeSettings.motionBlurStrength
     var blurX by remember { mutableFloatStateOf(0f) }
@@ -3884,7 +4384,7 @@ private fun TabPager(
                 val now = withFrameNanos { it }
                 val pos = pager.currentPage + pager.currentPageOffsetFraction
                 val dt = (now - lastT) / 1_000_000_000f
-                val v = if (dt > 0f) kotlin.math.abs(pos - last) / dt else 0f
+                val v = if (dt > 0f) kotlin.math.abs(pos - last) / dt else 0f // страниц в секунду
                 smooth += (v.coerceAtMost(8f) - smooth) * 0.35f
                 blurX = (smooth * 12f * mbStrength).coerceAtMost(60f * mbStrength)
                 last = pos; lastT = now
@@ -3893,16 +4393,24 @@ private fun TabPager(
             blurX = 0f
         }
     }
-    val programmatic = remember { IntArray(1) }
-    val userDriven = remember { booleanArrayOf(false) }
+    // Выбор вкладки по странице — только когда страницу листает сам пользователь (палец/бросок). Всё, что листает
+    // приложение (нажатие на вкладку в доке), не должно менять выбранную вкладку по дороге: раньше из-за этого
+    // нажатие на «Плейлисты» иногда кидало на «Поиск».
+    val programmatic = remember { IntArray(1) } // сколько наших переходов идёт сейчас
+    val userDriven = remember { booleanArrayOf(false) } // страницу сейчас листает палец (или бросок после него)
     LaunchedEffect(pager) {
         pager.interactionSource.interactions.collectLatest {
             when (it) {
+                // Флаг «листает палец» живёт до конца листания и сбрасывается только там (см. ниже). Раньше он сбрасывался
+                // по таймеру после отпускания пальца: если страница уже переходила за середину позже, выбор вкладки терялся,
+                // и страница «отскакивала» назад к старой вкладке, а в доке оставалась не та — экран зацикливало туда-сюда.
                 is androidx.compose.foundation.interaction.DragInteraction.Start -> userDriven[0] = true
                 else -> {}
             }
         }
     }
+    // Листание кончилось: палец больше не ведёт страницу. Если страница при этом оказалась не там, где выбранная вкладка
+    // (никто из пользователей её не листал), возвращаем её на выбранную — так экран не «уезжает» сам на другой раздел.
     val kb = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     val fm = androidx.compose.ui.platform.LocalFocusManager.current
     LaunchedEffect(pager) {
@@ -3912,6 +4420,7 @@ private fun TabPager(
             userDriven[0] = false
             if (programmatic[0] > 0) return@collectLatest
             if (byUser) {
+                // Листал пользователь: вкладка в доке должна совпасть со страницей, на которой всё остановилось.
                 val t = curTabs.getOrNull(pager.currentPage)
                 if (t != null && t != curSelected) onSel(t)
                 return@collectLatest
@@ -3924,6 +4433,8 @@ private fun TabPager(
             }
         }
     }
+    // Страница сменилась свайпом → выбираем её вкладку в доке сразу, как только пройдена половина страницы
+    // (а не после полной остановки), поэтому подсветка в доке не опаздывает.
     LaunchedEffect(pager) {
         snapshotFlow { pager.currentPage }.collect { p ->
             if (programmatic[0] > 0 || !userDriven[0]) return@collect
@@ -3931,19 +4442,32 @@ private fun TabPager(
             if (t != curSelected) onSel(t)
         }
     }
+    // Нажали вкладку в доке (или поменяли порядок экранов) → страница следом. Соседнюю листаем плавно на точное
+    // расстояние одной страницы (так анимация не может проскочить дальше нажатой вкладки), дальнюю — тоже плавно, пролистывая промежуточные, на точное расстояние (раньше — сразу).
     LaunchedEffect(selected, tabs) {
         val i = tabs.indexOf(selected)
         val fancy = curSearchJump
         if (fancy) onJumpConsumed()
-        if (i < 0 || pager.currentPage == i) return@LaunchedEffect
+        if (i < 0) return@LaunchedEffect
+        if (pager.currentPage == i) {
+            // Страница уже «та», но могла застыть между экранами (переход отменили на середине) — выравниваем.
+            if (pager.currentPageOffsetFraction != 0f && !pager.isScrollInProgress) pager.scrollToPage(i)
+            return@LaunchedEffect
+        }
         programmatic[0]++
         try {
-            if (warm < tabs.size - 1) {
-                warm = (tabs.size - 1).coerceAtLeast(0)
+            // Нужная вкладка могла быть ещё не собрана (прогрев идёт по одной): её первая сборка внутри анимации
+            // съедала кадры, и переход выглядел как мгновенный скачок. Собираем все вкладки до анимации и ждём пару кадров.
+            val need = kotlin.math.abs(pager.currentPage - i).coerceAtMost((tabs.size - 1).coerceAtLeast(0))
+            if (warm < need) {
+                warm = need
                 withFrameNanos { }
                 withFrameNanos { }
             }
+            // Любая вкладка (в том числе дальняя): страницы пролистываются по пути на точное расстояние, без перелёта.
+            // Чем дальше вкладка, тем дольше проскролл. Выключается в Настройки → Внешний вид → Анимации.
             if (!ThemeSettings.optimize && ThemeSettings.animTabScroll && curVertical) {
+                // Вертикальный вариант: текущая страница уезжает вверх (вниз) и гаснет, нужная приезжает с противоположной стороны.
                 val dir = if (i > pager.currentPage) 1f else -1f
                 slideFx.snapTo(0f)
                 slideFx.animateTo(-dir, tween(animMs(170), easing = FastOutLinearInEasing))
@@ -3961,10 +4485,12 @@ private fun TabPager(
                     )
                 } else pager.animateScrollToPage(i)
             } else if (!ThemeSettings.optimize) {
+                // Проскролл выключен: текущий экран гаснет, нужный появляется на его месте.
                 jumpFx.animateTo(0f, tween(animMs(150), easing = FastOutSlowInEasing))
                 pager.scrollToPage(i)
                 jumpFx.animateTo(1f, tween(animMs(300), easing = FastOutSlowInEasing))
             } else pager.scrollToPage(i)
+            // Если страницу всё же «снесло» (долгая первая отрисовка раздела), ставим ровно на нажатую вкладку.
             if (pager.currentPage != i || pager.currentPageOffsetFraction != 0f) pager.scrollToPage(i)
         } finally {
             programmatic[0]--
@@ -3972,6 +4498,7 @@ private fun TabPager(
             if (slideFx.value != 0f) kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { slideFx.snapTo(0f) }
         }
     }
+    // Началось листание (свайп в сторону) — прячем клавиатуру и снимаем фокус с поля, чтобы она не висела на чужом экране.
     val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
     val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
     LaunchedEffect(pager) {
@@ -3979,20 +4506,35 @@ private fun TabPager(
             if (moving && programmatic[0] == 0) { keyboard?.hide(); focusManager.clearFocus() }
         }
     }
+    // Вкладка сменилась другим путём (док, «назад», кнопка поиска с главной уходит на «Поиск» — там клавиатура
+    // нужна, её откроет сам SearchScreen): уходим с поиска — клавиатура прячется.
     LaunchedEffect(selected) {
         if (selected != Tab.Search) { keyboard?.hide(); focusManager.clearFocus() }
     }
+    // Чувствительность листания (Настройки → Внешний вид → Навигация): чем выше, тем меньше надо провести пальцем,
+    // чтобы страница поехала, и тем меньший сдвиг (без броска) переключает экран.
     val sens = NavSettings.swipeSensitivity
     val baseConfig = LocalViewConfiguration.current
     val pagerConfig = remember(baseConfig, sens) {
-        val slopFactor = 1.6f - 1.2f * sens
+        val slopFactor = 1.6f - 1.2f * sens // 0 → ×1.6, 0.5 → ×1, 1 → ×0.4
         object : ViewConfiguration by baseConfig {
             override val touchSlop: Float get() = baseConfig.touchSlop * slopFactor
         }
     }
     val fling = PagerDefaults.flingBehavior(state = pager, snapPositionalThreshold = 0.8f - 0.6f * sens)
+    // Вкладки собираются заранее и остаются собранными: смена вкладки больше не строит экран с нуля (это и давало
+    // подвисание). Прогреваем по одной после запуска, чтобы не тормозить старт. Вернуть как было: beyondViewportPageCount = 0.
+    // Повторное нажатие на уже выбранную вкладку: если страница пейджера разошлась с доком — принудительно выравниваем.
+    LaunchedEffect(resyncTick) {
+        if (resyncTick == 0) return@LaunchedEffect
+        val i = curTabs.indexOf(curSelected)
+        if (i >= 0 && !pager.isScrollInProgress && (pager.currentPage != i || pager.currentPageOffsetFraction != 0f)) {
+            AppLog.w("Tabs", "страница пейджера (${pager.currentPage}) разошлась с вкладкой ($i) — выравниваем")
+            pager.scrollToPage(i)
+        }
+    }
     LaunchedEffect(tabs.size) {
-        delay(350)
+        delay(2500) // сразу после запуска главный поток занят (JIT, первая сборка экранов) — прогрев откладываем
         while (warm < tabs.size - 1) {
             while (pager.isScrollInProgress) delay(100)
             warm++
@@ -4028,6 +4570,7 @@ private fun TabPager(
             flingBehavior = fling,
             key = { page -> tabs.getOrNull(page)?.name ?: page },
         ) { page ->
+            // Внутри страниц (списки, ряды) порог касания обычный: он меняется только для самого пейджера.
             CompositionLocalProvider(LocalViewConfiguration provides baseConfig) {
                 tabs.getOrNull(page)?.let { content(it) }
             }
@@ -4035,30 +4578,43 @@ private fun TabPager(
     }
 }
 
-private enum class LoginPage { Intro, Yandex }
+// ---------- Вход ----------
+
+private enum class LoginPage { Intro, Yandex, Vk, SoundCloud, Spotify }
 
 @Composable
 private fun LoginScreen(
+    vm: AppViewModel,
     error: String?,
     onToken: (String) -> Unit,
     onCancel: (() -> Unit)? = null,
+    /** Сразу открыть страницу входа через Яндекс (при добавлении аккаунта, когда тип уже выбран). */
     startOnYandex: Boolean = false,
+    /** Сразу открыть страницу входа выбранного сервиса (добавление аккаунта): "yandex", "vk" или "soundcloud". */
+    startOn: String? = null,
+    /** «Пропустить» справа сверху на приветствии: войти без Яндекс Музыки (режим «Локальные файлы»). */
     onSkip: (() -> Unit)? = null,
 ) {
+    val directStart = startOnYandex || startOn != null
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var pollJob by remember { mutableStateOf<Job?>(null) }
     var deviceCode by remember { mutableStateOf<DeviceCode?>(null) }
     var requesting by remember { mutableStateOf(false) }
     var authError by remember { mutableStateOf<String?>(null) }
+    // Две страницы: приветствие с кнопками входа и страница с кодом для входа через Яндекс.
     var page by remember {
         mutableStateOf(
             when {
-                startOnYandex -> LoginPage.Yandex
+                startOnYandex || startOn == PICK_YANDEX -> LoginPage.Yandex
+                startOn == PICK_VK -> LoginPage.Vk
+                startOn == PICK_SOUNDCLOUD -> LoginPage.SoundCloud
+                // Spotify пока закрыт («В разработке»): остаёмся на приветствии.
                 else -> LoginPage.Intro
             },
         )
     }
+    // В начале экран входа «заезжает» справа.
     val intro = remember { MutableTransitionState(false).apply { targetState = true } }
 
     fun openVerification(url: String) {
@@ -4073,6 +4629,7 @@ private fun LoginScreen(
         if (notify) AppToast.success("Код скопирован")
     }
 
+    // Вход через ya.ru/device: получаем код, открываем страницу и ждём подтверждения
     fun startDeviceLogin() {
         pollJob?.cancel()
         authError = null
@@ -4097,6 +4654,8 @@ private fun LoginScreen(
         }
     }
 
+    // Закрытие страницы входа (добавление аккаунта / вход поверх локального режима): весь экран уезжает вправо с затуханием,
+    // и только после анимации сообщаем наверх, что экран можно убрать.
     var closing by remember { mutableStateOf(false) }
     val closeProgress by animateFloatAsState(
         targetValue = if (closing) 1f else 0f,
@@ -4114,17 +4673,19 @@ private fun LoginScreen(
         }
     }
 
+    // Назад со страницы входа в Яндекс: останавливаем ожидание и возвращаемся на первую страницу
     fun goBack() {
         pollJob?.cancel()
         pollJob = null
         requesting = false
         deviceCode = null
         authError = null
-        if (startOnYandex) closeScreen() else page = LoginPage.Intro
+        if (directStart) closeScreen() else page = LoginPage.Intro
     }
 
-    LaunchedEffect(Unit) { if (startOnYandex) startDeviceLogin() }
+    LaunchedEffect(Unit) { if (startOnYandex || startOn == PICK_YANDEX) startDeviceLogin() }
 
+    // При добавлении аккаунта «назад» на первой странице закрывает экран входа.
     BackHandler(enabled = onCancel != null && page == LoginPage.Intro) { closeScreen() }
 
     DisposableEffect(Unit) {
@@ -4145,11 +4706,12 @@ private fun LoginScreen(
             modifier = Modifier.fillMaxSize(),
             enter = fadeIn(tween(fxMs(300))) + slideInHorizontally(tween(fxMs(450))) { it / 2 },
         ) {
+        // Приветствие → вход: «мягкий» переход с масштабом; дальше вперёд страница въезжает справа, назад — слева.
         AnimatedContent(
             targetState = page,
             transitionSpec = {
                 when {
-                    targetState == LoginPage.Yandex ->
+                    targetState != LoginPage.Intro ->
                         (fadeIn(tween(fxMs(260), delayMillis = 60)) + slideInHorizontally(tween(fxMs(360))) { it }) togetherWith
                             (fadeOut(tween(fxMs(160))) + slideOutHorizontally(tween(fxMs(300))) { -it / 3 })
                     else ->
@@ -4162,14 +4724,28 @@ private fun LoginScreen(
         when (target) {
             LoginPage.Intro -> LoginIntro(
                 error = error,
-                onYandex = { page = LoginPage.Yandex; startDeviceLogin() },
+                onPick = { which ->
+                    when (which) {
+                        PICK_YANDEX -> { page = LoginPage.Yandex; startDeviceLogin() }
+                        PICK_VK -> page = LoginPage.Vk
+                        PICK_SOUNDCLOUD -> page = LoginPage.SoundCloud
+                        PICK_SPOTIFY -> Unit // В разработке
+                    }
+                },
                 onCancel = if (onCancel != null) ({ closeScreen() }) else null,
-                onSkip = if (onCancel == null && !startOnYandex) onSkip else null,
+                onSkip = if (onCancel == null && !directStart) onSkip else null,
             )
+
+            LoginPage.Vk -> VkLoginPage(vm = vm, onBack = { if (directStart) closeScreen() else page = LoginPage.Intro })
+
+            LoginPage.SoundCloud -> SoundCloudLoginPage(vm = vm, onBack = { if (directStart) closeScreen() else page = LoginPage.Intro })
+
+            LoginPage.Spotify -> SpotifyLoginPage(vm = vm, onBack = { if (directStart) closeScreen() else page = LoginPage.Intro })
 
             LoginPage.Yandex -> {
                 BackHandler { goBack() }
                 Box(Modifier.fillMaxSize()) {
+                    // Кнопка «назад» — сверху слева
                     IconButton(
                         onClick = { goBack() },
                         modifier = Modifier.align(Alignment.TopStart).statusBarsPadding().padding(4.dp),
@@ -4193,6 +4769,7 @@ private fun LoginScreen(
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         )
                         Spacer(Modifier.height(24.dp))
+                        // Код в контейнере с моноширинным шрифтом: нажатие копирует его
                         val codePress = rememberPress(deviceCode != null)
                         Surface(
                             shape = containerShape(28),
@@ -4242,6 +4819,7 @@ private fun LoginScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                         Spacer(Modifier.height(24.dp))
+                        // «Открыть ya.ru/device»
                         FilledTonalButton(
                             onClick = { deviceCode?.let { openVerification(it.verificationUrl) } },
                             enabled = deviceCode != null,
@@ -4269,13 +4847,18 @@ private fun LoginScreen(
     }
 }
 
+/**
+ * Приветствие перед входом (Material 3 Expressive): иконка приложения «вылетает» на пружине с поворотом, фигура-«печенька» медленно вращается; затем слова заголовка по очереди всплывают,
+ * а снизу выезжает кнопка «Войти через Яндекс».
+ */
 @Composable
 private fun LoginIntro(
     error: String?,
-    onYandex: () -> Unit,
+    onPick: (String) -> Unit,
     onCancel: (() -> Unit)? = null,
     onSkip: (() -> Unit)? = null,
 ) {
+    var showPicker by rememberSaveable { mutableStateOf(false) }
     val words = remember { listOf("Добро", "пожаловать", "в", "ExMusic!") }
     val iconScale = remember { Animatable(0f) }
     val iconTurn = remember { Animatable(-120f) }
@@ -4309,6 +4892,7 @@ private fun LoginIntro(
         androidx.compose.animation.core.infiniteRepeatable(tween(9000, easing = FastOutSlowInEasing), androidx.compose.animation.core.RepeatMode.Reverse),
         label = "introDrift",
     )
+    // «Оптимизация»: фон и значок на экране приветствия стоят на месте.
     val spin = if (ThemeSettings.optimize) 0f else spinAnim
     val float = if (ThemeSettings.optimize) 0f else floatAnim
     val drift = if (ThemeSettings.optimize) 0f else driftAnim
@@ -4319,6 +4903,7 @@ private fun LoginIntro(
 
     Box(
         Modifier.fillMaxSize().drawBehind {
+            // Два больших мягких пятна медленно «плывут» на фоне.
             val r = size.width * 0.95f
             val a = Offset(size.width * (0.1f + 0.15f * drift), size.height * (0.12f + 0.06f * drift))
             val b = Offset(size.width * (0.9f - 0.15f * drift), size.height * (0.88f - 0.06f * drift))
@@ -4394,13 +4979,14 @@ private fun LoginIntro(
                         modifier = Modifier.padding(bottom = 12.dp),
                     )
                 }
+                // Одна кнопка «Дальше»: снизу выезжает шторка с выбором сервиса (Яндекс.Музыка, VK Музыка, SoundCloud).
                 Button(
-                    onClick = onYandex,
+                    onClick = { showPicker = true },
                     enabled = button.value > 0.6f,
                     modifier = Modifier.fillMaxWidth().height(64.dp),
                     shape = rounded(32),
                 ) {
-                    Text("Войти через Яндекс", style = MaterialTheme.typography.titleMedium)
+                    Text("Дальше", style = MaterialTheme.typography.titleMedium)
                 }
                 Spacer(Modifier.height(8.dp))
                 if (onCancel != null) {
@@ -4408,6 +4994,7 @@ private fun LoginIntro(
                 }
             }
         }
+        // «Пропустить» — справа сверху: вход без Яндекс Музыки, только файлы устройства.
         if (onSkip != null) {
             TextButton(
                 onClick = onSkip,
@@ -4415,6 +5002,12 @@ private fun LoginIntro(
                     .graphicsLayer { alpha = iconScale.value.coerceIn(0f, 1f) },
             ) { Text("Пропустить", style = MaterialTheme.typography.titleMedium) }
         }
+    }
+    if (showPicker) {
+        ProviderPickerSheet(
+            onPick = { showPicker = false; onPick(it) },
+            onDismiss = { showPicker = false },
+        )
     }
 }
 
@@ -4471,6 +5064,7 @@ private fun YandexAuthDialog(
                                         onTokenExtracted(token)
                                         return true
                                     }
+                                    // Только https: никаких intent:// , file:// , http:// внутри окна входа.
                                     return request?.url?.scheme != "https"
                                 }
 
@@ -4493,6 +5087,10 @@ private fun YandexAuthDialog(
         }
     }
 }
+/**
+ * Значок «Моей волны». Пока волна играет — бегущая волна из столбиков (по ним проходит синусоида);
+ * на паузе и когда волна не запущена — обычный статичный значок волны. Переключение — плавное.
+ */
 @Composable
 private fun WaveIcon(playing: Boolean, color: Color, modifier: Modifier = Modifier.size(24.dp)) {
     Crossfade(targetState = playing, animationSpec = tween(fxMs(250)), label = "waveIcon") { on ->
@@ -4511,6 +5109,7 @@ private fun WaveIcon(playing: Boolean, color: Color, modifier: Modifier = Modifi
                 val gap = size.width * 0.09f
                 val bw = (size.width - gap * (n - 1)) / n
                 for (i in 0 until n) {
+                    // каждый столбик сдвинут по фазе — получается волна, бегущая слева направо
                     val k = 0.5f + 0.5f * kotlin.math.sin(phase - i * 0.9f)
                     val h = size.height * (0.28f + 0.72f * k)
                     drawRoundRect(
@@ -4527,6 +5126,9 @@ private fun WaveIcon(playing: Boolean, color: Color, modifier: Modifier = Modifi
     }
 }
 
+// ---------- Главная (минимум: герой-карточка, плейлисты, любимое) ----------
+
+/** Вложенные страницы главного экрана. */
 private enum class HomePage { Chart, History, Podcasts, NewReleases, NewAlbums, NewTracks }
 
 @Composable
@@ -4540,6 +5142,7 @@ private fun HomeScreen(vm: AppViewModel) {
             HomePage.History -> SwipeBack(onBack = { page = null }) { HistoryPage(vm) { page = null } }
             HomePage.Podcasts -> SwipeBack(onBack = { page = null }) { PodcastsPage(vm) { page = null } }
             HomePage.NewReleases -> SwipeBack(onBack = { page = null }) { NewReleasesPage(vm, onOpen = { page = it }) { page = null } }
+            // Окна «Новые альбомы» / «Новые треки»: «назад» возвращает в «Новинки», вкладки в сторону не листаются.
             HomePage.NewAlbums -> SwipeBack(onBack = { page = HomePage.NewReleases }) { NewAlbumsPage(vm) { page = HomePage.NewReleases } }
             HomePage.NewTracks -> SwipeBack(onBack = { page = HomePage.NewReleases }) { NewTracksPage(vm) { page = HomePage.NewReleases } }
         }
@@ -4551,27 +5154,85 @@ private fun HomeMain(vm: AppViewModel, onOpen: (HomePage) -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
     var showWaveSettings by remember { mutableStateOf(false) }
     var showRecognize by remember { mutableStateOf(false) }
+    // Блок «Моей волны» занимает всю верхнюю часть главной. Если он закреплён (Настройки → Внешний вид → Главный экран),
+    // то после прокрутки сверху остаётся его компактная версия.
     val pinWave = ThemeSettings.pinWave
+    // Плитка относится только к «Моей волне»: если играет волна по исполнителю / альбому / плейлисту, плитка не «горит».
     val homeWaveOn = state.waveOn && state.waveStation == DEFAULT_WAVE
     val wavePlaying = homeWaveOn && state.isPlaying
-    val onWaveStart: () -> Unit = { if (homeWaveOn) vm.togglePlay() else vm.startWave() }
+    // Волна уже в очереди: повторное нажатие ставит на паузу / продолжает, а не запускает новую.
+    // SoundCloud: у сервиса своей волны нет, поэтому при запуске ExWave коротко объясняем, что это (можно отключить галочкой).
+    var showExWaveHint by remember { mutableStateOf(false) }
+    val onWaveStart: () -> Unit = {
+        if (homeWaveOn) vm.togglePlay()
+        else if (ActiveProvider.isSc && !NavSettings.waveHintHidden(state.activeToken)) showExWaveHint = true
+        else vm.startWave()
+    }
+    if (showExWaveHint) {
+        var dontShow by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { showExWaveHint = false },
+            title = { Text("ExWave") },
+            text = {
+                Column {
+                    Text("Случайный микс из выбранных источников: лайки, похожие треки, подписки и новинки SoundCloud. Источники меняются кнопкой с шестерёнкой, новый микс — кнопкой со стрелками")
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        Modifier.fillMaxWidth().clip(MaterialTheme.shapes.small).clickable { dontShow = !dontShow },
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(checked = dontShow, onCheckedChange = { dontShow = it })
+                        Text("Больше не показывать")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (dontShow) NavSettings.hideWaveHint(state.activeToken)
+                    showExWaveHint = false
+                    vm.startWave()
+                }) { Text("Запустить") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    if (dontShow) NavSettings.hideWaveHint(state.activeToken)
+                    showExWaveHint = false
+                }) { Text("Отмена") }
+            },
+        )
+    }
     val onWaveShake: () -> Unit = { vm.startWave() }
     val onWaveSettings: () -> Unit = { showWaveSettings = true }
+    // История для главной: серверная (с других устройств) вместе с локальной; пока не загрузилась — локальная.
     val historyList = state.syncedHistory.ifEmpty { state.history }
     val openSearch = LocalOpenSearch.current
+    // Поиск на главной: плиткой или значком в углу блока волны — одна настройка для всех сервисов, включая SoundCloud.
     val searchInCorner = NavSettings.homeSearch && NavSettings.homeSearchCorner
     val listState = rememberLazyListState()
-    val waveFirst = UiLayout.order(LScreen.HOME, HomeBlock.entries).firstOrNull { !UiLayout.isHidden(LScreen.HOME, it) } == HomeBlock.Wave
-    val heroGone by remember { derivedStateOf { listState.firstVisibleItemIndex > 0 } }
+    // Компактная «Моя волна» сверху нужна, пока большой блок волны не виден на экране — где бы он ни стоял
+    // (первым, в середине или в самом низу списка). Если блок скрыт в редакторе, закреплять нечего.
+    val waveFirst = !UiLayout.isHidden(LScreen.HOME, HomeBlock.Wave) && !ActiveProvider.isSc
+    val heroGone by remember { derivedStateOf { listState.layoutInfo.visibleItemsInfo.none { it.key == "wave" } } }
 
     val wideHome = LocalWide.current
+    // Планшет: слева «Моя волна», поиск и плитки, справа плейлисты, история и «Любимое».
     val homeLeftBlocks = setOf(HomeBlock.Wave, HomeBlock.SearchTile, HomeBlock.Recognize,
         HomeBlock.Chart, HomeBlock.New, HomeBlock.HistoryTracks, HomeBlock.Podcasts)
+    // VK: подборки «Для вас» подгружаются при открытии главной.
+    LaunchedEffect(state.loggedIn, state.provider) { if (state.loggedIn) vm.loadShelves() }
     val homeBlocks: LazyListScope.(Boolean?) -> Unit = { leftSide ->
+        // Блоки главной идут в порядке, который задан в редакторе интерфейса (Настройки → Внешний вид → Редактор интерфейса).
         UiLayout.order(LScreen.HOME, HomeBlock.entries).forEach { blk ->
             if (UiLayout.isHidden(LScreen.HOME, blk)) return@forEach
             if (leftSide != null && (blk in homeLeftBlocks) != leftSide) return@forEach
             when (blk) {
+                // Приветствие (Настройки → Внешний вид → Главный экран): обычный блок главной, по умолчанию первый, поэтому при
+                // прокрутке уходит вместе со списком. Порядок, размер и отступы — в редакторе интерфейса; на планшете не показывается.
+                HomeBlock.Greeting -> if (GreetingSettings.enabled && leftSide == null) item(key = "greeting") {
+                    LayoutBlockBox(LScreen.HOME, blk) {
+                        HomeGreeting(state.account?.name?.ifBlank { null } ?: state.account?.login.orEmpty())
+                    }
+                }
                 HomeBlock.Wave -> item(key = "wave") {
                     LayoutBlockBox(LScreen.HOME, blk) {
                         WaveHero(
@@ -4586,6 +5247,7 @@ private fun HomeMain(vm: AppViewModel, onOpen: (HomePage) -> Unit) {
                         )
                     }
                 }
+                // Поиск плиткой (Настройки → Внешний вид → Главный экран → «Поиск на главной»); значком в углу блока волны — другой вариант.
                 HomeBlock.SearchTile -> if (NavSettings.homeSearch && !NavSettings.homeSearchCorner) {
                     item(key = "search_tile") {
                         LayoutBlockBox(LScreen.HOME, blk) {
@@ -4599,8 +5261,8 @@ private fun HomeMain(vm: AppViewModel, onOpen: (HomePage) -> Unit) {
                         }
                     }
                 }
-                HomeBlock.Playlists -> if (state.playlists.isNotEmpty()) {
-                    item(key = "home_playlists") {
+                HomeBlock.Playlists -> {
+                    if (state.playlists.isNotEmpty()) item(key = "home_playlists") {
                         LayoutBlockBox(LScreen.HOME, blk) {
                             Column {
                                 SectionTitle("Плейлисты")
@@ -4611,7 +5273,38 @@ private fun HomeMain(vm: AppViewModel, onOpen: (HomePage) -> Unit) {
                             }
                         }
                     }
+                    // VK: подборки «Для вас» и плейлисты, собранные алгоритмами («Плейлист дня», «Дежавю», «Тайник»…).
+                    // У SoundCloud подборки и миксы подгружаются дольше всего и вынесены в свой блок ниже плиток (HomeBlock.Mixes),
+                    // иначе при их появлении все плитки и кнопки под ними «улетали» вниз.
+                    if (ActiveProvider.caps.recommendations && !ActiveProvider.isSc) state.shelves.forEach { shelf ->
+                        item(key = "shelf_" + shelf.id) {
+                            LayoutBlockBox(LScreen.HOME, blk) {
+                                Column {
+                                    SectionTitle(shelf.title)
+                                    LazyRow(
+                                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    ) { items(shelf.playlists, key = { "${it.ownerUid}_${it.kind}" }) { PlaylistCard(it) { vm.openPlaylist(it) } } }
+                                }
+                            }
+                        }
+                    }
                 }
+                // SoundCloud: миксы и подборки плейлистов. Стоят после плиток, поэтому их загрузка ничего не сдвигает.
+                HomeBlock.Mixes -> if (ActiveProvider.isSc && ActiveProvider.caps.recommendations) state.shelves.forEach { shelf ->
+                    item(key = "shelf_" + shelf.id) {
+                        LayoutBlockBox(LScreen.HOME, blk) {
+                            Column {
+                                SectionTitle(shelf.title)
+                                LazyRow(
+                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                ) { items(shelf.playlists, key = { "${it.ownerUid}_${it.kind}" }) { PlaylistCard(it) { vm.openPlaylist(it) } } }
+                            }
+                        }
+                    }
+                }
+                // «Распознать музыку», под ней — «Чарт» и «Новинки» рядом, ниже — история треков и подкасты.
                 HomeBlock.Recognize -> item(key = "recognize_tile") {
                     LayoutBlockBox(LScreen.HOME, blk) {
                         HomeTile(
@@ -4622,22 +5315,21 @@ private fun HomeMain(vm: AppViewModel, onOpen: (HomePage) -> Unit) {
                         ) { showRecognize = true }
                     }
                 }
+                // Четыре плитки — отдельные блоки: каждую можно убрать по одной. Две подряд идущие видимые плитки одной пары
+                // («Чарт» и «Новинки», «История треков» и «Подкасты») стоят рядом, одинокая плитка занимает всю ширину.
+                // Ширину плитки можно менять в режиме редактора на экране: ряд — 4 слота, по умолчанию плитка занимает 2,
+                // растянуть её можно, пока в ряду есть свободные слоты (см. [HomeTileFlow]).
                 HomeBlock.Chart, HomeBlock.New, HomeBlock.HistoryTracks, HomeBlock.Podcasts -> {
-                    val pair = if (blk == HomeBlock.Chart || blk == HomeBlock.New) listOf(HomeBlock.Chart, HomeBlock.New)
-                    else listOf(HomeBlock.HistoryTracks, HomeBlock.Podcasts)
-                    val visible = UiLayout.order(LScreen.HOME, HomeBlock.entries).filter {
-                        !UiLayout.isHidden(LScreen.HOME, it) && (leftSide == null || (it in homeLeftBlocks) == leftSide)
-                    }
-                    val i = visible.indexOf(blk)
-                    val prevIsPartner = i > 0 && visible[i - 1] in pair
-                    val nextPartner = visible.getOrNull(i + 1)?.takeIf { it in pair }
-                    if (!prevIsPartner) item(key = "home_tiles_" + blk.name) {
+                    val visible = HomeTileFlow.visible().filter { leftSide == null || (it in homeLeftBlocks) == leftSide }
+                    // Ряд рисуется целиком вместе с первой плиткой, остальные плитки ряда сами по себе пропускаем.
+                    val row = HomeTileFlow.rows(visible).firstOrNull { it.first() == blk }
+                    if (row != null) item(key = "home_tiles_" + blk.name) {
                         Row(
                             Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 12.dp),
                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
-                            listOfNotNull(blk, nextPartner).forEach { tile ->
-                                Box(Modifier.weight(1f)) {
+                            row.forEach { tile ->
+                                Box(Modifier.weight(HomeTileFlow.span(tile, row).toFloat())) {
                                     LayoutBlockBox(LScreen.HOME, tile) {
                                         when (tile) {
                                             HomeBlock.Chart -> HomeTile(
@@ -4647,7 +5339,7 @@ private fun HomeMain(vm: AppViewModel, onOpen: (HomePage) -> Unit) {
                                                 modifier = Modifier.fillMaxWidth(),
                                             ) { onOpen(HomePage.Chart) }
                                             HomeBlock.New -> HomeTile(
-                                                title = "Новинки", subtitle = "От ваших артистов", icon = R.drawable.ms_new_releases,
+                                                title = "Новинки", subtitle = if (ActiveProvider.isVk || ActiveProvider.isSc) "Свежие релизы" else "Ваши артисты", icon = R.drawable.ms_new_releases,
                                                 container = MaterialTheme.colorScheme.secondaryContainer,
                                                 content = MaterialTheme.colorScheme.onSecondaryContainer,
                                                 modifier = Modifier.fillMaxWidth(),
@@ -4668,9 +5360,13 @@ private fun HomeMain(vm: AppViewModel, onOpen: (HomePage) -> Unit) {
                                     }
                                 }
                             }
+                            // Свободные слоты ряда (плитки уменьшили) остаются пустыми справа.
+                            val free = HomeTileFlow.COLS - row.sumOf { HomeTileFlow.span(it, row) }
+                            if (free > 0) Spacer(Modifier.weight(free.toFloat()))
                         }
                     }
                 }
+                // История прослушивания (синхронизируется с Яндекс Музыкой и SoundCloud).
                 HomeBlock.History -> if (historyList.isNotEmpty() || state.syncedHistoryLoading) {
                     item(key = "history_title") {
                         LayoutBlockBox(LScreen.HOME, blk) { SectionLink("История прослушивания") { onOpen(HomePage.History) } }
@@ -4681,6 +5377,7 @@ private fun HomeMain(vm: AppViewModel, onOpen: (HomePage) -> Unit) {
                         }
                     }
                     val shown = historyList.take(6)
+                    // Нажатие на трек играет только его; вся история в очередь идёт кнопкой «Слушать» на странице истории.
                     itemsIndexed(shown, key = { _, t -> "h_" + t.id }, contentType = { _, _ -> "home_track" }) { _, t ->
                         LayoutBlockBox(LScreen.HOME, blk) { TrackRow(t) { vm.play(listOf(t), 0) } }
                     }
@@ -4710,8 +5407,11 @@ private fun HomeMain(vm: AppViewModel, onOpen: (HomePage) -> Unit) {
             Modifier.fillMaxSize(),
             state = listState,
             contentPadding = PaddingValues(bottom = 24.dp),
-        ) { homeBlocks(null) }
+        ) {
+            homeBlocks(null)
+        }
     }
+    // Компактная «Моя волна» сверху, когда большой блок уже прокручен.
     AnimatedVisibility(
         visible = pinWave && heroGone && waveFirst && !wideHome,
         modifier = Modifier.align(Alignment.TopCenter),
@@ -4724,17 +5424,23 @@ private fun HomeMain(vm: AppViewModel, onOpen: (HomePage) -> Unit) {
         )
     }
     }
-    if (showWaveSettings) WaveSettingsSheet(vm) { showWaveSettings = false }
+    if (showWaveSettings) {
+        if (ActiveProvider.isSc) ScWaveSourcesSheet(vm) { showWaveSettings = false }
+        else if (ActiveProvider.caps.mixSettings) MixSettingsSheet(vm) { showWaveSettings = false }
+        else WaveSettingsSheet(vm) { showWaveSettings = false }
+    }
     if (showRecognize) {
         ModalBottomSheet(onDismissRequest = { showRecognize = false }) {
             RecognitionContent(
                 onClose = { showRecognize = false },
-                onOpenInApp = { r -> showRecognize = false; vm.requestSearch(r.query) },
+                inApp = true,
+                onOpenInApp = { r -> showRecognize = false; vm.requestRecognizedSearch(r.query); Recognizer.reset() },
             )
         }
     }
 }
 
+/** Строка-кнопка поиска на главной: выглядит как поле ввода, нажатие открывает поиск с клавиатурой. */
 @Composable
 private fun HomeSearchPill(onClick: () -> Unit) {
     val source = remember { MutableInteractionSource() }
@@ -4750,16 +5456,16 @@ private fun HomeSearchPill(onClick: () -> Unit) {
         ) {
             Icon(painterResource(R.drawable.ms_search), contentDescription = null)
             Spacer(Modifier.width(12.dp))
-            Text(
+            FitText(
                 "Треки, исполнители, подкасты",
                 style = MaterialTheme.typography.bodyLarge,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+                maxLines = 2,
             )
         }
     }
 }
 
+/** Небольшая прямоугольная плитка главного экрана: значок и подпись. */
 @Composable
 private fun HomeTile(
     title: String,
@@ -4785,15 +5491,16 @@ private fun HomeTile(
             Icon(painterResource(icon), contentDescription = null, Modifier.size(24.dp))
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                FitText(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 2)
                 if (subtitle != null) {
-                    Text(subtitle, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    FitText(subtitle, style = MaterialTheme.typography.bodySmall, maxLines = 2)
                 }
             }
         }
     }
 }
 
+/** Страница «Чарт»: треки по местам, как в Яндекс Музыке. */
 @Composable
 private fun ChartPage(vm: AppViewModel, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -4808,6 +5515,7 @@ private fun ChartPage(vm: AppViewModel, onBack: () -> Unit) {
                         Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
+                        // Группа кнопок M3E: нажатая кнопка расширяется, соседняя уступает ей место.
                         val playSrc = remember { MutableInteractionSource() }
                         val shuffleSrc = remember { MutableInteractionSource() }
                         Button(
@@ -4815,14 +5523,14 @@ private fun ChartPage(vm: AppViewModel, onBack: () -> Unit) {
                             modifier = groupWeight(playSrc, listOf(shuffleSrc)).height(52.dp),
                             interactionSource = playSrc,
                         ) {
-                            Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); Text("Слушать", maxLines = 1)
+                            Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); FitText("Слушать")
                         }
                         FilledTonalButton(
                             onClick = { vm.play(state.chart, 0, shuffle = true) },
                             modifier = groupWeight(shuffleSrc, listOf(playSrc)).height(52.dp),
                             interactionSource = shuffleSrc,
                         ) {
-                            Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); Text("Вперемешку", maxLines = 1)
+                            Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); FitText("Вперемешку")
                         }
                     }
                 }
@@ -4848,6 +5556,10 @@ private fun ChartPage(vm: AppViewModel, onBack: () -> Unit) {
     }
 }
 
+/**
+ * Страница «Новинки»: свежие альбомы и треки артистов, которых вы слушаете чаще всего (по истории и «Любимому»).
+ * Свежие — выпущенные за последние четыре месяца.
+ */
 @Composable
 private fun NewReleasesPage(vm: AppViewModel, onOpen: (HomePage) -> Unit, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -4870,14 +5582,14 @@ private fun NewReleasesPage(vm: AppViewModel, onOpen: (HomePage) -> Unit, onBack
                                 modifier = groupWeight(playSrc, listOf(shuffleSrc)).height(52.dp),
                                 interactionSource = playSrc,
                             ) {
-                                Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); Text("Слушать", maxLines = 1)
+                                Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); FitText("Слушать")
                             }
                             FilledTonalButton(
                                 onClick = { vm.play(state.newReleaseTracks, 0, shuffle = true) },
                                 modifier = groupWeight(shuffleSrc, listOf(playSrc)).height(52.dp),
                                 interactionSource = shuffleSrc,
                             ) {
-                                Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); Text("Вперемешку", maxLines = 1)
+                                Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); FitText("Вперемешку")
                             }
                         }
                     }
@@ -4909,6 +5621,7 @@ private fun NewReleasesPage(vm: AppViewModel, onOpen: (HomePage) -> Unit, onBack
     }
 }
 
+/** Окно «Новые альбомы»: все новые релизы ваших артистов сеткой. Вкладки в сторону не листаются. */
 @Composable
 private fun NewAlbumsPage(vm: AppViewModel, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -4936,6 +5649,7 @@ private fun NewAlbumsPage(vm: AppViewModel, onBack: () -> Unit) {
     }
 }
 
+/** Окно «Новые треки»: все новые треки ваших артистов списком. Вкладки в сторону не листаются. */
 @Composable
 private fun NewTracksPage(vm: AppViewModel, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -4958,14 +5672,14 @@ private fun NewTracksPage(vm: AppViewModel, onBack: () -> Unit) {
                             modifier = groupWeight(playSrc, listOf(shuffleSrc)).height(52.dp),
                             interactionSource = playSrc,
                         ) {
-                            Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); Text("Слушать", maxLines = 1)
+                            Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); FitText("Слушать")
                         }
                         FilledTonalButton(
                             onClick = { vm.play(state.newReleaseTracks, 0, shuffle = true) },
                             modifier = groupWeight(shuffleSrc, listOf(playSrc)).height(52.dp),
                             interactionSource = shuffleSrc,
                         ) {
-                            Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); Text("Вперемешку", maxLines = 1)
+                            Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); FitText("Вперемешку")
                         }
                     }
                 }
@@ -4983,6 +5697,7 @@ private fun NewTracksPage(vm: AppViewModel, onBack: () -> Unit) {
     }
 }
 
+/** Страница «История треков»: всё, что слушали на всех устройствах аккаунта (плюс на этом устройстве). */
 @Composable
 private fun HistoryPage(vm: AppViewModel, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -4990,7 +5705,7 @@ private fun HistoryPage(vm: AppViewModel, onBack: () -> Unit) {
     LaunchedEffect(Unit) { vm.loadSyncedHistory(force = true) }
     val list = state.syncedHistory.ifEmpty { state.history }
     Column(Modifier.fillMaxSize()) {
-        SubPageBar("История треков", onBack, subtitle = "Синхронизируется с Яндекс Музыкой")
+        SubPageBar("История треков", onBack, subtitle = if (ActiveProvider.isVk) "Недавно прослушанное в VK" else if (ActiveProvider.isSc) "Синхронизируется с SoundCloud" else "Синхронизируется с Яндекс Музыкой")
         when {
             list.isNotEmpty() -> PullLazyColumn(vm, Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {
                 item {
@@ -4998,6 +5713,7 @@ private fun HistoryPage(vm: AppViewModel, onBack: () -> Unit) {
                         Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
+                        // Группа кнопок M3E: нажатая кнопка расширяется, соседняя уступает ей место.
                         val playSrc = remember { MutableInteractionSource() }
                         val shuffleSrc = remember { MutableInteractionSource() }
                         Button(
@@ -5005,14 +5721,14 @@ private fun HistoryPage(vm: AppViewModel, onBack: () -> Unit) {
                             modifier = groupWeight(playSrc, listOf(shuffleSrc)).height(52.dp),
                             interactionSource = playSrc,
                         ) {
-                            Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); Text("Слушать", maxLines = 1)
+                            Icon(painterResource(R.drawable.ms_play_arrow), null); Spacer(Modifier.width(6.dp)); FitText("Слушать")
                         }
                         FilledTonalButton(
                             onClick = { vm.play(list, 0, shuffle = true) },
                             modifier = groupWeight(shuffleSrc, listOf(playSrc)).height(52.dp),
                             interactionSource = shuffleSrc,
                         ) {
-                            Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); Text("Вперемешку", maxLines = 1)
+                            Icon(painterResource(R.drawable.ms_shuffle), null); Spacer(Modifier.width(6.dp)); FitText("Вперемешку")
                         }
                     }
                 }
@@ -5024,6 +5740,7 @@ private fun HistoryPage(vm: AppViewModel, onBack: () -> Unit) {
     }
 }
 
+/** Страница «Подкасты»: подборка и поиск по подкастам. Выпуски открываются как альбом. */
 @Composable
 private fun PodcastsPage(vm: AppViewModel, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -5031,7 +5748,9 @@ private fun PodcastsPage(vm: AppViewModel, onBack: () -> Unit) {
     var query by rememberSaveable { mutableStateOf("") }
     val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
     val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    // Открыли что-то из результатов — запрос уходит в историю поиска.
     val hideKeyboard: () -> Unit = { SearchHistory.add(query); keyboard?.hide(); focusManager.clearFocus() }
+    // Пустой запрос — подборка (грузится сразу), непустой — поиск с небольшой задержкой на ввод.
     LaunchedEffect(query) {
         if (query.isNotBlank()) delay(400)
         vm.searchPodcastsPage(query)
@@ -5070,6 +5789,7 @@ private fun PodcastsPage(vm: AppViewModel, onBack: () -> Unit) {
     }
 }
 
+/** Пустое состояние страницы: короткая надпись и, при необходимости, кнопка действия. */
 @Composable
 private fun EmptyNote(text: String, action: @Composable () -> Unit) {
     Column(
@@ -5087,6 +5807,12 @@ private fun EmptyNote(text: String, action: @Composable () -> Unit) {
     }
 }
 
+/**
+ * Верхняя часть главной: большой блок «Моей волны». Сверху — «Встряхнуть» и «Настройки» (и значок поиска в углу, если выбран
+ * такой вариант), снизу — большая кнопка «Моя волна» с бегущей волной, которая же ставит волну на паузу. Пока волна играет,
+ * светится сама кнопка «Моя волна», а не весь блок (Настройки → Внешний вид → Свечение → «Свечение «Моей волны»»).
+ * Фон блока рисуется без обрезки (не через Surface), чтобы свет кнопки выходил за её края поверх блока.
+ */
 @Composable
 private fun WaveHero(
     loading: Boolean,
@@ -5110,10 +5836,10 @@ private fun WaveHero(
         Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp + shapeInset() / 2, vertical = 14.dp)) {
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                 FilledTonalIconButton(onClick = onShake, enabled = !loading, colors = tonal, modifier = Modifier.size(48.dp)) {
-                    Icon(painterResource(R.drawable.ms_refresh), contentDescription = "Встряхнуть Мою волну")
+                    Icon(painterResource(R.drawable.ms_refresh), contentDescription = if (ActiveProvider.isVk) "Встряхнуть VK Микс" else if (ActiveProvider.isSc) "Новая волна" else "Встряхнуть Мою волну")
                 }
                 FilledTonalIconButton(onClick = onSettings, colors = tonal, modifier = Modifier.size(48.dp)) {
-                    Icon(painterResource(R.drawable.ms_settings), contentDescription = "Настройки Моей волны")
+                    Icon(painterResource(R.drawable.ms_settings), contentDescription = if (ActiveProvider.isVk) "Настройки VK Микса" else if (ActiveProvider.isSc) "Источники волны" else "Настройки Моей волны")
                 }
                 Spacer(Modifier.weight(1f))
                 if (searchInCorner) {
@@ -5129,6 +5855,7 @@ private fun WaveHero(
     }
 }
 
+/** Компактная «Моя волна», закреплённая сверху, когда большой блок главной прокручен. */
 @Composable
 private fun WavePinnedBar(
     loading: Boolean,
@@ -5138,6 +5865,8 @@ private fun WavePinnedBar(
     onShake: () -> Unit,
     onSettings: () -> Unit,
 ) {
+    // Непрозрачный фон: карточки уходят под панель, а не просвечивают сквозь неё. Свечение — у самой кнопки «Моя волна».
+    // Не Surface: он обрезает содержимое по границам, а свет кнопки должен выходить за них.
     Box(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface)) {
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
@@ -5146,15 +5875,19 @@ private fun WavePinnedBar(
         ) {
             WaveMainButton(loading = loading, playing = playing, waveOn = waveOn, onClick = onStart, modifier = Modifier.weight(1f), compact = true)
             FilledTonalIconButton(onClick = onShake, enabled = !loading, modifier = Modifier.size(48.dp)) {
-                Icon(painterResource(R.drawable.ms_refresh), contentDescription = "Встряхнуть Мою волну")
+                Icon(painterResource(R.drawable.ms_refresh), contentDescription = if (ActiveProvider.isVk) "Встряхнуть VK Микс" else if (ActiveProvider.isSc) "Встряхнуть волну" else "Встряхнуть Мою волну")
             }
             FilledTonalIconButton(onClick = onSettings, modifier = Modifier.size(48.dp)) {
-                Icon(painterResource(R.drawable.ms_settings), contentDescription = "Настройки Моей волны")
+                Icon(painterResource(R.drawable.ms_settings), contentDescription = if (ActiveProvider.isVk) "Настройки VK Микса" else if (ActiveProvider.isSc) "Источники волны" else "Настройки Моей волны")
             }
         }
     }
 }
 
+/**
+ * Большая кнопка «Моя волна»: на фоне бегущие волны (пока играет; на паузе почти замирают), слева значок-волна,
+ * справа — «пауза» или «играть». Нажатие запускает волну, а если она уже в очереди — ставит на паузу и продолжает.
+ */
 @Composable
 private fun WaveMainButton(
     loading: Boolean,
@@ -5169,6 +5902,7 @@ private fun WaveMainButton(
         haptic = HapticKind.Heavy,
         enabled = !loading,
         modifier = modifier.height(if (compact) 56.dp else 76.dp)
+            // Свечение рисуется под кнопкой и повторяет её форму; пока играет именно «Моя волна».
             .playGlow(
                 active = playing, enabled = ThemeSettings.glowWave,
                 color = MaterialTheme.colorScheme.primary,
@@ -5190,7 +5924,7 @@ private fun WaveMainButton(
                 }
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
-                    Text("Моя волна", style = MaterialTheme.typography.titleMediumEmphasized, maxLines = 1)
+                    Text(ActiveProvider.waveTitle, style = MaterialTheme.typography.titleMediumEmphasized, maxLines = 1)
                     if (!compact) {
                         Text(
                             when {
@@ -5215,6 +5949,14 @@ private fun WaveMainButton(
     }
 }
 
+/**
+ * Волна («вода») на фоне кнопки: одна мягкая синусоида. Пока [playing] — плавно бежит, иначе успокаивается
+ * (амплитуда падает, фаза замирает на месте). При включённой «Оптимизации» не рисуется вовсе.
+ * Бесконечная анимация работает, только пока играет.
+ *
+ * Если включено «Вода реагирует на наклон» (Настройки → Внешний вид), уровень воды следует за акселерометром:
+ * телефон наклонили — вода стекает в нижнюю сторону, покачали — плещется (пружина с лёгким «перелётом»).
+ */
 @Composable
 private fun WaveBackdrop(playing: Boolean, color: Color, modifier: Modifier = Modifier) {
     if (ThemeSettings.optimize) return
@@ -5228,6 +5970,7 @@ private fun WaveBackdrop(playing: Boolean, color: Color, modifier: Modifier = Mo
             label = "waveBackdropPhase",
         )
     } else null
+    // Наклон телефона: датчик → пружина. Читается только в Canvas, поэтому перекомпозиции от датчика нет.
     val tiltOn = ThemeSettings.waveTilt
     val tiltRaw = rememberTilt(tiltOn)
     val tilt = remember { Animatable(0f) }
@@ -5240,6 +5983,7 @@ private fun WaveBackdrop(playing: Boolean, color: Color, modifier: Modifier = Mo
             }
         }
     }
+    // Последняя фаза: на паузе волна замирает там, где была, а не прыгает в начало.
     val last = remember { FloatArray(1) }
     Canvas(modifier) {
         val ph = phase?.value ?: last[0]
@@ -5248,6 +5992,7 @@ private fun WaveBackdrop(playing: Boolean, color: Color, modifier: Modifier = Mo
         val h = size.height
         val twoPi = (2 * Math.PI).toFloat()
         val tl = tilt.value
+        // Чем сильнее вода «догоняет» наклон (пружина ещё качается), тем выше рябь.
         val churn = if (tiltOn) (kotlin.math.abs(tilt.targetValue - tl) * 1.6f).coerceAtMost(1.5f) else 0f
         val path = androidx.compose.ui.graphics.Path()
         val base = h * 0.68f
@@ -5255,6 +6000,7 @@ private fun WaveBackdrop(playing: Boolean, color: Color, modifier: Modifier = Mo
         path.moveTo(0f, h)
         var x = 0f
         while (x <= w + 8f) {
+            // Поверхность наклонена: справа глубже при tl > 0 (правый край ниже), слева глубже при tl < 0.
             val slope = -tl * h * 0.7f * (x / w - 0.5f)
             val y = (base + slope + ampPx * kotlin.math.sin(x / w * twoPi * 1.4f + ph)).coerceIn(0f, h)
             path.lineTo(x, y)
@@ -5266,6 +6012,7 @@ private fun WaveBackdrop(playing: Boolean, color: Color, modifier: Modifier = Mo
     }
 }
 
+/** Кнопка «Моя волна» и кнопка её настроек. Пока волна играет, значок — бегущая волна; иначе статичный значок волны. */
 @Composable
 private fun WaveRow(
     loading: Boolean,
@@ -5298,8 +6045,9 @@ private fun WaveRow(
                 WaveIcon(playing = playing, color = LocalContentColor.current)
             }
             Spacer(Modifier.width(8.dp))
-            Text("Моя волна", style = MaterialTheme.typography.titleMediumEmphasized)
+            Text(ActiveProvider.waveTitle, style = MaterialTheme.typography.titleMediumEmphasized)
         }
+        // Пока волна в очереди, между ней и настройками появляется «Встряхнуть»: подбирает новую подборку.
         AnimatedVisibility(
             visible = waveOn,
             enter = fadeIn(tween(fxMs(200))) + expandHorizontally(fxSpring(dampingRatio = 0.6f, stiffness = 800f)) +
@@ -5311,20 +6059,21 @@ private fun WaveRow(
                 enabled = !loading,
                 modifier = Modifier.padding(end = 0.dp).size(64.dp),
             ) {
-                Icon(painterResource(R.drawable.ms_refresh), contentDescription = "Встряхнуть Мою волну")
+                Icon(painterResource(R.drawable.ms_refresh), contentDescription = if (ActiveProvider.isVk) "Встряхнуть VK Микс" else if (ActiveProvider.isSc) "Встряхнуть волну" else "Встряхнуть Мою волну")
             }
         }
         FilledTonalIconButton(
             onClick = onSettings,
             modifier = Modifier.size(64.dp),
         ) {
-            Icon(painterResource(R.drawable.ms_settings), contentDescription = "Настройки Моей волны")
+            Icon(painterResource(R.drawable.ms_settings), contentDescription = if (ActiveProvider.isVk) "Настройки VK Микса" else if (ActiveProvider.isSc) "Источники волны" else "Настройки Моей волны")
         }
     }
 }
 
 @Composable
 private fun WaveSettingsSheet(vm: AppViewModel, onDismiss: () -> Unit) {
+    // Только настройки волны, а не всё состояние плеера (оно меняется каждую долю секунды и перерисовывало бы шторку).
     val waveSettings by remember(vm) {
         vm.state.map { it.waveSettings }.distinctUntilChanged()
     }.collectAsStateWithLifecycle(initialValue = vm.state.value.waveSettings)
@@ -5384,6 +6133,17 @@ private fun WaveOptionGroup(
     }
 }
 
+/**
+ * Растягивает содержимое на [extra] в каждую сторону за пределы родительских отступов.
+ * Нужен там, где строки списка (у них свой отступ 16dp) лежат внутри экрана с собственным боковым отступом.
+ */
+private fun Modifier.bleedH(extra: Dp): Modifier = layout { measurable, constraints ->
+    val e = extra.roundToPx()
+    val w = if (constraints.hasBoundedWidth) constraints.maxWidth + e * 2 else constraints.maxWidth
+    val placeable = measurable.measure(constraints.copy(minWidth = w, maxWidth = w))
+    layout(constraints.maxWidth, placeable.height) { placeable.place(-e, 0) }
+}
+
 @Composable
 private fun SectionTitle(text: String) = Text(
     text,
@@ -5406,6 +6166,7 @@ private fun PlaylistCard(
         modifier.then(if (fill) Modifier.fillMaxWidth() else Modifier.width(140.dp))
             .pressCard(source, onClick, onLongClick),
     ) {
+        // Свечение рисуется под обложкой и до её clip, поэтому видно вокруг неё.
         Box(
             Modifier.playGlow(
                 active = glowing, enabled = ThemeSettings.glowPlaylists,
@@ -5423,13 +6184,13 @@ private fun PlaylistCard(
                 WaveBadge({ waveActions.playlist(p) }, Modifier.align(Alignment.BottomEnd).padding(8.dp))
             }
         }
-        Text(
-            p.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
+        FitText(
+            p.title, maxLines = 2,
             style = MaterialTheme.typography.titleSmall,
             modifier = Modifier.padding(top = 8.dp, start = 4.dp, end = 4.dp),
         )
         Text(
-            "${p.trackCount} треков",
+            tracksWord(p.trackCount),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(start = 4.dp, end = 4.dp, bottom = 4.dp),
@@ -5444,11 +6205,13 @@ private fun TrackRow(t: Track, onRemove: (() -> Unit)? = null, modifier: Modifie
     val openAlbum = LocalOpenAlbum.current
     val showInfo = LocalShowTrackInfo.current
     val waveActions = LocalWaveActions.current
+    // Без сети треки, которых нет на устройстве, приглушены (играть их нельзя).
     val unavailable = LocalOffline.current && !t.isLocal && LocalDownloads.current.items.none { it.id == t.id }
     ListItem(
         headlineContent = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                // Приписка к названию («минус», «a.k.a. …»): серым после названия, нажатие открывает информацию о треке.
                 t.version?.let { v ->
                     Text(
                         v, maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -5474,7 +6237,10 @@ private fun TrackRow(t: Track, onRemove: (() -> Unit)? = null, modifier: Modifie
             }
         },
         leadingContent = {
-            Cover(model = t.cover(200), modifier = Modifier.size(52.dp).clip(rounded(14)))
+            Box {
+                Cover(model = t.cover(200), modifier = Modifier.size(52.dp).clip(rounded(14)))
+                MixPickBadge(t, Modifier.size(52.dp))
+            }
         },
         trailingContent = {
             if (!t.isLocal) {
@@ -5503,6 +6269,7 @@ private fun TrackRow(t: Track, onRemove: (() -> Unit)? = null, modifier: Modifie
                             onClick = { menu = false; waveActions.track(t) },
                         )
                     }
+                    MixPickMenuItem(t) { menu = false }
                     TrackActionItems(t) { menu = false }
                     if (onRemove != null) {
                         DropdownMenuItem(
@@ -5515,21 +6282,34 @@ private fun TrackRow(t: Track, onRemove: (() -> Unit)? = null, modifier: Modifie
             }
             }
         },
-        colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-        modifier = modifier.padding(horizontal = 8.dp).clip(containerShape(24)).clickable(onClick = onClick)
+        colors = MixPicker.rowColors(t),
+        // Выразительная строка: крупное скругление, нажатие подсвечивает всю «плитку».
+        // Долгое нажатие выбирает трек для микса; пока что-то выбрано, обычное нажатие отмечает/снимает трек.
+        modifier = modifier.padding(horizontal = 8.dp).clip(containerShape(24))
+            .combinedClickable(
+                onClick = { if (MixPicker.active) MixPicker.toggle(t) else onClick() },
+                onLongClick = { MixPicker.toggle(t) },
+            )
             .alpha(if (unavailable) 0.4f else 1f),
     )
 }
 
+// ---------- Поиск ----------
+
 @Composable
 private fun SearchScreen(vm: AppViewModel, active: Boolean = true) {
     val state by vm.state.collectAsStateWithLifecycle()
+    // Поле помнит последний запрос: вернулись на вкладку — в поле тот же текст, что и у результатов под ним.
     var query by remember { mutableStateOf(vm.state.value.searchedQuery) }
+    // Запрос из распознавания музыки: подставляем в поле и сразу ищем.
     val searchRequest by vm.searchRequest.collectAsStateWithLifecycle()
     LaunchedEffect(searchRequest) {
         searchRequest?.let { q -> query = q; vm.search(q); vm.consumeSearchRequest() }
     }
+    // Поиск по файлам устройства идёт сразу при вводе (с небольшой задержкой).
     LaunchedEffect(query) { delay(250); vm.searchLocal(query) }
+    // Живой поиск: результаты в Яндекс Музыке появляются, пока вы печатаете (Настройки → Внешний вид → Навигация).
+    // Пустое поле очищает результаты. Выключено — как раньше, поиск по «Enter».
     val liveSearch = NavSettings.liveSearch
     LaunchedEffect(query, liveSearch) {
         val q = query.trim()
@@ -5538,28 +6318,37 @@ private fun SearchScreen(vm: AppViewModel, active: Boolean = true) {
             return@LaunchedEffect
         }
         if (!liveSearch || q == vm.state.value.searchedQuery) return@LaunchedEffect
-        delay(350)
+        delay(350) // не шлём запрос на каждую букву
         vm.search(q, live = true)
     }
 
+    // Клавиатура: при открытии поиска всегда появляется; при прокрутке страницы вниз прячется,
+    // а когда вернулись наверх до упора — появляется снова.
     val listState = rememberLazyListState()
     val focusRequester = remember { FocusRequester() }
     val focusManager = androidx.compose.ui.platform.LocalFocusManager.current
     val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    // Нажали на карточку (исполнитель, альбом, подкаст, трек) — клавиатура прячется и поле теряет фокус.
     val hideKeyboard: () -> Unit = { keyboard?.hide(); focusManager.clearFocus() }
+    // Автоматическое появление клавиатуры — по настройке (Оформление → Поиск), по умолчанию выключено.
+    // «Поиск» живёт в пейджере вместе с другими вкладками и может быть собран, когда выбрана не она (соседняя страница
+    // при листании). Такой «неактивный» поиск не имеет права брать фокус и открывать клавиатуру: иначе при нажатии на
+    // «Плейлисты» система прокручивала пейджер к полю ввода, на секунду показывала поиск, а клавиатура оставалась.
     val autoKeyboard = ThemeSettings.searchAutoKeyboard
     val activeNow by rememberUpdatedState(active)
     LaunchedEffect(autoKeyboard, active) {
         if (autoKeyboard && active) {
-            delay(120)
+            delay(120) // даём экрану появиться, иначе клавиатура открывается рывком
             if (!activeNow) return@LaunchedEffect
             runCatching { focusRequester.requestFocus() }
             keyboard?.show()
         }
     }
+    // Ушли с «Поиска» — клавиатура прячется, поле теряет фокус.
     LaunchedEffect(active) {
         if (!active) { keyboard?.hide(); focusManager.clearFocus() }
     }
+    // Кнопка поиска на главной: ставим курсор в поле и открываем клавиатуру (когда «Поиск» уже стал выбранной вкладкой).
     val focusPending by vm.searchFocusRequest.collectAsStateWithLifecycle()
     LaunchedEffect(focusPending, active) {
         if (focusPending && active) {
@@ -5594,6 +6383,7 @@ private fun SearchScreen(vm: AppViewModel, active: Boolean = true) {
             onValueChange = { query = it },
             placeholder = { Text("Треки, исполнители, подкасты") },
             leadingIcon = { Icon(painterResource(R.drawable.ms_search), null) },
+            // Пока идёт запрос — индикатор, иначе (если что-то введено) — кнопка «Очистить».
             trailingIcon = {
                 if (state.searchLoading) {
                     LoadingIndicator(Modifier.size(28.dp))
@@ -5614,9 +6404,10 @@ private fun SearchScreen(vm: AppViewModel, active: Boolean = true) {
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
             keyboardActions = KeyboardActions(onSearch = { vm.search(query); SearchHistory.add(query); keyboard?.hide() }),
             modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 16.dp, bottom = 8.dp)
-                .focusProperties { canFocus = active }
+                .focusProperties { canFocus = active } // на неактивной вкладке поле вообще не может получить фокус
                 .focusRequester(focusRequester),
         )
+        // Планшет: слева альбомы, подкасты и исполнители, справа треки. Пустая колонка говорит, чего не нашлось.
         val wideSearch = LocalWide.current && query.isNotBlank()
         if (wideSearch) {
             val localShown = if (LocalFilesSettings.enabled) state.searchLocal else emptyList()
@@ -5702,6 +6493,7 @@ private fun SearchScreen(vm: AppViewModel, active: Boolean = true) {
             contentPadding = PaddingValues(bottom = 24.dp),
             searchQuery = query,
         ) {
+            // История поиска: пока поле пустое. Нажатие повторяет запрос, крестик убирает одну запись, «Очистить» — всю историю.
             if (SearchHistory.enabled && query.isBlank() && SearchHistory.items.isNotEmpty()) {
                 item(key = "search_history_head") {
                     Row(
@@ -5762,6 +6554,7 @@ private fun SearchScreen(vm: AppViewModel, active: Boolean = true) {
             itemsIndexed(state.searchResults) { i, t ->
                 TrackRow(t) { hideKeyboard(); vm.play(state.searchResults, i) }
             }
+            // Поиск по этому запросу завершился, а показывать нечего.
             if (!hasOther && state.searchResults.isEmpty() && query.isNotBlank() && state.searchedQuery == query.trim()) {
                 item(key = "nothing_found") {
                     Text(
@@ -5777,6 +6570,7 @@ private fun SearchScreen(vm: AppViewModel, active: Boolean = true) {
     }
 }
 
+/** Подпись пустой области поиска на планшете («Треки не найдены», «Ничего не найдено»): по центру области. */
 @Composable
 private fun SearchEmptyNote(text: String, modifier: Modifier = Modifier) {
     Box(modifier.padding(32.dp), contentAlignment = Alignment.Center) {
@@ -5794,6 +6588,7 @@ private fun SearchPaneTitle(text: String) {
     Text(text, style = MaterialTheme.typography.titleLargeEmphasized, modifier = Modifier.padding(top = 12.dp, bottom = 2.dp))
 }
 
+/** Строка истории поиска: значок, запрос и крестик, который убирает его из истории. */
 @Composable
 private fun SearchHistoryRow(q: String, modifier: Modifier = Modifier, onClick: () -> Unit, onRemove: () -> Unit) {
     Row(
@@ -5865,6 +6660,8 @@ private fun AlbumCard(a: AlbumInfo, width: Dp = 140.dp, modifier: Modifier = Mod
     }
 }
 
+// ---------- Альбом ----------
+
 @Composable
 private fun AlbumScreen(vm: AppViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -5874,8 +6671,10 @@ private fun AlbumScreen(vm: AppViewModel) {
     BackHandler(enabled = state.openedAlbum != null) { vm.closeAlbum() }
     val keys = remember(album.tracks) { trackKeys(album.tracks) }
     var showArtists by remember(album.id) { mutableStateOf(false) }
+    // Обложка альбома в большом размере: открывается в окне просмотра по нажатию на обложку.
     var showCover by remember(album.id) { mutableStateOf(false) }
     val bigCover = album.cover(1000) ?: album.tracks.firstOrNull()?.cover(1000)
+    // Открыт с обложки плеера — прокручиваем список к играющему треку (один раз после загрузки).
     val focusId = state.albumFocusTrackId
     val listState = rememberLazyListState()
     val isWideNow = LocalWide.current
@@ -5884,7 +6683,7 @@ private fun AlbumScreen(vm: AppViewModel) {
         if (focusId != null && !scrolled && !state.openedAlbumLoading) {
             val i = album.tracks.indexOfFirst { it.id == focusId }
             if (i >= 0) {
-                val before = if (isWideNow) 0 else 2
+                val before = if (isWideNow) 0 else 2 // шапка и ряды кнопок (на планшете они в левой колонке)
                 listState.scrollToItem(before + i)
                 scrolled = true
             }
@@ -5902,12 +6701,14 @@ private fun AlbumScreen(vm: AppViewModel) {
                     subtitle = album.artists.takeIf { it.isNotBlank() },
                     countText = listOfNotNull(album.year.takeIf { it > 0 }?.toString(), "$count треков").joinToString(" · "),
                     onSubtitleClick = if (album.artistRefs.isNotEmpty()) ({
+                        // Один исполнитель — окно выбора не нужно, сразу открываем его страницу.
                         val only = album.artistRefs.singleOrNull()
                         if (only != null) vm.openArtist(only) else showArtists = true
                     }) else null,
                     onCoverClick = if (bigCover != null) ({ showCover = true }) else null,
                 )
             }
+            // Кнопки без подписей, в один-два ряда: назад, слушать, вперемешку, волна, в коллекцию, поделиться.
             item(key = "album_actions") {
                 val shareCtx = LocalContext.current
                 val albumLiked = state.likedAlbums.any { it.id == album.id }
@@ -5920,16 +6721,25 @@ private fun AlbumScreen(vm: AppViewModel) {
                         PageAction(R.drawable.ms_play_arrow, "Слушать", kind = 1, enabled = album.tracks.isNotEmpty()) { vm.play(album.tracks, 0) },
                         PageAction(R.drawable.ms_shuffle, "Вперемешку", enabled = album.tracks.isNotEmpty()) { vm.play(album.tracks, 0, shuffle = true) },
                         wave?.let { w -> PageAction(R.drawable.ms_graphic_eq, "Включить волну", enabled = album.tracks.isNotEmpty()) { w.album(album) } },
+                        // Пока альбом грузится, у него нет названия и обложки — лайк станет доступен, как только загрузится.
                         PageAction(
                             if (albumLiked) R.drawable.ms_favorite else R.drawable.ms_favorite_border,
                             if (albumLiked) "Убрать из коллекции" else "В коллекцию",
                             kind = if (albumLiked) 1 else 0,
                             enabled = !state.openedAlbumLoading && album.title.isNotBlank(),
                         ) { vm.toggleAlbumLike(album) },
+                        // Свой альбом SoundCloud: название, описание, жанр, теги и видимость.
+                        run {
+                            val myId = LocalScMyId.current
+                            val editSc = LocalEditScItem.current
+                            if (myId != null && app.ymusic.m3e.data.ScIds.isSc(album.id) && album.artistRefs.any { it.id == myId }) {
+                                PageAction(R.drawable.ms_edit, "Изменить альбом") { editSc(album.id, true) }
+                            } else null
+                        },
                         shareLink?.let { link ->
                             PageAction(R.drawable.ms_share, "Поделиться") {
                                 val head = listOf(album.title, album.artists).filter { it.isNotBlank() }.joinToString(" — ")
-                                ShareLinks.shareText(shareCtx, album.title, "$head\n$link")
+                                ShareQrHost.open(album.title, "$head\n$link", link)
                             }
                         },
                     ) + downloadActions,
@@ -5970,6 +6780,7 @@ private fun AlbumScreen(vm: AppViewModel) {
     }
 }
 
+/** Модалка «Исполнители»: список авторов альбома с аватарками; нажатие открывает страницу исполнителя. */
 @Composable
 private fun ArtistsSheet(artists: List<ArtistRef>, onDismiss: () -> Unit, onPick: (ArtistRef) -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
@@ -5998,6 +6809,9 @@ private fun ArtistsSheet(artists: List<ArtistRef>, onDismiss: () -> Unit, onPick
     }
 }
 
+// ---------- Артист ----------
+
+/** Форма аватарки исполнителя из настроек. */
 @Composable
 private fun AvatarShape.asShape(): Shape = when (this) {
     AvatarShape.Cookie12 -> MaterialShapes.Cookie12Sided.toShape()
@@ -6019,19 +6833,24 @@ private fun ArtistScreen(vm: AppViewModel) {
     state.openedArtist?.let { lastArtist = it }
     val artist = lastArtist ?: return
     BackHandler(enabled = state.openedArtist != null) { vm.closeArtist() }
+    // Понравившиеся треки этого исполнителя и то, что слушали из него в «Моей волне» (как на странице исполнителя в Яндекс Музыке).
     val likedByArtist = remember(state.liked, artist.id) { state.liked.filter { l -> l.artistRefs.any { it.id == artist.id } } }
+    // «Из Моей волны»: локальные прослушивания плюс те, что аккаунт запомнил с других устройств.
     LaunchedEffect(artist.id) { vm.loadSyncedHistory() }
     val waveByArtist = remember(state.waveHistory, state.syncedWave, artist.id) {
         val seen = HashSet<String>()
         (state.waveHistory + state.syncedWave)
             .filter { w -> w.artistRefs.any { it.id == artist.id } && seen.add(w.id) }
     }
+    // Самый свежий альбом артиста (по дате выхода, а если её нет — по году).
     val latestAlbum = remember(artist.albums) { artist.albums.maxByOrNull { it.sortDate } }
+    // Нажатие на аватарку исполнителя открывает его фото в окне просмотра.
     var showPhoto by remember(artist.id) { mutableStateOf(false) }
     var subPage by remember(artist.id) { mutableStateOf<ArtistSub?>(null) }
     var lastSub by remember(artist.id) { mutableStateOf(ArtistSub.Tracks) }
     subPage?.let { lastSub = it }
     BackHandler(enabled = subPage != null) { subPage = null }
+    // Жест «назад» страницы исполнителя; пока открыта вложенная страница (Треки, Альбомы...), жест достаётся ей.
     SwipeBack(enabled = state.openedArtist != null && subPage == null, onBack = { vm.closeArtist() }) {
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
         Box(Modifier.fillMaxSize()) {
@@ -6056,6 +6875,23 @@ private fun ArtistScreen(vm: AppViewModel) {
                             style = MaterialTheme.typography.headlineMediumEmphasized,
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
                         )
+                        // Слушатели за месяц, если сервис их отдаёт; иначе подписчики; нет ни того, ни другого — строки нет.
+                        val statLine = if (artist.monthlyListeners > 0) listenersText(artist.monthlyListeners)
+                            else if (artist.followers > 0) followersText(artist.followers) else null
+                        if (statLine != null) {
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                statLine,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            )
+                        }
+                        // «Об артисте»: описание от сервиса (если есть). Отключается в Настройки → Внешний вид → Страница артиста.
+                        if (ThemeSettings.artistBio && artist.bio.isNotEmpty()) {
+                            Spacer(Modifier.height(16.dp))
+                            ArtistBioCard(artist.id, artist.bio)
+                        }
                     }
                     PlayButtonsRow(
                         enabled = artist.tracks.isNotEmpty(),
@@ -6068,11 +6904,12 @@ private fun ArtistScreen(vm: AppViewModel) {
                     PageActionsRow(
                         liked = null, onLike = null,
                         onShare = ShareLinks.artist(artist.id)?.let { link ->
-                            { ShareLinks.shareText(shareCtx, artist.name, "${artist.name}\n$link") }
+                            { ShareQrHost.open(artist.name, "${artist.name}\n$link", link) }
                         },
                     )
                 }
             }
+            // Последний выпуск артиста: прямоугольная плитка над треками и под кнопками. Нажатие открывает альбом.
             if (latestAlbum != null) {
                 item(key = "latest_album") { LatestAlbumTile(latestAlbum) { vm.openAlbum(latestAlbum) } }
             }
@@ -6098,6 +6935,7 @@ private fun ArtistScreen(vm: AppViewModel) {
             if (artist.albums.isNotEmpty()) {
                 item { SectionLink("Альбомы") { subPage = ArtistSub.Albums } }
                 item {
+                    // Карточки считаются от ширины экрана: ровно три альбома помещаются в ряд, остальные листаются.
                     BoxWithConstraints(Modifier.fillMaxWidth()) {
                         val cardW = ((maxWidth - 32.dp - 24.dp) / 3).coerceAtLeast(96.dp)
                         LazyRow(
@@ -6114,7 +6952,7 @@ private fun ArtistScreen(vm: AppViewModel) {
                 }
             }
             if (waveByArtist.isNotEmpty()) {
-                item(key = "waveHead") { SectionLink("Из Моей волны", count = waveByArtist.size) { subPage = ArtistSub.Wave } }
+                item(key = "waveHead") { SectionLink(if (ActiveProvider.isVk) "Из VK Микса" else if (ActiveProvider.isSc) "Из волны" else "Из Моей волны", count = waveByArtist.size) { subPage = ArtistSub.Wave } }
                 itemsIndexed(waveByArtist.take(3), key = { i, t -> "wave:${t.id}:$i" }) { i, t ->
                     TrackRow(t, modifier = removeAnim()) { vm.play(waveByArtist, i) }
                 }
@@ -6137,7 +6975,7 @@ private fun ArtistScreen(vm: AppViewModel) {
                     ArtistSub.Tracks -> ArtistTracksPage(vm, artist) { subPage = null }
                     ArtistSub.Albums -> ArtistAlbumsPage(vm, artist) { subPage = null }
                     ArtistSub.Liked -> ArtistLibPage(vm, "Понравившиеся", artist, likedByArtist) { subPage = null }
-                    ArtistSub.Wave -> ArtistLibPage(vm, "Из Моей волны", artist, waveByArtist) { subPage = null }
+                    ArtistSub.Wave -> ArtistLibPage(vm, if (ActiveProvider.isVk) "Из VK Микса" else if (ActiveProvider.isSc) "Из волны" else "Из Моей волны", artist, waveByArtist) { subPage = null }
                 }
             }
         }
@@ -6146,9 +6984,87 @@ private fun ArtistScreen(vm: AppViewModel) {
     }
 }
 
+/**
+ * «Об артисте» в стиле Material 3 Expressive: тональная карточка с крупным скруглением, значком в акцентном круге и
+ * превью текста в три строки. Нажатие в любом месте карточки раскрывает описание целиком (пружинная анимация высоты,
+ * стрелка в круге поворачивается). Если текст целиком помещается в три строки, стрелки нет и карточка не нажимается.
+ */
+@Composable
+private fun ArtistBioCard(artistId: String, text: String) {
+    var expanded by remember(artistId) { mutableStateOf(false) }
+    // Влезает ли текст в три строки: измеряется в свёрнутом виде и дальше не меняется, пока не сменился артист.
+    var canExpand by remember(artistId, text) { mutableStateOf(false) }
+    val source = remember { MutableInteractionSource() }
+    val arrow by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        animationSpec = fxSpring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMediumLow),
+        label = "bioArrow",
+    )
+    val toggle: () -> Unit = { if (canExpand) expanded = !expanded }
+    Surface(
+        modifier = Modifier.fillMaxWidth()
+            .let { if (canExpand) it.pressCard(source, toggle) else it },
+        shape = containerShape(28),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+    ) {
+        Column(
+            Modifier.fillMaxWidth()
+                .then(if (canExpand) Modifier.indication(source, LocalIndication.current) else Modifier)
+                .animateContentSize(animationSpec = fxSpring(dampingRatio = Spring.DampingRatioLowBouncy, stiffness = Spring.StiffnessMediumLow))
+                .padding(start = 16.dp + shapeInset(), end = 12.dp + shapeInset(), top = 14.dp, bottom = 14.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(36.dp).clip(rounded(12)).background(MaterialTheme.colorScheme.primaryContainer),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        painterResource(R.drawable.ms_info), null,
+                        Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Text(
+                    "Об артисте",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f),
+                )
+                if (canExpand) {
+                    Box(
+                        Modifier.size(32.dp).clip(androidx.compose.foundation.shape.CircleShape)
+                            .background(MaterialTheme.colorScheme.secondaryContainer),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            painterResource(R.drawable.ms_expand_more),
+                            contentDescription = if (expanded) "Свернуть" else "Развернуть",
+                            modifier = Modifier.size(22.dp).graphicsLayer { rotationZ = arrow },
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = if (expanded) Int.MAX_VALUE else 3,
+                overflow = TextOverflow.Ellipsis,
+                onTextLayout = { r -> if (!expanded && r.hasVisualOverflow) canExpand = true },
+            )
+        }
+    }
+}
+
+/** Плитка «Новинка» / «Последний альбом» на странице артиста: обложка, название, дата выхода и число треков. */
 @Composable
 private fun LatestAlbumTile(a: AlbumInfo, onClick: () -> Unit) {
     val source = remember { MutableInteractionSource() }
+    // Свежим считается релиз не старше четырёх месяцев — тогда плитка подписана «Новинка».
     val recent = remember(a.id) {
         a.sortDate.isNotEmpty() && a.sortDate >= java.time.LocalDate.now().minusDays(120).toString()
     }
@@ -6195,6 +7111,7 @@ private fun LatestAlbumTile(a: AlbumInfo, onClick: () -> Unit) {
 
 private enum class ArtistSub { Tracks, Albums, Liked, Wave }
 
+/** Заголовок раздела со стрелочкой: нажатие открывает полный список. */
 @Composable
 private fun SectionLink(text: String, count: Int? = null, onClick: () -> Unit) {
     Row(
@@ -6211,6 +7128,7 @@ private fun SectionLink(text: String, count: Int? = null, onClick: () -> Unit) {
     }
 }
 
+/** Верхняя панель вложенной страницы: «назад», заголовок и необязательная подпись. */
 @Composable
 internal fun SubPageBar(title: String, onBack: () -> Unit, subtitle: String? = null, modifier: Modifier = Modifier, showBack: Boolean = true) {
     Row(
@@ -6235,8 +7153,10 @@ internal fun SubPageBar(title: String, onBack: () -> Unit, subtitle: String? = n
     }
 }
 
+/** Все треки исполнителя. */
 @Composable
 private fun ArtistTracksPage(vm: AppViewModel, artist: ArtistInfo, onBack: () -> Unit) {
+    // Популярные треки приходят сразу, остальные догружаются страницами в фоне.
     val all by vm.artistAllTracks.collectAsStateWithLifecycle()
     LaunchedEffect(artist.id) { vm.loadAllArtistTracks(artist.id) }
     val loaded = all.takeIf { it.artistId == artist.id }
@@ -6261,6 +7181,7 @@ private fun ArtistTracksPage(vm: AppViewModel, artist: ArtistInfo, onBack: () ->
     }
 }
 
+/** Полный список понравившихся / прослушанных в «Моей волне» треков исполнителя. */
 @Composable
 private fun ArtistLibPage(vm: AppViewModel, title: String, artist: ArtistInfo, tracks: List<Track>, onBack: () -> Unit) {
     val keys = remember(tracks) { trackKeys(tracks) }
@@ -6276,6 +7197,7 @@ private fun ArtistLibPage(vm: AppViewModel, title: String, artist: ArtistInfo, t
     }
 }
 
+/** Все альбомы исполнителя. */
 @Composable
 private fun ArtistAlbumsPage(vm: AppViewModel, artist: ArtistInfo, onBack: () -> Unit) {
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
@@ -6299,6 +7221,8 @@ private fun ArtistAlbumsPage(vm: AppViewModel, artist: ArtistInfo, onBack: () ->
     }
 }
 
+// ---------- Плейлисты ----------
+
 private sealed interface PlPage {
     data object Grid : PlPage
     data object Liked : PlPage
@@ -6308,6 +7232,7 @@ private sealed interface PlPage {
     data class Detail(val p: PlaylistInfo) : PlPage
 }
 
+/** Ключи элементов списка: id трека + номер повтора, чтобы не было дублей и работала анимация удаления. */
 private fun trackKeys(tracks: List<Track>): List<String> {
     val seen = HashMap<String, Int>()
     return tracks.map { t ->
@@ -6340,6 +7265,7 @@ private fun PlaylistsScreen(vm: AppViewModel) {
         targetState = page,
         contentKey = { if (it is PlPage.Detail) "detail" else it.toString() },
         transitionSpec = {
+            // «Назад» — на главную страницу раздела или из открытого плейлиста; иначе «вперёд».
             if (targetState is PlPage.Grid || initialState is PlPage.Detail) {
                 (fadeIn(tween(animMs(260), delayMillis = animMs(60))) + slideInHorizontally(tween(animMs(320))) { -it / 5 }) togetherWith
                     (fadeOut(tween(animMs(140))) + slideOutHorizontally(tween(animMs(260))) { it / 5 })
@@ -6367,6 +7293,7 @@ private fun PlaylistsScreen(vm: AppViewModel) {
     }
 }
 
+/** Альбомы раздела: из коллекции аккаунта плюс те, что скачаны (их видно и без сети). */
 @Composable
 private fun rememberAlbumList(vm: AppViewModel): Pair<List<AlbumInfo>, Set<String>> {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -6389,6 +7316,10 @@ private fun DeletePlaylistDialog(target: PlaylistInfo, onDismiss: () -> Unit, on
     )
 }
 
+/**
+ * Главная страница раздела: «Любимое», «С устройства», новый плейлист, затем «Плейлисты» и «Альбомы» —
+ * горизонтальные ряды, которые листаются в сторону. Заголовок раздела нажимается и открывает полный список.
+ */
 @Composable
 private fun PlaylistsMain(
     vm: AppViewModel,
@@ -6402,8 +7333,10 @@ private fun PlaylistsMain(
     var showCreate by remember { mutableStateOf(false) }
     var deleteTarget by remember { mutableStateOf<PlaylistInfo?>(null) }
     val ctx = LocalContext.current
+    // Если доступ уже выдан — заранее считаем, сколько файлов на устройстве.
     LaunchedEffect(Unit) { if (LocalFilesSettings.enabled && LocalMusic.hasPermission(ctx)) vm.loadLocalTracks() }
     val wideLib = LocalWide.current
+    // Планшет: слева «Любимое», «С устройства» и «Новый плейлист», справа плейлисты и альбомы сеткой.
     val plLeftBlocks = setOf(PlaylistsBlock.Liked, PlaylistsBlock.Local, PlaylistsBlock.Create)
     val plBlocks: LazyListScope.() -> Unit = {
         UiLayout.order(LScreen.PLAYLISTS, PlaylistsBlock.entries).forEach { blk ->
@@ -6440,6 +7373,8 @@ private fun PlaylistsMain(
                                     modifier = Modifier.padding(top = 2.dp),
                                 )
                             }
+                            // Кнопка плей нажимается сама по себе (играет «Любимое» / ставит на паузу), а вся остальная
+                            // область карточки открывает список лайков.
                             val likedActive = state.playingSource == "liked"
                             FilledIconButton(
                                 onClick = {
@@ -6509,6 +7444,7 @@ private fun PlaylistsMain(
 
                 }
                 PlaylistsBlock.Playlists -> {
+                // ---- Плейлисты: ряд, который листается в сторону ----
                 blockItem("playlists_title", LScreen.PLAYLISTS, PlaylistsBlock.Playlists) {
                     Box(Modifier.padding(top = 8.dp)) { SectionLink("Плейлисты", onClick = onOpenAllPlaylists) }
                 }
@@ -6538,6 +7474,7 @@ private fun PlaylistsMain(
 
                 }
                 PlaylistsBlock.Albums -> {
+                // ---- Альбомы: после плейлистов, тоже в сторону ----
                 blockItem("albums_title", LScreen.PLAYLISTS, PlaylistsBlock.Albums) { SectionLink("Альбомы", onClick = onOpenAllAlbums) }
                 if (albums.isEmpty()) {
                     blockItem("albums_empty", LScreen.PLAYLISTS, PlaylistsBlock.Albums, withGap = false) {
@@ -6556,6 +7493,7 @@ private fun PlaylistsMain(
                             items(albums, key = { it.id }) { a ->
                                 AlbumCard(
                                     a,
+                                    // Без сети альбомы, которых нет среди скачанного, приглушены.
                                     modifier = Modifier.alpha(if (state.offline && a.id !in downloadedAlbumIds) 0.4f else 1f),
                                 ) { vm.openAlbum(a) }
                             }
@@ -6649,6 +7587,7 @@ private fun PlaylistsMain(
     }
 }
 
+/** Все плейлисты сеткой (открывается нажатием на заголовок «Плейлисты»). */
 @Composable
 private fun AllPlaylistsPage(vm: AppViewModel, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -6686,6 +7625,7 @@ private fun AllPlaylistsPage(vm: AppViewModel, onBack: () -> Unit) {
     }
 }
 
+/** Все альбомы сеткой (открывается нажатием на заголовок «Альбомы»). */
 @Composable
 private fun AllAlbumsPage(vm: AppViewModel, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -6720,6 +7660,7 @@ private fun AllAlbumsPage(vm: AppViewModel, onBack: () -> Unit) {
     }
 }
 
+/** Шапка плейлиста: обложка слева, справа название и число треков. */
 @Composable
 private fun PlaylistHeader(
     title: String,
@@ -6730,11 +7671,14 @@ private fun PlaylistHeader(
     countText: String? = null,
     placeholderIcon: Int = R.drawable.ms_music_note,
     onSubtitleClick: (() -> Unit)? = null,
+    /** Нажатие на обложку (если не задано редактирование): например, открыть её в окне просмотра. */
     onCoverClick: (() -> Unit)? = null,
+    /** Автоскачивание: null — кнопки нет; иначе текущее состояние (по умолчанию выключено) и переключатель. */
     autoDownload: Boolean? = null,
     onAutoDownloadChange: ((Boolean) -> Unit)? = null,
 ) {
     if (LocalInSplitPane.current) {
+        // Левая колонка планшета: крупная обложка сверху, под ней название и подпись по центру.
         val coverShape = rounded(32)
         val compact = LocalCompactHeight.current
         Column(
@@ -6857,25 +7801,34 @@ private fun PlaylistHeader(
     }
 }
 
+/** Кнопка страницы без подписи. [kind]: 0 — тональная, 1 — основная (залитая), 2 — опасное действие (удалить). */
 private class PageAction(
     val icon: Int,
     val label: String,
     val kind: Int = 0,
     val enabled: Boolean = true,
+    /** Ход скачивания 0..1: вокруг кнопки рисуется кольцо прогресса. */
     val progress: Float? = null,
     val onClick: () -> Unit,
 )
 
+/**
+ * Кнопки страницы альбома / плейлиста: только значки (название — в подсказке при долгом нажатии).
+ * Между кнопками нормальные отступы (M3E: 8dp). Первый ряд заполняется до конца, остаток кнопок — вторым рядом
+ * слева; если кнопки помещаются в один ряд — ряд один.
+ */
 @Composable
 private fun IconActionRows(actions: List<PageAction>) {
     if (actions.isEmpty()) return
     val btn = 56.dp
     val gap = 8.dp
     BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(top = 4.dp, bottom = 12.dp)) {
+        // Сколько кнопок помещается в ряд с учётом промежутков: n*56 + (n-1)*8 <= ширины.
         val perRow = ((maxWidth.value + gap.value) / (btn.value + gap.value)).toInt().coerceAtLeast(1)
         Column(verticalArrangement = Arrangement.spacedBy(gap)) {
             val rows = actions.chunked(perRow)
             rows.forEachIndexed { idx, row ->
+                // Неполный последний ряд (остаток) растягивается на всю ширину; полные ряды — круглые кнопки.
                 val stretch = rows.size > 1 && idx == rows.lastIndex && row.size < perRow
                 Row(
                     Modifier.fillMaxWidth(),
@@ -6893,8 +7846,10 @@ private fun IconActionRows(actions: List<PageAction>) {
 
 @Composable
 private fun RoundActionButton(a: PageAction, modifier: Modifier = Modifier) {
+    // Обычная кнопка 56x56; в растянутом ряду ширину задаёт modifier (weight), высота та же.
     val wide = modifier != Modifier
     val m = if (wide) Modifier.fillMaxWidth().height(56.dp) else Modifier.size(56.dp)
+    // M3E: основная кнопка — «квадратный круг» (скруглённый квадрат), остальные — круглые; при нажатии форма морфится.
     val primaryShape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp)
     Box(modifier = modifier, contentAlignment = Alignment.Center) {
         when (a.kind) {
@@ -6920,11 +7875,16 @@ private fun RoundActionButton(a: PageAction, modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * «Скачать всё» для альбомов и плейлистов в виде круглых кнопок для [IconActionRows]: скачать / докачать,
+ * при скачивании — отмена с кольцом прогресса, когда всё скачано — «скачать другим способом». Окно выбора, куда
+ * скачивать, показывается отсюда же.
+ */
 @Composable
 private fun downloadAllActions(vm: AppViewModel, name: String, tracks: List<Track>): List<PageAction> {
     val dl = LocalDownloads.current
     val offline = LocalOffline.current
-    val remote = remember(tracks) { tracks.filter { !it.isLocal }.distinctBy { it.id } }
+    val remote = remember(tracks) { tracks.filter { it.canDownload() }.distinctBy { it.id } }
     val have = remember(dl.items) { dl.items.mapTo(HashSet()) { it.id } }
     val missing = remote.count { it.id !in have }
     val bulk = dl.bulk
@@ -6965,6 +7925,7 @@ private fun downloadAllActions(vm: AppViewModel, name: String, tracks: List<Trac
                 else if (missing == remote.size) "Скачать все ($missing)" else "Докачать ($missing из ${remote.size})",
                 enabled = !offline,
             ) { if (dl.askMode) ask = true else vm.downloadAll(name, remote, null) },
+            // Окно выбора отключено; эта кнопка открывает его вручную для разового другого способа.
             if (!dl.askMode) PageAction(R.drawable.ms_cloud_download, "Скачать как…", enabled = !offline) { ask = true } else null,
         )
     }
@@ -6977,9 +7938,12 @@ private fun PlayButtonsRow(
     onPlay: () -> Unit,
     onShuffle: () -> Unit,
     onDelete: (() -> Unit)? = null,
+    /** Включить волну по этому альбому / исполнителю / плейлисту; null — кнопки нет. */
     onWave: (() -> Unit)? = null,
 ) {
+    // Всё в одну строку: «назад» + две кнопки поровну. На узких экранах иконки в кнопках скрываются, чтобы текст влез.
     BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 8.dp)) {
+        // Назад + волна + удалить + две основные кнопки на узком экране не помещаются с подписями — остаются значки.
         val iconsOnly = onWave != null && onDelete != null && maxWidth < 420.dp
         val icons = maxWidth >= 340.dp || iconsOnly
         Row(
@@ -6990,6 +7954,7 @@ private fun PlayButtonsRow(
             FilledTonalIconButton(onClick = onBack, modifier = Modifier.size(56.dp)) {
                 Icon(painterResource(R.drawable.ms_arrow_back), contentDescription = "Назад")
             }
+            // Группа кнопок M3E: нажатая кнопка расширяется, соседняя уступает ей место.
             val playSrc = remember { MutableInteractionSource() }
             val shuffleSrc = remember { MutableInteractionSource() }
             Button(
@@ -6999,7 +7964,7 @@ private fun PlayButtonsRow(
                 interactionSource = playSrc,
             ) {
                 if (icons) { Icon(painterResource(R.drawable.ms_play_arrow), if (iconsOnly) "Слушать" else null); if (!iconsOnly) Spacer(Modifier.width(6.dp)) }
-                if (!iconsOnly) Text("Слушать", maxLines = 1)
+                if (!iconsOnly) FitText("Слушать")
             }
             FilledTonalButton(
                 onClick = onShuffle, enabled = enabled,
@@ -7008,7 +7973,7 @@ private fun PlayButtonsRow(
                 interactionSource = shuffleSrc,
             ) {
                 if (icons) { Icon(painterResource(R.drawable.ms_shuffle), if (iconsOnly) "Вперемешку" else null); if (!iconsOnly) Spacer(Modifier.width(6.dp)) }
-                if (!iconsOnly) Text("Вперемешку", maxLines = 1)
+                if (!iconsOnly) FitText("Вперемешку")
             }
             if (onWave != null) {
                 FilledTonalIconButton(onClick = onWave, enabled = enabled, modifier = Modifier.size(56.dp)) {
@@ -7027,11 +7992,15 @@ private fun PlayButtonsRow(
     }
 }
 
+/**
+ * Строка «Скачать всё» для «Любимого», плейлистов и альбомов: по нажатию спрашивает, куда скачивать (файлами,
+ * только в приложении или и то и другое); потом показывает прогресс с отменой.
+ */
 @Composable
 private fun DownloadAllRow(vm: AppViewModel, name: String, tracks: List<Track>) {
     val dl = LocalDownloads.current
     val offline = LocalOffline.current
-    val remote = remember(tracks) { tracks.filter { !it.isLocal }.distinctBy { it.id } }
+    val remote = remember(tracks) { tracks.filter { it.canDownload() }.distinctBy { it.id } }
     if (remote.isEmpty()) return
     val have = remember(dl.items) { dl.items.mapTo(HashSet()) { it.id } }
     val missing = remote.count { it.id !in have }
@@ -7067,6 +8036,7 @@ private fun DownloadAllRow(vm: AppViewModel, name: String, tracks: List<Track>) 
             else -> {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilledTonalButton(
+                        // Выбор «не показывать снова» сделан — качаем сразу способом по умолчанию.
                         onClick = { if (dl.askMode) ask = true else vm.downloadAll(name, remote, null) },
                         enabled = !offline,
                         modifier = Modifier.weight(1f).height(48.dp),
@@ -7076,6 +8046,7 @@ private fun DownloadAllRow(vm: AppViewModel, name: String, tracks: List<Track>) 
                         Text(if (missing == remote.size) "Скачать все ($missing)" else "Докачать ($missing из ${remote.size})", maxLines = 1)
                     }
                     if (!dl.askMode) {
+                        // Окно выбора отключено; кнопка открывает его вручную для разового другого способа.
                         FilledTonalIconButton(onClick = { ask = true }, enabled = !offline, modifier = Modifier.size(48.dp)) {
                             Icon(painterResource(R.drawable.ms_cloud_download), contentDescription = "Скачать как…")
                         }
@@ -7105,6 +8076,8 @@ private fun DownloadAllRow(vm: AppViewModel, name: String, tracks: List<Track>) 
 private fun LikedPage(vm: AppViewModel, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
     BackHandler { onBack() }
+    // Список читаем один раз в композиции: ключи и строки обязаны браться из одного и того же списка, иначе при
+    // обновлении списка во время расчёта ленты ключи отстают и приложение падает (IndexOutOfBounds).
     val liked = state.liked
     val keys = remember(liked) { trackKeys(liked) }
     SplitPullColumn(vm, Modifier.fillMaxSize(), header = {
@@ -7114,7 +8087,7 @@ private fun LikedPage(vm: AppViewModel, onBack: () -> Unit) {
                 count = liked.size,
                 cover = liked.firstOrNull()?.cover(400),
                 onEdit = null,
-                autoDownload = DownloadsState.AUTO_LIKED in LocalDownloads.current.auto,
+                autoDownload = if (ActiveProvider.isSc) null else DownloadsState.AUTO_LIKED in LocalDownloads.current.auto,
                 onAutoDownloadChange = { vm.setAutoDownload(DownloadsState.AUTO_LIKED, it, "Любимое", liked) },
             )
         }
@@ -7135,6 +8108,7 @@ private fun LikedPage(vm: AppViewModel, onBack: () -> Unit) {
     }
 }
 
+/** Папка «С устройства»: при первом заходе просит доступ к аудио, затем показывает файлы телефона. */
 @Composable
 private fun LocalPage(vm: AppViewModel, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -7145,11 +8119,14 @@ private fun LocalPage(vm: AppViewModel, onBack: () -> Unit) {
         granted = ok
         if (ok) vm.loadLocalTracks()
     }
+    // Диалог доступа показываем сам только один раз; после перезапуска процесса (например, когда
+    // разрешение сменили в настройках) пользователь видит кнопку «Разрешить доступ», а не неожиданный диалог.
     var asked by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         if (granted) vm.loadLocalTracks()
         else if (!asked) { asked = true; request(false) }
     }
+    // Вернулись из системных настроек: доступ могли как выдать, так и отозвать.
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         val now = LocalMusic.hasPermission(ctx)
         if (now != granted) {
@@ -7157,6 +8134,8 @@ private fun LocalPage(vm: AppViewModel, onBack: () -> Unit) {
             if (now) vm.loadLocalTracks()
         }
     }
+    // Список читаем один раз в композиции: ключи и строки обязаны браться из одного и того же списка. Раньше после
+    // выдачи доступа список загружался прямо во время расчёта ленты, ключи отставали, и приложение падало.
     val tracks = state.localTracks
     val keys = remember(tracks) { trackKeys(tracks) }
     SplitPullColumn(vm, Modifier.fillMaxSize(), header = {
@@ -7232,6 +8211,7 @@ private fun LocalPage(vm: AppViewModel, onBack: () -> Unit) {
 @Composable
 private fun PlaylistDetail(vm: AppViewModel, initial: PlaylistInfo) {
     val state by vm.state.collectAsStateWithLifecycle()
+    // Запоминаем последнее состояние, чтобы экран красиво уезжал, а не пустел при закрытии.
     var last by remember { mutableStateOf(initial) }
     state.openedPlaylist?.let { last = it }
     var lastTracks by remember { mutableStateOf(state.openedPlaylistTracks) }
@@ -7253,14 +8233,17 @@ private fun PlaylistDetail(vm: AppViewModel, initial: PlaylistInfo) {
                 title = p.title,
                 count = if (state.openedPlaylistLoading) p.trackCount else tracks.size,
                 cover = cover,
+                // Правка — кнопкой «Редактировать» в ряду кнопок, не нажатием на обложку или название.
                 onEdit = null,
-                autoDownload = playlistSourceKey(p) in LocalDownloads.current.auto,
+                autoDownload = if (ActiveProvider.isSc) null else playlistSourceKey(p) in LocalDownloads.current.auto,
                 onAutoDownloadChange = { vm.setAutoDownload(playlistSourceKey(p), it, p.title, tracks) },
             )
         }
+        // Кнопки без подписей, в один-два ряда. Публичность меняется в окне редактирования.
         item(key = "playlist_actions") {
             val shareCtx = LocalContext.current
             val wave = LocalWaveActions.current
+            // Чужой плейлист, который удалось открыть, — публичный (даже если сервер не прислал поле видимости).
             val shareable = if (editable || p.visibility != null) p else p.copy(visibility = "public")
             val link = if (p.kind != 3) ShareLinks.playlist(shareable) else null
             val downloadActions = if (!state.openedPlaylistLoading && tracks.isNotEmpty()) downloadAllActions(vm, p.title, tracks) else emptyList()
@@ -7270,11 +8253,12 @@ private fun PlaylistDetail(vm: AppViewModel, initial: PlaylistInfo) {
                     PageAction(R.drawable.ms_play_arrow, "Слушать", kind = 1, enabled = tracks.isNotEmpty()) { vm.play(tracks, 0) },
                     PageAction(R.drawable.ms_shuffle, "Вперемешку", enabled = tracks.isNotEmpty()) { vm.play(tracks, 0, shuffle = true) },
                     wave?.let { w -> PageAction(R.drawable.ms_graphic_eq, "Включить волну", enabled = tracks.isNotEmpty()) { w.playlist(p) } },
+                    // «Мне нравится» (kind = 3) — системный и всегда приватный: «Поделиться» нет.
                     if (p.kind != 3) PageAction(
                         R.drawable.ms_share,
                         if (link != null) "Поделиться плейлистом" else "Поделиться нельзя — плейлист приватный",
                         enabled = link != null,
-                    ) { if (link != null) ShareLinks.shareText(shareCtx, p.title, "${p.title}\n$link") } else null,
+                    ) { if (link != null) ShareQrHost.open(p.title, "${p.title}\n$link", link) } else null,
                     if (editable) PageAction(R.drawable.ms_edit, "Редактировать плейлист") { showEdit = true } else null,
                     if (editable) PageAction(R.drawable.ms_delete, "Удалить плейлист", kind = 2) { showDelete = true } else null,
                 ) + downloadActions,
@@ -7320,8 +8304,10 @@ private fun PlaylistDetail(vm: AppViewModel, initial: PlaylistInfo) {
     if (showEdit && editable) {
         EditPlaylistSheet(
             title = p.title,
-            isPublic = if (p.kind != 3) p.isPublic else null,
+            // «Мне нравится» (kind = 3) всегда приватный — переключателя нет.
+            isPublic = if (p.kind != 3 && ActiveProvider.caps.playlistVisibility) p.isPublic else null,
             onPublicChange = { vm.setPlaylistPublic(p, it) },
+            // Окно закрывается само — с анимацией; здесь только действия.
             onDismiss = { showEdit = false },
             onSave = { name -> if (name.trim() != p.title) vm.renamePlaylist(p, name) },
             onDelete = { showDelete = true },
@@ -7340,6 +8326,10 @@ private fun PlaylistDetail(vm: AppViewModel, initial: PlaylistInfo) {
     }
 }
 
+/**
+ * Окно редактирования своего плейлиста: название и удаление. Закрывается с анимацией (шторка уезжает вниз):
+ * [onSave] и [onDelete] только выполняют действие, а [onDismiss] вызывается после анимации.
+ */
 @Composable
 private fun EditPlaylistSheet(
     title: String,
@@ -7352,6 +8342,7 @@ private fun EditPlaylistSheet(
     var name by remember { mutableStateOf(title) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val scope = rememberCoroutineScope()
+    // Сначала действие, затем шторка уезжает вниз, и только потом окно убирается из композиции.
     fun closeThen(action: () -> Unit) {
         action()
         scope.launch { sheetState.hide() }.invokeOnCompletion { onDismiss() }
@@ -7376,6 +8367,7 @@ private fun EditPlaylistSheet(
             )
             if (isPublic != null) {
                 Spacer(Modifier.height(16.dp))
+                // Публичность плейлиста (как в Яндекс Музыке): по ссылке публичный открывает и слушает кто угодно.
                 Surface(shape = containerShape(20), color = MaterialTheme.colorScheme.surfaceContainer) {
                     Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 10.dp, bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f).padding(end = 12.dp)) {
@@ -7413,6 +8405,7 @@ private fun EditPlaylistSheet(
     }
 }
 
+/** Пустой плейлист: подсказка про смену названия и кнопка, открывающая поиск песен. */
 @Composable
 private fun EmptyPlaylistPrompt(onAdd: () -> Unit) {
     Column(
@@ -7442,6 +8435,7 @@ private fun EmptyPlaylistPrompt(onAdd: () -> Unit) {
     }
 }
 
+/** Отдельный поиск: находим песни и добавляем их прямо в открытый плейлист. */
 @Composable
 private fun AddSongsPage(vm: AppViewModel, playlist: PlaylistInfo, tracks: List<Track>, onClose: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -7453,6 +8447,7 @@ private fun AddSongsPage(vm: AppViewModel, playlist: PlaylistInfo, tracks: List<
     LaunchedEffect(Unit) { vm.clearPlaylistSearch(); runCatching { focus.requestFocus() } }
     DisposableEffect(Unit) { onDispose { vm.clearPlaylistSearch() } }
     LaunchedEffect(query) { delay(400); vm.searchForPlaylist(query) }
+    // Если добавление не удалось, снимаем «крутилки», чтобы можно было нажать ещё раз.
     LaunchedEffect(state.error) { if (state.error != null) pending = emptySet() }
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(Modifier.fillMaxSize()) {
@@ -7476,6 +8471,7 @@ private fun AddSongsPage(vm: AppViewModel, playlist: PlaylistInfo, tracks: List<
                 modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 8.dp)
                     .focusRequester(focus),
             )
+            // Пока запрос пустой — показываем песни из «Любимого», чтобы их можно было добавить сразу.
             val results = if (query.isBlank()) state.liked else state.pickerResults
             when {
                 query.isNotBlank() && state.pickerLoading && results.isEmpty() -> Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
@@ -7559,10 +8555,12 @@ private fun CreatePlaylistDialog(onDismiss: () -> Unit, onCreate: (String, Boole
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Spacer(Modifier.height(12.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Публичный", Modifier.weight(1f))
-                    ExpressiveSwitch(checked = isPublic, onCheckedChange = { isPublic = it })
+                if (ActiveProvider.caps.playlistVisibility) {
+                    Spacer(Modifier.height(12.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Публичный", Modifier.weight(1f))
+                        ExpressiveSwitch(checked = isPublic, onCheckedChange = { isPublic = it })
+                    }
                 }
             }
         },
@@ -7633,6 +8631,8 @@ private fun AddToPlaylistDialog(
     )
 }
 
+// ---------- Профиль ----------
+
 @Composable
 private fun ProfileScreen(vm: AppViewModel, onOpenSettings: () -> Unit = {}) {
     val state by vm.state.collectAsStateWithLifecycle()
@@ -7642,9 +8642,18 @@ private fun ProfileScreen(vm: AppViewModel, onOpenSettings: () -> Unit = {}) {
     val ctx = LocalContext.current
     val showPlaylist = LocalShowPlaylist.current
     val account = state.account
+    // Аккаунт SoundCloud: под шапкой профиля показываем счётчики (треки, плейлисты, подписчики и т. д.).
+    val scProfile = remember(state.accounts, state.activeToken) {
+        state.accounts.firstOrNull { it.token == state.activeToken && it.provider == app.ymusic.m3e.data.Provider.SOUNDCLOUD }
+            ?.let { app.ymusic.m3e.data.ScProfile.fromJson(it.scInfo) }
+    }
+    // Публичные плейлисты самого пользователя (без «Любимого» и чужих): их видят все, у кого есть ссылка.
     val publicPlaylists = remember(state.playlists, account) {
         state.playlists.filter { it.isPublic && it.kind != 3 && it.isEditableBy(account) }
     }
+    // Свои треки и альбомы SoundCloud (только для аккаунта SoundCloud).
+    LaunchedEffect(scProfile?.id) { scProfile?.let { vm.loadScOwn(it.id) } }
+    LaunchedEffect(state.refreshing) { if (state.refreshing) scProfile?.let { vm.loadScOwn(it.id, force = true) } }
     val wide = LocalWide.current
     val profilePane: @Composable () -> Unit = {
     Box(Modifier.fillMaxSize()) {
@@ -7653,11 +8662,15 @@ private fun ProfileScreen(vm: AppViewModel, onOpenSettings: () -> Unit = {}) {
         Modifier.fillMaxSize().verticalScroll(profileScroll)
             .padding(start = 20.dp, end = 20.dp, top = if (wide) 24.dp else 56.dp, bottom = 24.dp + dockInset()),
     ) {
+        // Блоки профиля идут в порядке из редактора интерфейса.
         UiLayout.order(LScreen.PROFILE, ProfileBlock.entries).forEach { blk ->
             if (UiLayout.isHidden(LScreen.PROFILE, blk)) return@forEach
+            if ((blk == ProfileBlock.MyTracks || blk == ProfileBlock.MyAlbums) && scProfile == null) return@forEach
             LayoutBlockBox(LScreen.PROFILE, blk) {
                 when (blk) {
-                    ProfileBlock.Header -> Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    // Слева аватарка, справа ник, под ним юзернейм и кнопка «Поделиться».
+                    ProfileBlock.Header -> Column(Modifier.fillMaxWidth()) {
+                    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                         Surface(
                             shape = ThemeSettings.avatarShape.asShape(),
                             color = MaterialTheme.colorScheme.tertiaryContainer,
@@ -7683,7 +8696,8 @@ private fun ProfileScreen(vm: AppViewModel, onOpenSettings: () -> Unit = {}) {
                                     nick, style = MaterialTheme.typography.headlineSmallEmphasized, maxLines = 2,
                                     overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false),
                                 )
-                                if (account?.hasPlus == true) PlusBadge(Modifier.padding(start = 8.dp).size(22.dp))
+                                // Значок Яндекс Плюса у ника — только если подписка есть.
+                                if (account?.hasPlus == true && account.provider == app.ymusic.m3e.data.Provider.YANDEX) PlusBadge(Modifier.padding(start = 8.dp).size(22.dp))
                             }
                             if (!account?.login.isNullOrBlank()) {
                                 Text(
@@ -7692,11 +8706,12 @@ private fun ProfileScreen(vm: AppViewModel, onOpenSettings: () -> Unit = {}) {
                                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 )
                             }
-                            val profileLink = account?.login?.let { ShareLinks.profile(it) }
+                            val profileLink = if (account?.provider == app.ymusic.m3e.data.Provider.SOUNDCLOUD) scProfile?.profileUrl?.ifBlank { null }
+                                else account?.login?.let { ShareLinks.profile(it) }
                             if (UiLayout.profileShare && profileLink != null) {
                                 Spacer(Modifier.height(10.dp))
                                 FilledTonalButton(
-                                    onClick = { ShareLinks.shareText(ctx, nick, "$nick\n$profileLink") },
+                                    onClick = { ShareQrHost.open(nick, "$nick\n$profileLink", profileLink) },
                                     contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
                                 ) {
                                     Icon(painterResource(R.drawable.ms_share), null, Modifier.size(18.dp))
@@ -7706,6 +8721,58 @@ private fun ProfileScreen(vm: AppViewModel, onOpenSettings: () -> Unit = {}) {
                             }
                         }
                     }
+                    if (scProfile != null) SoundCloudStats(scProfile, Modifier.padding(top = 4.dp, bottom = 4.dp))
+                    }
+                    // Треки пользователя SoundCloud: первые пять, нажатие на заголовок открывает страницу исполнителя со всем списком.
+                    ProfileBlock.MyTracks -> Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                        val sc = scProfile
+                        val tracks = state.scOwnTracks
+                        Row(
+                            Modifier.fillMaxWidth().clip(containerShape(16)).clickable {
+                                if (sc != null) vm.openArtist(ArtistRef(app.ymusic.m3e.data.ScIds.PREFIX + sc.id, sc.username, sc.avatarUrl))
+                            }.padding(vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text("Мои треки", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                            if (tracks.isNotEmpty()) {
+                                Spacer(Modifier.width(8.dp))
+                                Text("${tracks.size}", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Spacer(Modifier.width(4.dp))
+                            Icon(painterResource(R.drawable.ms_chevron_right), contentDescription = null)
+                        }
+                        // Загрузка своей музыки на SoundCloud: трек появляется в профиле и виден всем.
+                        ScUploadSection(vm, state.scUploading, state.scUploadProgress, Modifier.padding(bottom = 8.dp))
+                        when {
+                            tracks.isEmpty() && state.scOwnLoading -> Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) { LoadingIndicator() }
+                            tracks.isEmpty() -> Text("Своих треков пока нет", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            // Строки треков имеют свой отступ 16dp, а экран профиля — 20dp: без выравнивания треки уезжали вправо на 36dp.
+                            else -> Column(Modifier.fillMaxWidth().bleedH(16.dp)) {
+                                tracks.take(5).forEachIndexed { i, t -> TrackRow(t) { vm.play(tracks, i) } }
+                            }
+                        }
+                    }
+                    // Альбомы (плейлисты) пользователя SoundCloud: ряд карточек.
+                    ProfileBlock.MyAlbums -> Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                        val albums = state.scOwnAlbums
+                        if (albums.isEmpty() && state.scOwnLoading) {
+                            Box(Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) { LoadingIndicator() }
+                        } else {
+                            Text(
+                                "Мои альбомы" + if (albums.isNotEmpty()) " · ${albums.size}" else "",
+                                style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(vertical = 12.dp),
+                            )
+                            if (albums.isEmpty()) {
+                                Text("Своих альбомов пока нет", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            } else {
+                                LazyRow(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    items(albums.take(20), key = { it.id }) { a -> AlbumCard(a, width = 140.dp) { vm.openAlbum(a) } }
+                                }
+                            }
+                        }
+                    }
+                    // Все публичные плейлисты блоками.
                     ProfileBlock.Playlists -> Column(Modifier.fillMaxWidth().padding(top = 16.dp)) {
                         Text(
                             "Публичные плейлисты" + if (publicPlaylists.isNotEmpty()) " · ${publicPlaylists.size}" else "",
@@ -7740,6 +8807,7 @@ private fun ProfileScreen(vm: AppViewModel, onOpenSettings: () -> Unit = {}) {
         }
     }
     }
+    // Настройки — в правом верхнем углу (на планшете они стоят справа от профиля, кнопка не нужна).
     if (!wide) IconButton(
         onClick = onOpenSettings,
         modifier = Modifier.align(Alignment.TopEnd).padding(8.dp),
@@ -7749,6 +8817,7 @@ private fun ProfileScreen(vm: AppViewModel, onOpenSettings: () -> Unit = {}) {
     }
     }
     if (wide) {
+        // Планшет: слева профиль, справа меню настроек.
         TwoPane(
             left = {
                 Surface(
@@ -7761,6 +8830,13 @@ private fun ProfileScreen(vm: AppViewModel, onOpenSettings: () -> Unit = {}) {
     } else profilePane()
 }
 
+// ---------- Настройки ----------
+
+/**
+ * Появление элемента при открытии страницы: плавно проявляется и «подплывает» снизу с небольшой задержкой по номеру
+ * ([index]), поэтому группы и кнопки выстраиваются каскадом. Играет один раз для страницы (флаг сохраняется, поэтому при
+ * возврате элемента в ленту после прокрутки анимация не повторяется). При включённой «Оптимизации» отключена.
+ */
 @Composable
 private fun Modifier.entrance(index: Int = 0, offsetDp: Int = 14): Modifier {
     if (ThemeSettings.optimize) return this
@@ -7779,25 +8855,35 @@ private fun Modifier.entrance(index: Int = 0, offsetDp: Int = 14): Modifier {
     }
 }
 
+/** Счётчик очередности элементов на странице: каждая следующая группа появляется чуть позже предыдущей. */
 private class EntranceCounter { var n = 0 }
 
 private val LocalEntrance = staticCompositionLocalOf<EntranceCounter?> { null }
 
+/** Глубина страницы настроек: по ней понятно, открываем мы страницу (вглубь) или возвращаемся. */
 private fun SettingsPage.depth(): Int = when (this) {
     SettingsPage.Main -> 0
     SettingsPage.LogsCurrent, SettingsPage.LogsPrevious, SettingsPage.Layout, SettingsPage.Developers -> 2
     else -> 1
 }
 
-private enum class SettingsPage { Main, Accounts, Equalizer, Appearance, Player, Haptics, Recognition, Downloads, Offline, Plugins, Updates, About, Developers, Developer, LogsCurrent, LogsPrevious, Layout }
+private enum class SettingsPage { Main, Accounts, Equalizer, Appearance, Player, Haptics, Recognition, Downloads, Offline, Plugins, Updates, About, Developers, Developer, LogsCurrent, LogsPrevious, Layout, ScProxy, Cache }
 
 private val APP_VERSION: String get() = app.ymusic.m3e.data.Updates.current.display
 
 @Composable
 private fun SettingsScreen(vm: AppViewModel, local: Boolean = false, onLogin: () -> Unit = {}, embedded: Boolean = false, onClose: () -> Unit) {
     var page by remember { mutableStateOf(SettingsPage.Main) }
+    val searchCtx = LocalContext.current
+    // Подсветка пункта, выбранного в поиске, гаснет сама.
+    LaunchedEffect(SettingsHighlight.stamp) {
+        if (SettingsHighlight.stamp != 0) { delay(3600); SettingsHighlight.clear() }
+    }
+    // Встроенные настройки (справа от профиля на планшете): вложенная страница не даёт листать вкладки, а повторное
+    // нажатие на вкладку «Профиль» возвращает на главную страницу настроек.
     if (embedded && page != SettingsPage.Main) PagerLockEffect()
     InnerPageEffect("embeddedSettings", embedded && page != SettingsPage.Main) { page = SettingsPage.Main }
+    // Плагин, чей пункт («settings_entry») открыт в Настройках: его настройки показываются нижней модалкой.
     var pluginEntry by remember { mutableStateOf<Pair<String, String?>?>(null) }
     val uiState by vm.state.collectAsStateWithLifecycle()
     BackHandler(enabled = !embedded || page != SettingsPage.Main) {
@@ -7809,11 +8895,14 @@ private fun SettingsScreen(vm: AppViewModel, local: Boolean = false, onLogin: ()
             else -> page = SettingsPage.Main
         }
     }
+    // Жест «назад»: на главной странице настроек закрывает их целиком, на вложенных (внизу) — возвращает на главную.
     SwipeBack(enabled = page == SettingsPage.Main && !embedded, onBack = onClose) {
     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
         AnimatedContent(
             targetState = page,
             transitionSpec = {
+                // Вглубь (в раздел, в логи): новая страница выезжает справа, прежняя чуть уходит влево.
+                // Назад: прежняя уезжает вправо поверх, под ней проявляется предыдущая.
                 val forward = targetState.depth() >= initialState.depth() && targetState != SettingsPage.Main
                 if (forward) {
                     androidx.compose.animation.ContentTransform(
@@ -7852,7 +8941,16 @@ private fun SettingsScreen(vm: AppViewModel, local: Boolean = false, onLogin: ()
                     onPlayer = { page = SettingsPage.Player },
                     onHaptics = { page = SettingsPage.Haptics },
                     onRecognition = { page = SettingsPage.Recognition },
+                    onScProxy = { page = SettingsPage.ScProxy },
+                    onSearchOpen = { key ->
+                        when (key) {
+                            "main" -> Unit
+                            "links" -> AppLinks.openSettings(searchCtx)
+                            else -> runCatching { SettingsPage.valueOf(key) }.getOrNull()?.let { page = it }
+                        }
+                    },
                     onDownloads = { page = SettingsPage.Downloads },
+                    onCache = { page = SettingsPage.Cache },
                     onOffline = { page = SettingsPage.Offline },
                     onPlugins = { page = SettingsPage.Plugins },
                     onPluginEntry = { id, entry -> pluginEntry = id to entry },
@@ -7868,7 +8966,9 @@ private fun SettingsScreen(vm: AppViewModel, local: Boolean = false, onLogin: ()
                 SettingsPage.Player -> PlayerSettingsPage { page = SettingsPage.Main }
                 SettingsPage.Haptics -> HapticsSettingsPage { page = SettingsPage.Main }
                 SettingsPage.Recognition -> RecognitionSettingsPage { page = SettingsPage.Main }
+                SettingsPage.ScProxy -> ScProxyPage { page = SettingsPage.Main }
                 SettingsPage.Downloads -> DownloadsPage(vm) { page = SettingsPage.Main }
+                SettingsPage.Cache -> CachePage { page = SettingsPage.Main }
                 SettingsPage.Offline -> OfflinePage { page = SettingsPage.Main }
                 SettingsPage.Plugins -> PluginsPage { page = SettingsPage.Main }
                 SettingsPage.Updates -> UpdatesPage { page = SettingsPage.Main }
@@ -7887,6 +8987,8 @@ private fun SettingsScreen(vm: AppViewModel, local: Boolean = false, onLogin: ()
                 )
             }
             }
+            // Каждая страница непрозрачная и со своим счётчиком появления элементов: при переходе тексты двух страниц
+            // не просвечивают друг через друга, а группы внутри выстраиваются каскадом.
             val entranceCounter = remember { EntranceCounter() }
             CompositionLocalProvider(LocalEntrance provides entranceCounter) {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
@@ -7928,7 +9030,10 @@ private fun SettingsMain(
     onPlayer: () -> Unit,
     onHaptics: () -> Unit,
     onRecognition: () -> Unit,
+    onScProxy: () -> Unit = {},
+    onSearchOpen: (String) -> Unit = {},
     onDownloads: () -> Unit,
+    onCache: () -> Unit,
     onOffline: () -> Unit,
     onPlugins: () -> Unit = {},
     onPluginEntry: (String, String?) -> Unit = { _, _ -> },
@@ -7941,7 +9046,23 @@ private fun SettingsMain(
     val logoutColors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f))
     Column(Modifier.fillMaxSize().verticalScroll(rememberTopScrollState()).padding(bottom = 24.dp + dockInset())) {
         SubPageBar("Настройки", onBack, showBack = !embedded)
+        // Поиск по названиям и описаниям пунктов (в том числе внутри страниц): пока запрос не пуст, вместо групп показываются результаты.
+        var searchQuery by rememberSaveable { mutableStateOf("") }
+        val searchCtx2 = LocalContext.current
+        SettingsSearchField(searchQuery, onSearch = { SettingsSearchHistory.add(searchCtx2, searchQuery) }) { searchQuery = it }
+        if (searchQuery.isNotBlank()) {
+            SettingsSearchResults(searchQuery) { e ->
+                SettingsSearchHistory.add(searchCtx2, searchQuery)
+                SettingsHighlight.set(e)
+                searchQuery = ""
+                onSearchOpen(e.page)
+            }
+        } else {
+        SettingsSearchHistoryRow(searchCtx2) { searchQuery = it }
+        // Material 3 Expressive: пункты собраны в группы с крупным скруглением снаружи и тонкими разделителями-зазорами.
+        // Каждая группа — свой раздел со своей подписью.
         if (local) {
+            // Режим «Локальные файлы»: вместо аккаунта — вход через Яндекс.
             SettingsGroup {
                 ListItem(
                     headlineContent = { Text("Войти через Яндекс") },
@@ -7971,10 +9092,11 @@ private fun SettingsMain(
                 modifier = Modifier.clickable(onClick = onAccounts),
             )
         }
+        SettingsLabel("Интерфейс")
         SettingsGroup {
             ListItem(
                 headlineContent = { Text("Внешний вид") },
-                supportingContent = { Text("Тема, цвета, шрифт, формы, полоса прогресса, свечение, главная и док-панель") },
+                supportingContent = { Text("Тема, цвета, шрифт, формы, размер, стекло, свечение, анимации, главная, поиск и док-панель") },
                 leadingContent = { Icon(painterResource(R.drawable.ms_palette), null) },
                 trailingContent = { Icon(painterResource(R.drawable.ms_chevron_right), null) },
                 colors = itemColors,
@@ -7988,12 +9110,13 @@ private fun SettingsMain(
                 colors = itemColors,
                 modifier = Modifier.clickable(onClick = onHaptics),
             )
+            LanguageSettingItem(itemColors)
         }
         SettingsLabel("Музыка")
         SettingsGroup {
             ListItem(
                 headlineContent = { Text("Плеер") },
-                supportingContent = { Text("Качество звука, мини-плеер, громкость, тексты песен") },
+                supportingContent = { Text("Качество звука, мини-плеер, полоса прогресса, тексты песен, волна") },
                 leadingContent = { Icon(painterResource(R.drawable.ms_music_note), null) },
                 trailingContent = { Icon(painterResource(R.drawable.ms_chevron_right), null) },
                 colors = itemColors,
@@ -8014,10 +9137,21 @@ private fun SettingsMain(
                 colors = itemColors,
                 modifier = Modifier.clickable(onClick = onRecognition),
             )
+        }
+        SettingsLabel("Сеть")
+        SettingsGroup {
+            ListItem(
+                headlineContent = { Text("Обход блокировки SoundCloud (BETA)") },
+                supportingContent = { Text(scProxySummary()) },
+                leadingContent = { Icon(painterResource(R.drawable.ms_cloud_download), null) },
+                trailingContent = { Icon(painterResource(R.drawable.ms_chevron_right), null) },
+                colors = itemColors,
+                modifier = Modifier.clickable(onClick = onScProxy),
+            )
             val linksCtx = LocalContext.current
             ListItem(
-                headlineContent = { Text("Ссылки Яндекс Музыки") },
-                supportingContent = { Text("Открывать ссылки music.yandex.ru в этом приложении") },
+                headlineContent = { Text(if (ActiveProvider.isSc) "Ссылки SoundCloud" else if (ActiveProvider.isVk) "Ссылки VK Музыки" else "Ссылки Яндекс Музыки") },
+                supportingContent = { Text(if (ActiveProvider.isSc) "Открывать ссылки soundcloud.com в этом приложении" else if (ActiveProvider.isVk) "Открывать ссылки vk.com и vk.ru на музыку в этом приложении" else "Открывать ссылки music.yandex.ru в этом приложении") },
                 leadingContent = { Icon(painterResource(R.drawable.ms_open_in_new), null) },
                 trailingContent = { Icon(painterResource(R.drawable.ms_chevron_right), null) },
                 colors = itemColors,
@@ -8033,6 +9167,14 @@ private fun SettingsMain(
                 trailingContent = { Icon(painterResource(R.drawable.ms_chevron_right), null) },
                 colors = itemColors,
                 modifier = Modifier.clickable(onClick = onDownloads),
+            )
+            ListItem(
+                headlineContent = { Text("Кэш") },
+                supportingContent = { Text("Размер и очистка: обложки, тексты, предзагруженный звук") },
+                leadingContent = { Icon(painterResource(R.drawable.ms_delete), null) },
+                trailingContent = { Icon(painterResource(R.drawable.ms_chevron_right), null) },
+                colors = itemColors,
+                modifier = Modifier.clickable(onClick = onCache),
             )
             if (!local) ListItem(
                 headlineContent = { Text("Офлайн-режим") },
@@ -8055,6 +9197,7 @@ private fun SettingsMain(
                 colors = itemColors,
                 modifier = Modifier.clickable(onClick = onPlugins),
             )
+            // Свои пункты плагинов (contributes.settings_entry): видны, пока плагин и система плагинов включены.
             if (PluginSystem.enabled) PluginSystem.plugins.filter { it.enabled && it.manifest.menuEntry != null && it.manifest.settings.isNotEmpty() }.forEach { pl ->
                 val me = pl.manifest.menuEntry!!
                 key(pl.id) {
@@ -8068,6 +9211,7 @@ private fun SettingsMain(
                     )
                 }
             }
+            // Страницы, которые плагины создали сами из Lua (ui.settings_page с menu = true).
             if (PluginSystem.enabled) PluginSystem.plugins.filter { it.enabled }.forEach { pl ->
                 pl.uiEntries.filter { it.menu && !it.transient }.forEach { e ->
                     key(pl.id, e.id) {
@@ -8119,6 +9263,8 @@ private fun SettingsMain(
             )
         }
         }
+        }
+        // Пасхалка: несколько быстрых нажатий подряд по этой надписи.
         var egg by remember { mutableStateOf(false) }
         var eggTaps by remember { mutableStateOf(0) }
         var eggLast by remember { mutableStateOf(0L) }
@@ -8143,6 +9289,9 @@ private fun SettingsMain(
     }
 }
 
+/**
+ * Пасхалка: на весь экран (с растяжением) вылетает картинка с криком «А-а-а!», затем появляется алерт.
+ */
 @Composable
 private fun EasterEgg(onDone: () -> Unit) {
     val ctx = LocalContext.current
@@ -8164,6 +9313,7 @@ private fun EasterEgg(onDone: () -> Unit) {
         Haptics.heavy()
         launch { turn.animateTo(0f, fxSpring(dampingRatio = 0.35f, stiffness = 180f)) }
         launch { scale.animateTo(1f, fxSpring(dampingRatio = 0.45f, stiffness = 260f)) }
+        // Тряска, пока кричит.
         repeat(26) { i ->
             shake = if (i % 2 == 0) 1f else -1f
             if (i % 4 == 0) Haptics.heavy()
@@ -8183,7 +9333,7 @@ private fun EasterEgg(onDone: () -> Unit) {
         androidx.compose.foundation.Image(
             painter = painterResource(R.drawable.easter_cat),
             contentDescription = null,
-            contentScale = ContentScale.FillBounds,
+            contentScale = ContentScale.FillBounds, // растянута на весь экран
             modifier = Modifier.fillMaxSize().graphicsLayer {
                 scaleX = scale.value; scaleY = scale.value
                 rotationZ = turn.value + shake * 1.5f
@@ -8208,6 +9358,7 @@ private fun EasterEgg(onDone: () -> Unit) {
     }
 }
 
+/** Группа пунктов настроек в стиле M3E: крупное скругление снаружи, 2 dp между пунктами. */
 @Composable
 private fun SettingsGroup(content: @Composable ColumnScope.() -> Unit) {
     val counter = LocalEntrance.current
@@ -8219,8 +9370,9 @@ private fun SettingsGroup(content: @Composable ColumnScope.() -> Unit) {
     )
 }
 
+/** Круглая «печенька» с аватаром аккаунта (или значком человека, если аватара нет). */
 @Composable
-private fun AccountAvatar(avatarUrl: String?, size: Dp) {
+internal fun AccountAvatar(avatarUrl: String?, size: Dp) {
     Surface(
         shape = MaterialShapes.Cookie9Sided.toShape(),
         color = MaterialTheme.colorScheme.tertiaryContainer,
@@ -8240,6 +9392,7 @@ private fun AccountAvatar(avatarUrl: String?, size: Dp) {
     }
 }
 
+/** Значок Яндекс Плюса: наклонный плюс в кружке акцентного цвета темы (вместо градиентной картинки), фон прозрачный. */
 @Composable
 private fun PlusBadge(modifier: Modifier = Modifier) {
     val bg = MaterialTheme.colorScheme.primary
@@ -8252,7 +9405,9 @@ private fun PlusBadge(modifier: Modifier = Modifier) {
         drawCircle(bg, radius = size.minDimension / 2f, center = center)
         clipPath(circle) {
             val plus = androidx.compose.ui.graphics.Path().apply {
+                // горизонтальная перекладина
                 moveTo(50f * k, 95f * k); lineTo(256f * k, 95f * k); lineTo(256f * k, 128f * k); lineTo(42f * k, 128f * k); close()
+                // наклонная вертикальная перекладина
                 moveTo(165f * k, 0f); lineTo(205f * k, 0f); lineTo(142f * k, 205f * k); lineTo(105f * k, 205f * k); close()
             }
             drawPath(plus, fg)
@@ -8260,19 +9415,26 @@ private fun PlusBadge(modifier: Modifier = Modifier) {
     }
 }
 
+/** Аккаунты: переключение, выход из одного или из всех, вход в новый. */
 @Composable
 private fun AccountsPage(vm: AppViewModel, onBack: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
     var logoutTarget by remember { mutableStateOf<StoredAccount?>(null) }
     var confirmAll by remember { mutableStateOf(false) }
+    // «Добавить аккаунт»: снизу выезжает шторка с выбором сервиса.
+    var showPicker by rememberSaveable { mutableStateOf(false) }
     Column(Modifier.fillMaxSize()) {
         SubPageBar("Аккаунты", onBack)
         LazyColumn(Modifier.fillMaxSize(), state = rememberTopListState(), contentPadding = PaddingValues(start = 8.dp, end = 8.dp, bottom = 24.dp + dockInset())) {
             items(state.accounts, key = { it.token }) { a ->
                 val active = a.token == state.activeToken
                 val sub = listOfNotNull(
+                    a.provider.title,
                     a.login.takeIf { it.isNotBlank() && it != a.title },
-                    if (a.hasPlus) "Плюс" else null,
+                    if (a.provider == app.ymusic.m3e.data.Provider.SOUNDCLOUD) {
+                        app.ymusic.m3e.data.ScProfile.fromJson(a.scInfo)?.let { "${compactCount(it.followers)} подписчиков" }
+                    } else null,
+                    if (a.hasPlus && a.provider == app.ymusic.m3e.data.Provider.YANDEX) "Плюс" else null,
                     if (active) "Активный" else null,
                 ).joinToString(" · ")
                 ListItem(
@@ -8299,7 +9461,7 @@ private fun AccountsPage(vm: AppViewModel, onBack: () -> Unit) {
             item {
                 Spacer(Modifier.height(16.dp))
                 FilledTonalButton(
-                    onClick = { vm.startAddAccount() },
+                    onClick = { showPicker = true },
                     modifier = Modifier.fillMaxWidth().height(56.dp),
                     shape = rounded(28),
                 ) {
@@ -8321,6 +9483,13 @@ private fun AccountsPage(vm: AppViewModel, onBack: () -> Unit) {
                 }
             }
         }
+    }
+
+    if (showPicker) {
+        ProviderPickerSheet(
+            onPick = { showPicker = false; vm.startAddAccount(it) },
+            onDismiss = { showPicker = false },
+        )
     }
 
     logoutTarget?.let { a ->
@@ -8359,6 +9528,7 @@ private fun AccountsPage(vm: AppViewModel, onBack: () -> Unit) {
     }
 }
 
+/** Выпадающий список (комбобокс): поле только для чтения, по нажатию раскрывается меню на всю ширину поля. */
 @Composable
 private fun <T> ComboBox(
     selectedText: String,
@@ -8386,6 +9556,7 @@ private fun <T> ComboBox(
             },
             modifier = Modifier.fillMaxWidth(),
         )
+        // Прозрачный слой поверх поля: нажатие в любом месте открывает список.
         Box(Modifier.matchParentSize().clip(fieldShape).clickable { expanded = true })
         DropdownMenu(
             expanded = expanded,
@@ -8416,23 +9587,29 @@ private fun <T> ComboBox(
     }
 }
 
+/** Настройки плеера: звук, мини-плеер, полный плеер, полоса прогресса, тексты песен и волна. */
 @Composable
 private fun PlayerSettingsPage(onBack: () -> Unit) {
     Column(Modifier.fillMaxSize()) {
         SubPageBar("Плеер", onBack)
         Column(Modifier.fillMaxSize().verticalScroll(rememberTopScrollState()).padding(bottom = dockInset())) {
             SettingsSection("Звук", R.drawable.ms_graphic_eq, startExpanded = true) {
+            val tokens = (LocalContext.current.applicationContext as app.ymusic.m3e.App).tokenStore
+            val hqAcc = tokens.accounts.firstOrNull { it.token == tokens.token }
+            val hasPlusHq = hqAcc?.hasPlus == true || hqAcc?.provider == app.ymusic.m3e.data.Provider.VK
             ListItem(
                 headlineContent = { Text("Высокое качество") },
                 supportingContent = {
                     Text(
-                        if (PlayerSettings.highQuality) "Лучший доступный поток: lossless (FLAC) или до 320 кбит/с"
+                        if (!hasPlusHq) "Нужен Яндекс Плюс: без подписки доступен только обычный поток"
+                        else if (hqAcc?.provider == app.ymusic.m3e.data.Provider.VK) "VK: если сервер отдаёт несколько битрейтов — выбирается лучший, иначе единственный поток"
+                        else if (PlayerSettings.highQuality) "Лучший доступный поток: lossless (FLAC) или до 320 кбит/с"
                         else "Экономный поток (~128 кбит/с): меньше трафика и места"
                     )
                 },
                 leadingContent = { Icon(painterResource(R.drawable.ms_graphic_eq), null) },
-                trailingContent = { ExpressiveSwitch(checked = PlayerSettings.highQuality, onCheckedChange = { PlayerSettings.updateHighQuality(it) }) },
-                modifier = Modifier.clickable { PlayerSettings.updateHighQuality(!PlayerSettings.highQuality) },
+                trailingContent = { ExpressiveSwitch(checked = hasPlusHq && PlayerSettings.highQuality, onCheckedChange = if (hasPlusHq) ({ PlayerSettings.updateHighQuality(it) }) else null) },
+                modifier = if (hasPlusHq) Modifier.clickable { PlayerSettings.updateHighQuality(!PlayerSettings.highQuality) } else Modifier,
             )
             Text(
                 "Качество применяется к следующим трекам и к новым загрузкам. Для lossless нужен Яндекс Плюс; если сервер " +
@@ -8453,6 +9630,15 @@ private fun PlayerSettingsPage(onBack: () -> Unit) {
                 trailingContent = { ExpressiveSwitch(checked = PlayerSettings.preload, onCheckedChange = { PlayerSettings.updatePreload(it) }) },
                 modifier = Modifier.clickable { PlayerSettings.updatePreload(!PlayerSettings.preload) },
             )
+            var showMix by rememberSaveable { mutableStateOf(false) }
+            ListItem(
+                headlineContent = { Text("Микс треков") },
+                supportingContent = { Text(mixSummary() + " · плавный переход между треками, как «Кроссфейд» в Spotify") },
+                leadingContent = { Icon(painterResource(R.drawable.ms_graphic_eq), null) },
+                trailingContent = { ExpressiveSwitch(checked = PlayerSettings.crossfade, onCheckedChange = { PlayerSettings.updateCrossfade(it) }) },
+                modifier = Modifier.clickable { showMix = true },
+            )
+            if (showMix) MixSheet { showMix = false }
             }
             SettingsSection("Мини-плеер", R.drawable.ms_music_note) {
             ListItem(
@@ -8468,6 +9654,13 @@ private fun PlayerSettingsPage(onBack: () -> Unit) {
                 leadingContent = { Icon(painterResource(R.drawable.ms_volume_up), null) },
                 trailingContent = { ExpressiveSwitch(checked = PlayerSettings.miniVolume, onCheckedChange = { PlayerSettings.updateMiniVolume(it) }) },
                 modifier = Modifier.clickable { PlayerSettings.updateMiniVolume(!PlayerSettings.miniVolume) },
+            )
+            ListItem(
+                headlineContent = { Text("Цвет мини-плеера по обложке") },
+                supportingContent = { Text("Подложка мини-плеера подстраивается под цвет обложки играющего трека") },
+                leadingContent = { Icon(painterResource(R.drawable.ms_palette), null) },
+                trailingContent = { ExpressiveSwitch(checked = PlayerSettings.miniCoverColor, onCheckedChange = { PlayerSettings.updateMiniCoverColor(it) }) },
+                modifier = Modifier.clickable { PlayerSettings.updateMiniCoverColor(!PlayerSettings.miniCoverColor) },
             )
             Text(
                 "Когда включены оба пункта, ползунок переключается между перемоткой и громкостью кнопкой справа от него. " +
@@ -8517,6 +9710,10 @@ private fun PlayerSettingsPage(onBack: () -> Unit) {
                 modifier = Modifier.clickable { PlayerSettings.updateLyricsBlurFull(!PlayerSettings.lyricsBlurFull) },
             )
             }
+            SettingsSection("Полоса прогресса", R.drawable.ms_schedule, contentPadding = 16.dp) {
+            Spacer(Modifier.height(8.dp))
+            SeekStyleSection()
+            }
             SettingsSection("Тексты песен", R.drawable.ms_lyrics) {
             Text(
                 "Откуда брать текст. Включите только нужные источники — остальные опрашиваться не будут. " +
@@ -8524,6 +9721,22 @@ private fun PlayerSettingsPage(onBack: () -> Unit) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            )
+            ListItem(
+                headlineContent = { Text("Подтверждать выбор текста") },
+                supportingContent = { Text("При выборе текста в ручном поиске показывать окно с подтверждением") },
+                leadingContent = { Icon(painterResource(R.drawable.ms_search), null) },
+                trailingContent = { ExpressiveSwitch(checked = PlayerSettings.lyricsConfirm, onCheckedChange = { PlayerSettings.updateLyricsConfirm(it) }) },
+                modifier = Modifier.clickable { PlayerSettings.updateLyricsConfirm(!PlayerSettings.lyricsConfirm) },
+            )
+            ListItem(
+                headlineContent = { Text("Привязка текста к треку") },
+                supportingContent = {
+                    Text("Выбранный вручную текст запоминается для этого трека и показывается первым. В окне подтверждения — галочка; если окно отключено, текст привязывается сразу")
+                },
+                leadingContent = { Icon(painterResource(R.drawable.ms_lyrics), null) },
+                trailingContent = { ExpressiveSwitch(checked = PlayerSettings.lyricsPin, onCheckedChange = { PlayerSettings.updateLyricsPin(it) }) },
+                modifier = Modifier.clickable { PlayerSettings.updateLyricsPin(!PlayerSettings.lyricsPin) },
             )
             val lyricIds = LyricsSourceOptions.map { it.first }
             LyricsSourceOptions.forEach { (id, name, desc) ->
@@ -8547,11 +9760,22 @@ private fun PlayerSettingsPage(onBack: () -> Unit) {
                 }
             }
             }
+            SettingsSection("Волна", R.drawable.ms_graphic_eq, contentPadding = 16.dp) {
+            Spacer(Modifier.height(8.dp))
+            GlowSwitchRow(
+                if (ActiveProvider.isVk) "Не повторять треки VK Микса" else if (ActiveProvider.isSc) "Не повторять треки ExWave" else "Не повторять треки волны",
+                "Трек, который уже прозвучал в волне, в течение 24 часов в неё не вернётся. Работает для «Моей волны», VK Микса и ExWave. Выключите, чтобы треки могли повторяться",
+                app.ymusic.m3e.data.WaveSeen.enabled,
+            ) { app.ymusic.m3e.data.WaveSeen.updateEnabled(it) }
+            }
             Spacer(Modifier.height(24.dp))
         }
     }
 }
 
+// ---------- Для разработчиков ----------
+
+/** Раздел «Для разработчиков»: журнал текущего запуска и полный журнал прошлого запуска. */
 @Composable
 private fun DeveloperPage(onBack: () -> Unit, onCurrent: () -> Unit, onPrevious: () -> Unit) {
     val itemColors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
@@ -8582,6 +9806,10 @@ private fun DeveloperPage(onBack: () -> Unit, onCurrent: () -> Unit, onPrevious:
     }
 }
 
+/**
+ * Просмотр журнала. [previous] = false — текущий запуск, true — полный журнал прошлого запуска.
+ * «Сохранить .log» открывает выбор места сохранения, «Скопировать лог» кладёт весь журнал в буфер обмена.
+ */
 @Composable
 private fun LogViewerPage(title: String, previous: Boolean, onBack: () -> Unit) {
     val ctx = LocalContext.current
@@ -8594,6 +9822,7 @@ private fun LogViewerPage(title: String, previous: Boolean, onBack: () -> Unit) 
         }
     }
     val full = text.orEmpty()
+    // На экране показываем хвост (последние строки), в файл и в буфер уходит весь журнал целиком.
     val lines = remember(full) { full.lineSequence().toList().takeLast(3000) }
     val saveName = remember(previous) {
         val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
@@ -8625,6 +9854,7 @@ private fun LogViewerPage(title: String, previous: Boolean, onBack: () -> Unit) 
             TextButton(onClick = { reload++ }, modifier = Modifier.entrance(1, offsetDp = 10).padding(horizontal = 8.dp)) { Text("Обновить") }
         }
         Spacer(Modifier.height(4.dp))
+        // Загрузка → пустой журнал / текст журнала: плавная смена, текст появляется со сдвигом снизу.
         val phase = when {
             text == null -> 0
             full.isEmpty() -> 1
@@ -8651,6 +9881,9 @@ private fun LogViewerPage(title: String, previous: Boolean, onBack: () -> Unit) 
                     )
                 }
                 else -> {
+                    // Журнал — один выделяемый текст внутри обычной прокрутки, а не сотни отдельных строк в ленте: при
+                    // выделении протяжкой лента выгружала строки из-под пальца, и Compose падал (NoSuchElementException в
+                    // SelectionManager). Цвета строк сохранены.
                     val errColor = MaterialTheme.colorScheme.error
                     val warnColor = MaterialTheme.colorScheme.tertiary
                     val markColor = MaterialTheme.colorScheme.primary
@@ -8688,6 +9921,7 @@ private fun LogViewerPage(title: String, previous: Boolean, onBack: () -> Unit) 
     }
 }
 
+/** Вибрация: включение/выключение виброотклика и выбор его силы. */
 @Composable
 private fun HapticsSettingsPage(onBack: () -> Unit) {
     Column(Modifier.fillMaxSize()) {
@@ -8790,6 +10024,7 @@ private fun HapticsSettingsPage(onBack: () -> Unit) {
     }
 }
 
+/** Распознавание музыки: ключ сервиса, длина записи и плитка для шторки быстрых настроек. */
 @Composable
 private fun RecognitionSettingsPage(onBack: () -> Unit) {
     val ctx = LocalContext.current
@@ -8799,7 +10034,7 @@ private fun RecognitionSettingsPage(onBack: () -> Unit) {
             SettingsSection("Сервис", R.drawable.ms_mic, startExpanded = true) {
             Text(
                 "Трек определяет Shazam, настройка не нужна: приложение записывает короткий фрагмент, считает из него отпечаток " +
-                    "на телефоне и отправляет только отпечаток. Найденный трек открывается в поиске Яндекс Музыки. " +
+                    "на телефоне и отправляет только отпечаток. Найденный трек открывается в поиске музыкального сервиса аккаунта (Яндекс или VK). " +
                     "Если Shazam не узнал песню, можно указать ключ AudD как запасной вариант (необязательно).",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -8826,6 +10061,7 @@ private fun RecognitionSettingsPage(onBack: () -> Unit) {
             }
             }
             SettingsSection("Когда трек узнан", R.drawable.ms_music_note) {
+            // Выдали ли «Поверх других приложений» — проверяем заново, когда вернулись из системных настроек.
             var permTick by remember { mutableIntStateOf(0) }
             LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { permTick++ }
             val canOpen = remember(permTick) { app.ymusic.m3e.recognition.RecognitionService.canOpenFromBackground(ctx) }
@@ -8909,15 +10145,21 @@ private fun RecognitionSettingsPage(onBack: () -> Unit) {
     }
 }
 
+/**
+ * Подраздел страницы настроек: плитка-заголовок, по нажатию раскрывается и показывает свои настройки.
+ * Так длинные страницы («Внешний вид», «Плеер» и др.) собраны в группы, а не идут одним длинным списком.
+ * [contentPadding] — горизонтальный отступ содержимого (у страниц, где строки сами идут от края до края, он 0).
+ */
 @Composable
-private fun SettingsSection(
+internal fun SettingsSection(
     title: String,
     icon: Int,
     startExpanded: Boolean = false,
     contentPadding: Dp = 0.dp,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    var open by rememberSaveable(title) { mutableStateOf(startExpanded) }
+    // Раздел, выбранный в поиске по настройкам, открывается сам.
+    var open by rememberSaveable(title) { mutableStateOf(startExpanded || SettingsHighlight.section == title) }
     val arrow by animateFloatAsState(if (open) 90f else 0f, label = "sectionArrow")
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 3.dp)) {
         Surface(
@@ -8944,6 +10186,7 @@ private fun SettingsSection(
     }
 }
 
+/** Подпись раздела внутри страницы настроек. */
 @Composable
 private fun SettingsLabel(text: String) {
     Text(
@@ -8952,6 +10195,7 @@ private fun SettingsLabel(text: String) {
     )
 }
 
+/** Строка раздела «Акценты»: часть интерфейса, пояснение и текущий цвет; нажатие открывает выбор цвета. */
 @Composable
 private fun AccentRoleRow(title: String, hint: String, color: Color, custom: Boolean, onReset: () -> Unit, onClick: () -> Unit) {
     ListItem(
@@ -8968,6 +10212,10 @@ private fun AccentRoleRow(title: String, hint: String, color: Color, custom: Boo
     )
 }
 
+/**
+ * Ряд «Мне нравится / Поделиться» под кнопками воспроизведения страницы (альбом, исполнитель).
+ * [liked] == null или [onLike] == null — кнопки лайка нет; [onShare] == null — кнопки «Поделиться» нет.
+ */
 @Composable
 private fun PageActionsRow(
     liked: Boolean?,
@@ -8997,15 +10245,20 @@ private fun PageActionsRow(
         }
         if (onShare != null) {
             FilledTonalButton(onClick = onShare, modifier = Modifier.weight(1f).height(48.dp), contentPadding = PaddingValues(horizontal = 12.dp)) {
-                Icon(painterResource(R.drawable.ms_share), null, Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text("Поделиться", maxLines = 1)
+                Icon(painterResource(R.drawable.ms_share), null, Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); FitText("Поделиться")
             }
         }
     }
 }
 
+/**
+ * Доступ к плейлисту: у своего — переключатель «Публичный / приватный» (как в Яндекс Музыке) и «Поделиться»;
+ * у чужого — только «Поделиться». Приватным плейлистом поделиться нельзя: кнопка неактивна.
+ */
 @Composable
 private fun PlaylistShareRow(p: PlaylistInfo, editable: Boolean, onTogglePublic: (Boolean) -> Unit) {
     val ctx = LocalContext.current
+    // Чужой плейлист, который удалось открыть, — публичный (даже если сервер не прислал поле видимости).
     val shareable = if (editable || p.visibility != null) p else p.copy(visibility = "public")
     val link = ShareLinks.playlist(shareable)
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -9029,7 +10282,7 @@ private fun PlaylistShareRow(p: PlaylistInfo, editable: Boolean, onTogglePublic:
         }
         FilledTonalButton(
             onClick = {
-                if (link != null) ShareLinks.shareText(ctx, p.title, "${p.title}\n$link")
+                if (link != null) ShareQrHost.open(p.title, "${p.title}\n$link", link)
             },
             enabled = link != null,
             modifier = Modifier.fillMaxWidth().height(48.dp),
@@ -9041,6 +10294,10 @@ private fun PlaylistShareRow(p: PlaylistInfo, editable: Boolean, onTogglePublic:
     }
 }
 
+/**
+ * Окно «Изменить название, исполнителя и обложку» для файла с устройства. Сам файл не меняется — правка хранится в приложении
+ * и действует во всех списках, альбомах и в плеере.
+ */
 @Composable
 private fun EditLocalTrackDialog(vm: AppViewModel, t: Track, onDismiss: () -> Unit) {
     val scope = rememberCoroutineScope()
@@ -9053,6 +10310,7 @@ private fun EditLocalTrackDialog(vm: AppViewModel, t: Track, onDismiss: () -> Un
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri != null) { pickedCover = uri; resetCover = false }
     }
+    // Обложка из самого файла / альбома (то, что вернётся при сбросе).
     val original = remember(t.id) {
         if (t.localAlbumId > 0) android.content.ContentUris.withAppendedId(
             android.net.Uri.parse("content://media/external/audio/albumart"), t.localAlbumId,
@@ -9156,6 +10414,7 @@ private fun AppearancePage(onBack: () -> Unit, onOpenEditor: () -> Unit = {}) {
             Modifier.fillMaxSize().verticalScroll(rememberTopScrollState())
                 .padding(top = 8.dp, bottom = 8.dp + dockInset()),
         ) {
+            // Вход в редактор интерфейса: порядок и размеры блоков, кнопки дока и плеера, ссылки.
             Surface(
                 onClick = onOpenEditor,
                 shape = containerShape(20),
@@ -9180,6 +10439,7 @@ private fun AppearancePage(onBack: () -> Unit, onOpenEditor: () -> Unit = {}) {
     }
 }
 
+/** Все настройки внешнего вида одним столбцом (без прокрутки): общий вид для страницы «Внешний вид» и для вкладки «Вид» редактора. */
 @Composable
 internal fun AppearanceContent() {
     val mode = ThemeSettings.mode
@@ -9188,6 +10448,7 @@ internal fun AppearanceContent() {
     val fontName = ThemeSettings.customFontName
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
+    // Окна выбора цвета: основной акцент и отдельные цвета приложения.
     var pickMain by remember { mutableStateOf(false) }
     var pickSlot by remember { mutableStateOf<AccentSlot?>(null) }
     val fontPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -9200,6 +10461,7 @@ internal fun AppearanceContent() {
     Column(Modifier.fillMaxWidth()) {
         run {
             OptimizeSwitchCard()
+            SettingsLabel("Оформление")
             SettingsSection("Тема", R.drawable.ms_palette, contentPadding = 16.dp) {
             Spacer(Modifier.height(12.dp))
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
@@ -9259,6 +10521,7 @@ internal fun AppearanceContent() {
                         AnimatedCheck(selected, tint = Color.White)
                     }
                 }
+                // Свои цвета: нажатие — выбрать, долгое нажатие — убрать из списка.
                 ThemeSettings.customColors.forEach { argb ->
                     val selected = accent == argb
                     Box(
@@ -9275,6 +10538,7 @@ internal fun AppearanceContent() {
                         AnimatedCheck(selected, tint = Color.White)
                     }
                 }
+                // Колорпикер: любой цвет по своему вкусу.
                 Box(
                     Modifier.size(52.dp)
                         .clip(CircleShape)
@@ -9371,6 +10635,7 @@ internal fun AppearanceContent() {
                 optionSupporting = { if (it == FontMode.File) (fontName ?: "Выбрать .ttf или .otf") else null },
                 onSelect = { m ->
                     if (m == FontMode.File && ThemeSettings.customFont == null) {
+                        // Файл ещё не выбран — сразу открываем выбор.
                         fontPicker.launch(arrayOf("*/*"))
                     } else {
                         ThemeSettings.updateFontMode(m)
@@ -9407,6 +10672,8 @@ internal fun AppearanceContent() {
                 IconShape.entries.forEach { sh ->
                     val selected = ThemeSettings.iconShape == sh
                     Column(
+                        // Фиксированная форма области нажатия: иначе она менялась бы вместе с выбранной формой
+                        // и срезала превью остальных.
                         Modifier.width(96.dp).clip(androidx.compose.foundation.shape.RoundedCornerShape(16.dp))
                             .clickable { ThemeSettings.updateIconShape(sh) }.padding(vertical = 6.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
@@ -9471,9 +10738,13 @@ internal fun AppearanceContent() {
                 }
             }
             }
-            SettingsSection("Полоса прогресса", R.drawable.ms_schedule, contentPadding = 16.dp) {
+            SettingsSection("Матовое стекло (размытая прозрачность)", R.drawable.ms_palette, contentPadding = 16.dp) {
             Spacer(Modifier.height(8.dp))
-            SeekStyleSection()
+            GlassSettingsSection()
+            }
+            SettingsSection("Размер интерфейса", R.drawable.ms_open_in_full, contentPadding = 16.dp) {
+            Spacer(Modifier.height(8.dp))
+            UiScaleSetting()
             }
             SettingsSection("Свечение", R.drawable.ms_music_note, contentPadding = 16.dp) {
             Spacer(Modifier.height(8.dp))
@@ -9482,9 +10753,32 @@ internal fun AppearanceContent() {
                 "Обложка в полном плеере и мини-плеер мягко светятся, пока играет музыка. На паузе свечения нет",
                 ThemeSettings.glowPlayer,
             ) { ThemeSettings.updateGlowPlayer(it) }
+            if (ThemeSettings.glowPlayer) {
+                Text(
+                    "Цвет свечения плеера",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp, bottom = 6.dp),
+                )
+                Row(
+                    Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilterChip(
+                        selected = ThemeSettings.glowFromCover,
+                        onClick = { ThemeSettings.updateGlowFromCover(true) },
+                        label = { Text("По обложке") },
+                    )
+                    FilterChip(
+                        selected = !ThemeSettings.glowFromCover,
+                        onClick = { ThemeSettings.updateGlowFromCover(false) },
+                        label = { Text("По цвету системы") },
+                    )
+                }
+            }
             GlowSwitchRow(
-                "Свечение «Моей волны»",
-                "Весь верхний блок «Моей волны» светится, пока играет волна. Выключите, чтобы блок был без свечения",
+                if (ActiveProvider.isVk) "Свечение VK Микса" else if (ActiveProvider.isSc) "Свечение волны" else "Свечение «Моей волны»",
+                if (ActiveProvider.isVk) "Весь верхний блок VK Микса светится, пока играет микс. Выключите, чтобы блок был без свечения" else if (ActiveProvider.isSc) "Весь верхний блок волны светится, пока играет волна. Выключите, чтобы блок был без свечения" else "Весь верхний блок «Моей волны» светится, пока играет волна. Выключите, чтобы блок был без свечения",
                 ThemeSettings.glowWave,
             ) { ThemeSettings.updateGlowWave(it) }
             GlowSwitchRow(
@@ -9494,12 +10788,17 @@ internal fun AppearanceContent() {
             ) { ThemeSettings.updateGlowPlaylists(it) }
             }
             AnimationSection()
+            SettingsLabel("Главная, поиск и навигация")
             InterfaceSection()
             Spacer(Modifier.height(16.dp))
         }
     }
 }
 
+/**
+ * «Оптимизация»: один переключатель на все эффекты. Включено — свечение, размытие дока, бегущие волны, переходы
+ * и пружинки выключены; выключено — всё работает по отдельным настройкам, как раньше.
+ */
 @Composable
 private fun OptimizeSwitchCard() {
     val on = ThemeSettings.optimize
@@ -9526,6 +10825,7 @@ private fun OptimizeSwitchCard() {
     }
 }
 
+/** Скорость анимации: ползунок применяется, когда палец отпущен. Влияет на переходы между экранами и жест «назад». */
 @Composable
 private fun AnimationSection() {
     SettingsSection("Анимации", R.drawable.ms_refresh, contentPadding = 16.dp) {
@@ -9622,6 +10922,7 @@ private fun AnimationSection() {
     }
 }
 
+/** Строка настроек «название + пояснение + переключатель» для пункта «Свечение». */
 @Composable
 internal fun GlowSwitchRow(title: String, hint: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     Row(
@@ -9637,6 +10938,10 @@ internal fun GlowSwitchRow(title: String, hint: String, checked: Boolean, onChan
     }
 }
 
+
+
+
+/** Выбор стиля полосы прогресса (общий для полного плеера и мини-плеера). Живёт в «Плеер». */
 @Composable
 private fun SeekStyleSection() {
     Column(Modifier.fillMaxWidth()) {
@@ -9674,70 +10979,20 @@ private fun SeekStyleSection() {
     }
 }
 
+/** Главный экран, поиск, док-панель, навигация и планшеты. Часть страницы «Внешний вид». */
 @Composable
 private fun InterfaceSection() {
-            SettingsSection("Планшеты", R.drawable.ms_smartphone, contentPadding = 16.dp) {
-                Text(
-                    "Широкая раскладка: вместо нижней панели — боковая, слева кнопки и профиль, справа списки треков и настройки, мини-плеер внизу списка. " +
-                        "«Авто» включает её, когда окно шире 600 dp (планшеты, а также телефон в альбомной ориентации); " +
-                        "«Только планшеты» оставляет на телефоне обычный вид даже в альбомной ориентации",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(8.dp))
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
-                    TabletMode.entries.forEach { m ->
-                        FilterChip(
-                            selected = TabletSettings.mode == m,
-                            onClick = { TabletSettings.update(m) },
-                            label = { Text(m.title) },
-                        )
-                    }
-                }
-                GlowSwitchRow(
-                    "В вертикальном положении",
-                    "Планшетная раскладка работает и в портретной ориентации. Выключите — в портретной будет обычный телефонный вид",
-                    TabletSettings.inPortrait,
-                ) { TabletSettings.updateInPortrait(it) }
-                Text("Положение островка", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                    IslandPos.entries.forEach { p ->
-                        FilterChip(selected = TabletSettings.islandPos == p, onClick = { TabletSettings.updateIslandPos(p) }, label = { Text(p.title) })
-                    }
-                }
-                Text(
-                    "Навигация на планшете: «Островок / док» — при включённом островке это капсула только со значками поверх контента (положение — ниже; «Снизу» — обычный островок с подписями), " +
-                        "«Боковая панель» — кнопки слева",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                    FilterChip(selected = !TabletSettings.sideRail, onClick = { TabletSettings.updateSideRail(false) }, label = { Text("Островок / док") })
-                    FilterChip(selected = TabletSettings.sideRail, onClick = { TabletSettings.updateSideRail(true) }, label = { Text("Боковая панель") })
-                }
-            }
             SettingsSection("Главный экран", R.drawable.ms_home, contentPadding = 16.dp) {
             Spacer(Modifier.height(8.dp))
-            Row(
-                Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium)
-                    .clickable { ThemeSettings.updatePinWave(!ThemeSettings.pinWave) }.padding(vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f).padding(end = 16.dp)) {
-                    Text("Закреплённая «Моя волна»", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                    Text(
-                        "Когда большой блок «Моей волны» прокручен вверх, компактная кнопка волны остаётся сверху. Выключите, чтобы блок просто прокручивался вместе со списком",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                ExpressiveSwitch(checked = ThemeSettings.pinWave, onCheckedChange = { ThemeSettings.updatePinWave(it) })
-            }
-            GlowSwitchRow(
-                "Вода реагирует на наклон",
-                "Волна на кнопке «Моя волна» стекает в нижнюю сторону и плещется, когда вы наклоняете или крутите телефон (акселерометр)",
-                ThemeSettings.waveTilt,
-            ) { ThemeSettings.updateWaveTilt(it) }
+            // Для управления одной рукой на больших телефонах; на планшете приветствия нет.
+            if (!LocalWide.current) GlowSwitchRow(
+                "Приветствие сверху",
+                "Вверху главного экрана: значок, «Доброе утро / день / вечер / Доброй ночи» по времени телефона и ваш ник (нажмите на него, чтобы сменить). При прокрутке скрывается",
+                GreetingSettings.enabled,
+            ) { GreetingSettings.updateEnabled(it) }
             GlowSwitchRow(
                 "Поиск на главной",
-                "Кнопка поиска на главной: нажатие открывает поиск с клавиатурой. Её можно показать плиткой или значком в углу блока «Моей волны»",
+                if (ActiveProvider.isVk) "Кнопка поиска на главной: нажатие открывает поиск с клавиатурой. Её можно показать плиткой или значком в углу блока VK Микса" else if (ActiveProvider.isSc) "Кнопка поиска на главной: нажатие открывает поиск с клавиатурой. Её можно показать плиткой или значком в углу блока волны" else "Кнопка поиска на главной: нажатие открывает поиск с клавиатурой. Её можно показать плиткой или значком в углу блока «Моей волны»",
                 NavSettings.homeSearch,
             ) { NavSettings.updateHomeSearch(it) }
             if (NavSettings.homeSearch) {
@@ -9757,6 +11012,26 @@ private fun InterfaceSection() {
                     )
                 }
             }
+            Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.fillMaxWidth().clip(MaterialTheme.shapes.medium)
+                    .clickable { ThemeSettings.updatePinWave(!ThemeSettings.pinWave) }.padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f).padding(end = 16.dp)) {
+                    Text(if (ActiveProvider.isVk) "Закреплённый VK Микс" else if (ActiveProvider.isSc) "Закреплённая волна" else "Закреплённая «Моя волна»", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (ActiveProvider.isVk) "Когда большой блок VK Микса не виден на экране (прокручен или стоит в самом низу), компактная кнопка остаётся сверху. Выключите, чтобы блок просто прокручивался вместе со списком" else if (ActiveProvider.isSc) "Когда большой блок волны не виден на экране (прокручен или стоит в самом низу), компактная кнопка волны остаётся сверху. Выключите, чтобы блок просто прокручивался вместе со списком" else "Когда большой блок «Моей волны» не виден на экране (прокручен или стоит в самом низу), компактная кнопка волны остаётся сверху. Выключите, чтобы блок просто прокручивался вместе со списком",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                ExpressiveSwitch(checked = ThemeSettings.pinWave, onCheckedChange = { ThemeSettings.updatePinWave(it) })
+            }
+            GlowSwitchRow(
+                "Вода реагирует на наклон",
+                if (ActiveProvider.isVk) "Волна на кнопке VK Микса стекает в нижнюю сторону и плещется, когда вы наклоняете или крутите телефон (акселерометр)" else if (ActiveProvider.isSc) "Волна на кнопке стекает в нижнюю сторону и плещется, когда вы наклоняете или крутите телефон (акселерометр)" else "Волна на кнопке «Моя волна» стекает в нижнюю сторону и плещется, когда вы наклоняете или крутите телефон (акселерометр)",
+                ThemeSettings.waveTilt,
+            ) { ThemeSettings.updateWaveTilt(it) }
             }
             SettingsSection("Поиск", R.drawable.ms_search, contentPadding = 16.dp) {
             Spacer(Modifier.height(8.dp))
@@ -9787,6 +11062,14 @@ private fun InterfaceSection() {
             if (SearchHistory.items.isNotEmpty()) {
                 TextButton(onClick = { SearchHistory.clear() }) { Text("Очистить историю поиска (${SearchHistory.items.size})") }
             }
+            }
+            SettingsSection("Страница артиста", R.drawable.ms_person, contentPadding = 16.dp) {
+            Spacer(Modifier.height(8.dp))
+            GlowSwitchRow(
+                "Информация об артисте",
+                "Раскрываемая карточка «Об артисте» под именем на странице исполнителя: показывает описание или биографию, если сервис их отдаёт. Нажмите на карточку, чтобы прочитать целиком",
+                ThemeSettings.artistBio,
+            ) { ThemeSettings.updateArtistBio(it) }
             }
             SettingsSection("Док-панель", R.drawable.ms_library_music, contentPadding = 16.dp) {
             Spacer(Modifier.height(8.dp))
@@ -9839,14 +11122,6 @@ private fun InterfaceSection() {
                 }
             }
             }
-            SettingsSection("Матовое стекло (размытая прозрачность)", R.drawable.ms_palette, contentPadding = 16.dp) {
-            Spacer(Modifier.height(8.dp))
-            GlassSettingsSection()
-            }
-            SettingsSection("Размер интерфейса", R.drawable.ms_open_in_full, contentPadding = 16.dp) {
-            Spacer(Modifier.height(8.dp))
-            UiScaleSetting()
-            }
             SettingsSection("Навигация", R.drawable.ms_smartphone, contentPadding = 16.dp) {
             Spacer(Modifier.height(8.dp))
             GlowSwitchRow(
@@ -9873,16 +11148,58 @@ private fun InterfaceSection() {
                     )
                 }
             }
+            Spacer(Modifier.height(16.dp))
+            NavTabsEditor()
             GlowSwitchRow(
                 "Подсказки кнопок",
                 "Зажмите маленькую кнопку без подписи — появится её название (особенно полезно в плеере), а действие не сработает",
                 NavSettings.hints,
             ) { NavSettings.updateHints(it) }
-            Spacer(Modifier.height(16.dp))
-            NavTabsEditor()
+            }
+            SettingsSection("Планшеты", R.drawable.ms_smartphone, contentPadding = 16.dp) {
+                Text(
+                    "Широкая раскладка: вместо нижней панели — боковая, слева кнопки и профиль, справа списки треков и настройки, мини-плеер внизу списка. " +
+                        "«Авто» включает её, когда окно шире 600 dp (планшеты, а также телефон в альбомной ориентации); " +
+                        "«Только планшеты» оставляет на телефоне обычный вид даже в альбомной ориентации",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)) {
+                    TabletMode.entries.forEach { m ->
+                        FilterChip(
+                            selected = TabletSettings.mode == m,
+                            onClick = { TabletSettings.update(m) },
+                            label = { Text(m.title) },
+                        )
+                    }
+                }
+                GlowSwitchRow(
+                    "В вертикальном положении",
+                    "Планшетная раскладка работает и в портретной ориентации. Выключите — в портретной будет обычный телефонный вид",
+                    TabletSettings.inPortrait,
+                ) { TabletSettings.updateInPortrait(it) }
+                Text("Положение островка", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                    IslandPos.entries.forEach { p ->
+                        FilterChip(selected = TabletSettings.islandPos == p, onClick = { TabletSettings.updateIslandPos(p) }, label = { Text(p.title) })
+                    }
+                }
+                Text(
+                    "Навигация на планшете: «Островок / док» — при включённом островке это капсула только со значками поверх контента (положение — ниже; «Снизу» — обычный островок с подписями), " +
+                        "«Боковая панель» — кнопки слева",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                    FilterChip(selected = !TabletSettings.sideRail, onClick = { TabletSettings.updateSideRail(false) }, label = { Text("Островок / док") })
+                    FilterChip(selected = TabletSettings.sideRail, onClick = { TabletSettings.updateSideRail(true) }, label = { Text("Боковая панель") })
+                }
             }
 }
 
+/**
+ * Какие экраны есть в панели и в каком порядке. Порядок сверху вниз — слева направо в доке. Экран можно убрать
+ * и вернуть; «Профиль» убрать нельзя, потому что через него открываются настройки.
+ */
 @Composable
 private fun NavTabsEditor() {
     val tabs = NavSettings.tabs
@@ -9951,12 +11268,9 @@ private fun formatSize(b: Long): String = when {
     else -> String.format(java.util.Locale.US, "%.2f ГБ", b / 1024f / 1024f / 1024f)
 }
 
-private fun songsWord(n: Int): String {
-    val m10 = n % 10
-    val m100 = n % 100
-    return if (m10 == 1 && m100 != 11) "песня" else if (m10 in 2..4 && m100 !in 12..14) "песни" else "песен"
-}
+private fun songsWord(n: Int): String = plural(n, "песня", "песни", "песен")
 
+/** Скачивание песен: папка, размер, список скачанного с удалением. */
 @Composable
 private fun DownloadsPage(vm: AppViewModel, onBack: () -> Unit) {
     val dl by vm.downloads.collectAsStateWithLifecycle()
@@ -10050,8 +11364,8 @@ private fun DownloadsPage(vm: AppViewModel, onBack: () -> Unit) {
                 item {
                     val all = dl.items.sortedByDescending { it.ts }.map { it.toTrack() }
                     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Button(onClick = { vm.play(all, 0) }, modifier = Modifier.weight(1f).height(48.dp)) { Text("Слушать скачанное", maxLines = 1) }
-                        FilledTonalButton(onClick = { vm.play(all, 0, shuffle = true) }, modifier = Modifier.weight(1f).height(48.dp)) { Text("Вперемешку", maxLines = 1) }
+                        Button(onClick = { vm.play(all, 0) }, modifier = Modifier.weight(1f).height(48.dp)) { FitText("Слушать скачанное") }
+                        FilledTonalButton(onClick = { vm.play(all, 0, shuffle = true) }, modifier = Modifier.weight(1f).height(48.dp)) { FitText("Вперемешку") }
                     }
                 }
             }
@@ -10094,6 +11408,9 @@ private fun DownloadsPage(vm: AppViewModel, onBack: () -> Unit) {
     }
 }
 
+// ---------- Плагины ----------
+
+/** Иконка плагина из его .exm; если иконки нет — значок «пазл». */
 @Composable
 private fun PluginIcon(icon: ByteArray?, size: Dp) {
     val bmp = remember(icon) {
@@ -10121,12 +11438,19 @@ private fun pluginNum(d: Double): String =
     if (d == Math.rint(d) && Math.abs(d) < 1e12) d.toLong().toString()
     else String.format(java.util.Locale.US, "%.2f", d).trimEnd('0').trimEnd('.')
 
+/**
+ * Настройки плагина в нижней модалке (открывается кнопкой с иконкой настроек в карточке плагина). Поля описаны в манифесте
+ * плагина, а рисует их приложение (код плагина в интерфейс не попадает). Значения сохраняются сразу; скрипт узнаёт о них
+ * через событие setting_changed.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun PluginSettingsSheet(p: InstalledPlugin, entryId: String? = null, closing: Boolean = false, onDismiss: () -> Unit) {
     val m = p.manifest
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    // Lua попросил закрыть шторку (ui.close_page): сначала она плавно уезжает вниз, потом окно снимается.
     LaunchedEffect(closing) { if (closing) { runCatching { sheetState.hide() }; onDismiss() } }
+    // Страницы, которые плагин создал из Lua, рисует сам Lua (render): при открытии просим свежую отрисовку.
     LaunchedEffect(p, entryId) { PluginSystem.requestPage(p, entryId) }
     val entries = p.uiEntries.filter { !it.transient }
     val shown = if (entryId == null) entries else p.uiEntries.filter { it.id == entryId }
@@ -10173,8 +11497,10 @@ private fun PluginSettingsSheet(p: InstalledPlugin, entryId: String? = null, clo
     }
 }
 
+/** Поле настроек из манифеста плагина. */
 @Composable
 private fun PluginSettingField(p: InstalledPlugin, st: app.ymusic.m3e.data.PluginSetting) {
+    // «Отключить песочницу»: включить можно только после предупреждения; выключить — сразу.
     var warn by remember { mutableStateOf(false) }
     PluginSettingField(
         st = st, cur = p.settingValues[st.key], live = PluginSystem.enabled && p.enabled,
@@ -10208,6 +11534,10 @@ private fun PluginSettingField(p: InstalledPlugin, st: app.ymusic.m3e.data.Plugi
     }
 }
 
+/**
+ * Страница настроек, которую плагин создал из Lua (ui.settings_page): рисуются компоненты из последнего render(),
+ * действия пользователя уходят обратно в Lua-колбэки.
+ */
 @Composable
 private fun PluginDynPage(p: InstalledPlugin, entryId: String) {
     val nodes = p.uiPages[entryId]
@@ -10232,6 +11562,7 @@ private fun PluginDynPage(p: InstalledPlugin, entryId: String) {
     }
 }
 
+/** Общая отрисовка одного поля: [cur] — текущее значение, [onSet] — пользователь изменил, [onPress] — нажал кнопку. */
 @Composable
 private fun PluginSettingField(
     st: app.ymusic.m3e.data.PluginSetting,
@@ -10425,6 +11756,10 @@ private fun PluginSettingField(
 
 private fun pluginSize(b: Long): String = if (b >= 1024 * 1024) "%.1f МБ".format(b / 1048576.0) else "${maxOf(1L, b / 1024)} КБ"
 
+/**
+ * Карточка плагина в списке. Появляется с анимацией (раскрывается по высоте, выезжает справа и проявляется), а при
+ * удалении [removing] — сворачивается и уезжает; по окончании анимации вызывается [onRemoved] (тогда плагин и стирается).
+ */
 @Composable
 private fun PluginRow(
     p: InstalledPlugin,
@@ -10436,6 +11771,7 @@ private fun PluginRow(
 ) {
     val m = p.manifest
     val itemColors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
+    // Начинаем «скрытыми» и сразу переключаемся на «видимые»: так карточка, которая только что появилась, проигрывает вход.
     val visible = remember(p) { MutableTransitionState(false).apply { targetState = true } }
     LaunchedEffect(removing) { if (removing) visible.targetState = false }
     LaunchedEffect(removing, visible.currentState, visible.targetState) {
@@ -10488,6 +11824,7 @@ private fun PluginRow(
     }
 }
 
+/** Настройки → Плагины: главный выключатель, список установленных, установка из файла .exm. */
 @Composable
 private fun PluginsPage(onBack: () -> Unit) {
     val ctx = LocalContext.current
@@ -10496,6 +11833,7 @@ private fun PluginsPage(onBack: () -> Unit) {
     }
     var toDelete by remember { mutableStateOf<InstalledPlugin?>(null) }
     var settingsFor by remember { mutableStateOf<String?>(null) }
+    // Плагины, которые прямо сейчас «уезжают»: стираются по окончании анимации (см. PluginRow).
     val removing = remember { mutableStateListOf<String>() }
     val on = PluginSystem.enabled
     val itemColors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
@@ -10574,6 +11912,7 @@ private fun PluginsPage(onBack: () -> Unit) {
     }
 }
 
+/** Диалог, который открыл Lua-скрипт: заголовок, текст, необязательное поле ввода и до трёх кнопок. */
 @Composable
 private fun PluginLuaDialog(d: app.ymusic.m3e.data.PluginDialog) {
     var input by remember(d) { mutableStateOf(d.inputValue ?: "") }
@@ -10615,6 +11954,7 @@ private fun PluginLuaDialog(d: app.ymusic.m3e.data.PluginDialog) {
     )
 }
 
+/** Окно снизу при установке плагина: сведения о нём и кнопка «Установить» (или «Обновить»). */
 @Composable
 private fun PluginInstallSheet(pv: PluginPreview) {
     val m = pv.manifest
@@ -10622,7 +11962,10 @@ private fun PluginInstallSheet(pv: PluginPreview) {
     val sheetState = rememberModalBottomSheetState()
     val sheetScope = rememberCoroutineScope()
     var closing by remember { mutableStateOf(false) }
+    // Включать ли хуки плагина: для нового плагина выключено, для обновления — как было у установленного.
     var hooksOn by remember(pv) { mutableStateOf(PluginSystem.plugins.firstOrNull { it.id == m.id }?.hooksOn == true) }
+    // Кнопки «Отмена» и «Установить» закрывают окно с анимацией: сначала шторка плавно уезжает вниз, и только потом
+    // действие выполняется (раньше окно пропадало мгновенно, потому что плагин снимался с «ожидания» сразу).
     fun closeThen(action: () -> Unit) {
         if (closing) return
         closing = true
@@ -10672,6 +12015,7 @@ private fun PluginInstallSheet(pv: PluginPreview) {
                     )
                 }
                 Spacer(Modifier.height(8.dp))
+                // Вопрос при установке: по умолчанию хуки выключены; при обновлении стоит прежний выбор пользователя.
                 Row(
                     Modifier.fillMaxWidth().clip(rounded(16)).clickable { hooksOn = !hooksOn }
                         .background(MaterialTheme.colorScheme.surfaceContainerHigh).padding(horizontal = 16.dp, vertical = 10.dp),
@@ -10728,6 +12072,7 @@ private fun OfflinePage(onBack: () -> Unit) {
     }
 }
 
+/** О проекте: шапка с градиентом, версия и ветка, ссылки и переход к странице «Разработчики». */
 @Composable
 private fun AboutPage(onBack: () -> Unit, onDevelopers: () -> Unit) {
     val ctx = LocalContext.current
@@ -10735,6 +12080,7 @@ private fun AboutPage(onBack: () -> Unit, onDevelopers: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
     Column(Modifier.fillMaxSize().verticalScroll(rememberTopScrollState()).padding(bottom = 24.dp + dockInset())) {
         SubPageBar("О проекте", onBack)
+        // Шапка: прямоугольник с закруглениями, градиент акцентного цвета, значок и название по центру по высоте.
         Box(
             Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp).height(132.dp)
                 .clip(containerShape(28))
@@ -10813,6 +12159,7 @@ private fun AboutPage(onBack: () -> Unit, onDevelopers: () -> Unit) {
     }
 }
 
+/** Круглая «печенька» с аватаркой из ресурсов (страница «Разработчики»). */
 @Composable
 private fun DevAvatar(res: Int) {
     androidx.compose.foundation.Image(
@@ -10821,6 +12168,7 @@ private fun DevAvatar(res: Int) {
     )
 }
 
+/** Разработчики: команда проекта и те, кто поддержал (группы блоков, как в настройках). */
 @Composable
 private fun DevelopersPage(onBack: () -> Unit) {
     val itemColors = ListItemDefaults.colors(containerColor = MaterialTheme.colorScheme.surfaceContainer)
@@ -10858,6 +12206,8 @@ private fun DevelopersPage(onBack: () -> Unit) {
 @Suppress("unused")
 @Composable
 private fun AboutPageClassic(onBack: () -> Unit) {
+    // Большие мягкие пятна акцентного цвета в верхнем левом и нижнем правом углах:
+    // почти ровная заливка с плавно размытым краем (градиент работает на любой версии Android).
     val spot = MaterialTheme.colorScheme.primary.copy(alpha = 0.40f)
     Box(Modifier.fillMaxSize()) {
         Box(
@@ -10888,6 +12238,7 @@ private fun AboutPageClassic(onBack: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+        // Ссылки внизу страницы: «Мы в Telegram • GitHub», под ними — «Сайт».
         val ctx = LocalContext.current
         val linkStyles = androidx.compose.ui.text.TextLinkStyles(
             style = androidx.compose.ui.text.SpanStyle(
@@ -10928,6 +12279,7 @@ private fun freqLabel(hz: Int): String =
         (if (k % 1f == 0f) k.toInt().toString() else String.format(java.util.Locale.US, "%.1f", k)) + " кГц"
     } else "$hz Гц"
 
+/** Вертикальный слайдер: обычный Slider, повёрнутый на 270°. */
 @Composable
 private fun VerticalSlider(
     value: Float,
@@ -10970,6 +12322,7 @@ private fun EqualizerPage(vm: AppViewModel, onBack: () -> Unit) {
                 .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 8.dp + dockInset()),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            // Выключатель
             Surface(shape = containerShape(28), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 12.dp),
@@ -10979,6 +12332,7 @@ private fun EqualizerPage(vm: AppViewModel, onBack: () -> Unit) {
                     ExpressiveSwitch(checked = eq.enabled, onCheckedChange = { vm.setEqEnabled(it) })
                 }
             }
+            // Выбор пресета
             var menu by remember { mutableStateOf(false) }
             Box {
                 Surface(
@@ -11011,6 +12365,7 @@ private fun EqualizerPage(vm: AppViewModel, onBack: () -> Unit) {
                     }
                 }
             }
+            // Полосы
             Surface(shape = containerShape(28), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 16.dp),
@@ -11044,55 +12399,67 @@ private fun EqualizerPage(vm: AppViewModel, onBack: () -> Unit) {
     }
 }
 
+// ---------- Плеер ----------
+
+/**
+ * Шторка полного плеера со своим жестом (вместо ModalBottomSheet, у которого якоря пересчитывались
+ * при перерисовке и анимация зацикливалась). Положение хранится в [PlayerSheetState] и общее с мини-плеером:
+ * мини-плеер вытягивает шторку вверх пальцем, а здесь её можно утянуть обратно вниз. Одна анимация за раз.
+ */
 @Composable
 private fun PlayerSheet(vm: AppViewModel, sheet: PlayerSheetState) {
     val closedPx = sheet.closedPx
     BackHandler { sheet.close() }
 
     val dragState = androidx.compose.foundation.gestures.rememberDraggableState { d -> sheet.dragBy(d) }
+    // Состояния «текст песни» и «вывод звука» живут здесь: в альбомной ориентации кнопки для них стоят в шапке.
     val sNow by vm.state.collectAsStateWithLifecycle()
     var showLyrics by rememberSaveable { mutableStateOf(false) }
     var showOutput by remember { mutableStateOf(false) }
 
     Box(Modifier.fillMaxSize()) {
+        // Затемнение под шторкой (при перетаскивании вниз проступает фон приложения)
         Box(
             Modifier.fillMaxSize()
                 .graphicsLayer { alpha = (1f - (sheet.offset.value / closedPx)).coerceIn(0f, 1f) }
                 .background(Color.Black.copy(alpha = 0.32f))
         )
+        // Плеер на весь экран: ничего не прокручивается. Закрыть — кнопка-стрелка сверху,
+        // свайп вниз в любом месте плеера или системная кнопка «назад».
+        // «Матовое стекло» фона плеера (выключено по умолчанию): полупрозрачная подложка и размытое приложение за ней.
         val sheetShape: Shape =
             if (ThemeSettings.iconShape == IconShape.Default) androidx.compose.foundation.shape.RoundedCornerShape(topStart = 36.dp, topEnd = 36.dp)
             else MaterialTheme.shapes.extraLarge
         val playerGlassOn = GlassSettings.playerGlass && !ThemeSettings.optimize
         val motionBlurOn = ThemeSettings.motionBlur && !ThemeSettings.optimize && android.os.Build.VERSION.SDK_INT >= 31
         val motionBlurK = ThemeSettings.motionBlurStrength
-        val playerProbe = remember { mutableStateOf(Offset.Zero) }
         Surface(
             shape = sheetShape,
             color = if (playerGlassOn) {
                 MaterialTheme.colorScheme.surfaceContainerLow.copy(alpha = GlassSettings.solidAlpha(GlassSettings.playerAlpha))
             } else MaterialTheme.colorScheme.surfaceContainerLow,
+            // Цвет контента задаём явно: у полупрозрачной подложки Surface не находит «свой» onSurface, и текст (название трека) выходил чёрным.
             contentColor = MaterialTheme.colorScheme.onSurface,
             tonalElevation = if (playerGlassOn) 0.dp else 1.dp,
             modifier = Modifier
                 .fillMaxSize()
-                .glassOriginProbe(playerProbe)
                 .graphicsLayer {
                     translationY = sheet.offset.value
+                    // Motion blur при выезде и сворачивании плеера: размытие по вертикали пропорционально скорости шторки.
                     if (motionBlurOn) {
                         val by = (kotlin.math.abs(sheet.offset.velocity) / 1000f * 3f * motionBlurK).coerceAtMost(36f * motionBlurK)
                         if (by > 0.8f) renderEffect = androidx.compose.ui.graphics.BlurEffect(0f, by, androidx.compose.ui.graphics.TileMode.Clamp)
                     }
                 }
-                .glassBehind(
-                    playerGlassOn, GlassSettings.playerBlurDp, sheetShape,
-                    source = GlassHost.fullBackdrop,
-                    base = MaterialTheme.colorScheme.background,
-                ) { playerProbe.value + Offset(0f, sheet.offset.value) }
+                // Матовое стекло: само приложение под плеером размывается на месте (см. Modifier.playerGlassBackdrop у корня),
+                // а здесь поверх него — молочная вуаль и тонкая светлая кромка.
+                .glassFrost(playerGlassOn, sheetShape)
                 .pointerInput(Unit) { detectTapGestures { } },
         ) {
+            // Размытая обложка текущего трека на фоне плеера (не рисуется при «Матовом стекле» фона плеера и при «Оптимизации»).
             if (PlayerSettings.playerBgBlur && (!playerGlassOn || android.os.Build.VERSION.SDK_INT < 31) && !ThemeSettings.optimize) PlayerBackdrop(sNow.nowPlaying)
             BoxWithConstraints(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
+            // Та же проверка, что была в FullPlayer: область под шапкой (52 dp) с отступами по 20 dp.
             val landscape = (maxWidth - 40.dp) > (maxHeight - 52.dp) * 1.1f
             Column(
                 Modifier.fillMaxSize()
@@ -11109,6 +12476,7 @@ private fun PlayerSheet(vm: AppViewModel, sheet: PlayerSheetState) {
                     }
                     val nowT = sNow.nowPlaying
                     if (landscape && nowT != null) {
+                        // Альбомная ориентация: маленькие кнопки (звук, ещё, повтор, текст, дизлайк, лайк) — наверху, без прокрутки.
                         Box(Modifier.weight(1f).padding(horizontal = 12.dp)) {
                             PlayerBottomRow(vm, nowT, lyricsOn = showLyrics, onLyrics = { showLyrics = !showLyrics }) { showOutput = true }
                         }
@@ -11121,7 +12489,9 @@ private fun PlayerSheet(vm: AppViewModel, sheet: PlayerSheetState) {
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
+                    // Недавно прослушанные: кнопка открывает шторку со списком (как в Яндекс Музыке).
                     var showHistory by remember { mutableStateOf(false) }
+                    // Наша обёртка: отклик на нажатие и подсказка при долгом нажатии; тиков при удержании в плеере нет (LocalHoldHaptics = false).
                     FilledTonalIconButton(onClick = { showHistory = true }) {
                         Icon(painterResource(R.drawable.ms_history), contentDescription = "История прослушивания")
                     }
@@ -11140,6 +12510,10 @@ private fun PlayerSheet(vm: AppViewModel, sheet: PlayerSheetState) {
     }
 }
 
+/**
+ * Фон полного плеера: обложка текущего трека, сильно размытая и приглушённая цветом поверхности, чтобы текст оставался читаемым.
+ * На Android 12+ размытие настоящее; на старых обложка берётся в крошечном размере и растягивается, что тоже даёт мягкий фон.
+ */
 @Composable
 private fun PlayerBackdrop(track: Track?) {
     val cover = track?.cover(300)
@@ -11160,6 +12534,7 @@ private fun PlayerBackdrop(track: Track?) {
                         modifier = Modifier.fillMaxSize().blur(56.dp, BlurredEdgeTreatment.Unbounded),
                     )
                 } else {
+                    // Android 8–11: настоящего размытия нет, поэтому обложку размываем сами (раньше брали 40 px — выходила пиксельной).
                     val bmp = rememberSoftBlurredCover(url)
                     if (bmp != null) {
                         androidx.compose.foundation.Image(
@@ -11177,6 +12552,7 @@ private fun PlayerBackdrop(track: Track?) {
     }
 }
 
+/** Срез состояния для шторки «История»: без позиции трека и прочего, что меняется постоянно. */
 private data class RecentSheetSnap(
     val nowId: String?,
     val syncedHistory: List<Track>,
@@ -11185,8 +12561,16 @@ private data class RecentSheetSnap(
     val sessionLabel: String,
 )
 
+/**
+ * История в плеере: шторка Material 3 с двумя вкладками. «С включения» — только то, что играло с момента запуска
+ * текущего плейлиста / «Моей волны» / волны по источнику; «Вся история» — всё прослушанное. Нажатие на трек играет его сразу,
+ * но плейлист или волна не заменяются и продолжаются после него. Играющий сейчас трек в списке не повторяется.
+ */
 @Composable
 private fun RecentTracksSheet(vm: AppViewModel, onNav: () -> Unit, onDismiss: () -> Unit) {
+    // Важно: подписываемся не на весь vm.state, а на узкий срез. Состояние плеера обновляется на каждом тике позиции,
+    // и перерисовка шторки на каждый тик заставляла ModalBottomSheet пересчитывать якоря: если долго тянуть шторку вверх,
+    // анимация подъёма зацикливалась и шторка залипала. Срез меняется только когда реально меняются списки / трек.
     val s by remember(vm) {
         vm.state
             .map { RecentSheetSnap(it.nowPlaying?.id, it.syncedHistory, it.history, it.sessionHistory, it.sessionLabel) }
@@ -11196,6 +12580,7 @@ private fun RecentTracksSheet(vm: AppViewModel, onNav: () -> Unit, onDismiss: ()
     )
     val nowId = s.nowId
     var tab by remember { mutableIntStateOf(if (s.sessionHistory.isNotEmpty()) 0 else 1) }
+    // Как на главной: серверная история (с других устройств) вместе с локальной; пока не загрузилась — локальная.
     val all = remember(s.syncedHistory, s.history, nowId) {
         s.syncedHistory.ifEmpty { s.history }.filter { it.id != nowId }
     }
@@ -11229,12 +12614,15 @@ private fun RecentTracksSheet(vm: AppViewModel, onNav: () -> Unit, onDismiss: ()
             )
             Spacer(Modifier.height(8.dp))
             if (list.isNotEmpty()) {
+                // Шторка лежит поверх полного плеера: исполнитель/альбом открываются под ним, поэтому
+                // сначала закрываем шторку и сворачиваем плеер, и только потом показываем карточку.
                 CompositionLocalProvider(
                     LocalOpenArtist provides { ref: ArtistRef -> onDismiss(); onNav(); vm.openArtist(ref) },
                     LocalOpenAlbum provides { id: String, title: String? -> onDismiss(); onNav(); vm.openAlbum(id, title) },
                 ) {
                     LazyColumn(Modifier.fillMaxWidth().weight(1f, fill = false), contentPadding = PaddingValues(bottom = 24.dp)) {
                         itemsIndexed(list, key = { i, t -> "${tab}:${t.id}#$i" }) { _, t ->
+                            // Трек играет сразу, а очередь (плейлист / волна) остаётся и продолжается после него.
                             TrackRow(t) { vm.playFromHistory(t); onDismiss() }
                         }
                     }
@@ -11246,10 +12634,16 @@ private fun RecentTracksSheet(vm: AppViewModel, onNav: () -> Unit, onDismiss: ()
     }
 }
 
+/** Срез состояния для шторки «Включить волну по…». */
 private data class WaveSheetSnap(val playlists: List<PlaylistInfo>, val playingSource: String?, val apiId: String?)
 
+/**
+ * «Включить волну по…»: как в Яндекс Музыке, волна подбирается не из всей музыки аккаунта, а по этому треку,
+ * исполнителю, альбому или плейлисту, из которого играет музыка. Текущий трек и очередь заменяются новой волной.
+ */
 @Composable
 private fun WaveFromSheet(vm: AppViewModel, t: Track, fromPlayer: Boolean = true, onDismiss: () -> Unit) {
+    // Узкий срез состояния: без позиции трека, иначе шторка перерисовывается на каждом тике и её анимация зацикливается.
     val s by remember(vm) {
         vm.state.map { WaveSheetSnap(it.playlists, it.playingSource, it.account?.apiId) }.distinctUntilChanged()
     }.collectAsStateWithLifecycle(initialValue = vm.state.value.let { WaveSheetSnap(it.playlists, it.playingSource, it.account?.apiId) })
@@ -11263,6 +12657,7 @@ private fun WaveFromSheet(vm: AppViewModel, t: Track, fromPlayer: Boolean = true
     if (!albumId.isNullOrBlank()) {
         opts += Opt("По альбому", t.albumTitle?.takeIf { it.isNotBlank() } ?: "Альбом трека") { vm.startWaveByAlbum(albumId, t.albumTitle) }
     }
+    // Плейлист берётся из того, что играет сейчас, поэтому из меню трека (где это может быть другой список) его не предлагаем.
     val src = if (fromPlayer) s.playingSource else null
     if (src != null && src.startsWith("pl:")) {
         val p = s.playlists.firstOrNull { playlistSourceKey(it) == src }
@@ -11276,6 +12671,7 @@ private fun WaveFromSheet(vm: AppViewModel, t: Track, fromPlayer: Boolean = true
         val uid = s.apiId
         if (uid != null) opts += Opt("По плейлисту", "Любимое") { vm.startWaveByPlaylist(uid, "3", "Любимое") }
     }
+    // Станции из плагинов (если система плагинов включена).
     PluginSystem.activeStations.forEach { (pl, st) ->
         opts += Opt(st.title, "Плагин «${pl.manifest.name}»" + (st.subtitle.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "")) {
             vm.startWave(listOf(st.station), "Волна: ${st.title}")
@@ -11321,6 +12717,7 @@ private fun WaveFromSheet(vm: AppViewModel, t: Track, fromPlayer: Boolean = true
     }
 }
 
+/** Ползунок размера интерфейса: применяется, когда палец отпущен (иначе ползунок «убегает» из-под пальца). */
 @Composable
 internal fun UiScaleSetting() {
     var draft by remember { mutableFloatStateOf(ThemeSettings.uiScale) }
@@ -11341,14 +12738,21 @@ internal fun UiScaleSetting() {
     }
 }
 
+// ---------- Мини-плеер ----------
+
 private enum class MiniSlider { Seek, Volume }
 
+/**
+ * Громкость музыки с отслеживанием кнопок громкости. Пока музыка играет на колонке Яндекса (Wi-Fi или Ynison),
+ * ползунок управляет громкостью колонки, а не телефона.
+ */
 private class VolumeState(private val am: android.media.AudioManager) {
     private val max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC).coerceAtLeast(1)
     var value by mutableFloatStateOf(am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC).toFloat() / max)
         private set
     var dragging = false
 
+    /** Колонка, на которой сейчас играет музыка (null — управляем громкостью телефона). */
     var remote: app.ymusic.m3e.data.ConnectDevice? = null
     var sendRemote: ((app.ymusic.m3e.data.ConnectDevice, Float) -> Unit)? = null
     private var lastSent = 0L
@@ -11368,6 +12772,7 @@ private class VolumeState(private val am: android.media.AudioManager) {
         value = v.coerceIn(0f, 1f)
         val r = remote
         if (r != null) {
+            // Не чаще раза в 250 мс, чтобы колонка менялась сразу, но без спама.
             val now = System.currentTimeMillis()
             if (now - lastSent > 250) { lastSent = now; sendRemote?.invoke(r, value) }
         } else {
@@ -11375,6 +12780,7 @@ private class VolumeState(private val am: android.media.AudioManager) {
         }
     }
 
+    /** Палец отпущен: для колонки досылаем итоговое значение. */
     fun finish() {
         dragging = false
         remote?.let { sendRemote?.invoke(it, value) }
@@ -11390,6 +12796,7 @@ private fun rememberVolume(vm: AppViewModel, active: Boolean): VolumeState {
     st.remote = if (vm.remoteActive()) {
         cs.devices.firstOrNull { it.id == cs.remoteId && it.volumeSteps > 0 }
     } else null
+    // Громкость колонки изменилась (кнопки на колонке, голос, другой клиент) или сменили источник — обновляем ползунок.
     LaunchedEffect(active, st.remote?.id, st.remote?.volume) { if (active) st.refresh() }
     DisposableEffect(active) {
         if (!active) return@DisposableEffect onDispose { }
@@ -11406,9 +12813,14 @@ private fun rememberVolume(vm: AppViewModel, active: Boolean): VolumeState {
     return st
 }
 
+/**
+ * Компактный мини-плеер. Свайп влево/вправо по обложке и названию переключает трек (как в Spotify);
+ * по настройкам «Плеер» снизу появляется тонкий ползунок перемотки и/или громкости (кнопка справа переключает).
+ */
 @Composable
 private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolean) {
     val s by vm.state.collectAsStateWithLifecycle()
+    // Запоминаем последний трек, чтобы мини-плеер красиво уезжал, а не исчезал.
     var lastTrack by remember { mutableStateOf<Track?>(null) }
     if (s.nowPlaying != null) lastTrack = s.nowPlaying
     val miniPos by vm.positionMs.collectAsStateWithLifecycle()
@@ -11433,6 +12845,7 @@ private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolea
     var widthPx by remember { mutableFloatStateOf(1f) }
     val scope = rememberCoroutineScope()
     val t = lastTrack ?: return
+    // Для анимации смены трека: идёт ли переключение свайпом (у него своя анимация) и какой трек был следующим.
     val swipeSwitch = remember { BooleanArray(1) }
     val dirMemo = remember { arrayOfNulls<String>(1) }
     val nextIdOfShown = remember(t.id) { vm.neighborTrack(true)?.id }
@@ -11440,25 +12853,41 @@ private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolea
     val style = ThemeSettings.seekStyle
     val progressColor = (if (island) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSecondaryContainer).copy(alpha = 0.12f)
     val showFill = mode != MiniSlider.Seek && !style.circular
+    // Стиль ползунка общий с полным плеером. В круговом стиле перемотка — это само кольцо вокруг кнопки play/pause.
     val linearBar = mode != null && !(style.circular && mode == MiniSlider.Seek)
 
+    // Свайп вверх по мини-плееру вытягивает полный плеер вслед за пальцем (как в Яндекс Музыке).
     val openDrag = androidx.compose.foundation.gestures.rememberDraggableState { d -> sheet.dragBy(d) }
+    // Плавное превращение мини-плеера в островок и обратно: углы, цвет, тень и отступы перетекают пружиной.
     val morph by animateFloatAsState(
         targetValue = if (island) 1f else 0f,
         animationSpec = fxSpring(dampingRatio = Spring.DampingRatioLowBouncy, stiffness = Spring.StiffnessLow),
         label = "miniMorph",
     )
+    // Скругление: из редактора интерфейса (−1 — как раньше: зависит от «Островка»).
     val miniRadius = if (UiStyle.miniCorner >= 0) UiStyle.miniCorner.dp
         else maxOf(0.dp, scaledDp(24) + (scaledDp(32) - scaledDp(24)) * morph)
     val miniShape = cornerShape(miniRadius)
+    // «Матовое стекло» мини-плеера (выключено по умолчанию): полупрозрачная подложка и размытый экран за ней.
     val miniGlassOn = GlassSettings.miniGlass && !ThemeSettings.optimize
     val miniProbe = remember { mutableStateOf(Offset.Zero) }
-    val miniBase = androidx.compose.ui.graphics.lerp(
-        MaterialTheme.colorScheme.secondaryContainer, MaterialTheme.colorScheme.surfaceContainerHigh, morph.coerceIn(0f, 1f),
-    )
+    // Подкраска под обложку играющего трека (настройка «Цвет мини-плеера по обложке»): цвет плавно перетекает при смене трека.
+    val tintHs = rememberCoverHue(t.cover(160), PlayerSettings.miniCoverColor)
+    val secBase = MaterialTheme.colorScheme.secondaryContainer
+    val highBase = MaterialTheme.colorScheme.surfaceContainerHigh
+    val tintSec by animateColorAsState(tintHs?.let { coverTinted(it, secBase) } ?: secBase, tween(fxMs(500)), label = "miniTintSec")
+    val tintHigh by animateColorAsState(tintHs?.let { coverTinted(it, highBase) } ?: highBase, tween(fxMs(500)), label = "miniTintHigh")
+    val miniBase = androidx.compose.ui.graphics.lerp(tintSec, tintHigh, morph.coerceIn(0f, 1f))
+    val miniSurfaceColor = if (miniGlassOn) miniBase.copy(alpha = GlassSettings.solidAlpha(GlassSettings.miniAlpha)) else miniBase
+    val miniGlowColor = rememberGlowColor(t.cover(160))
     Surface(
+        // Док-панель в виде островка — и мини-плеер «островок»: парящая капсула с тенью.
         shape = miniShape,
-        color = if (miniGlassOn) miniBase.copy(alpha = GlassSettings.solidAlpha(GlassSettings.miniAlpha)) else miniBase,
+        color = miniSurfaceColor,
+        // Без подкраски цвет содержимого выбирается как раньше; с подкраской — как у обычной подложки мини-плеера.
+        contentColor = if (tintHs != null) androidx.compose.ui.graphics.lerp(
+            MaterialTheme.colorScheme.onSecondaryContainer, MaterialTheme.colorScheme.onSurface, morph.coerceIn(0f, 1f),
+        ) else contentColorFor(miniSurfaceColor),
         tonalElevation = if (miniGlassOn) 0.dp else (3f * morph).coerceAtLeast(0f).dp,
         shadowElevation = if (miniGlassOn) 0.dp else (8f * morph).coerceAtLeast(0f).dp,
         modifier = Modifier
@@ -11466,9 +12895,10 @@ private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolea
                 start = (12f + 4f * morph + UiStyle.miniSide).dp, top = (3f + 2f * morph).dp,
                 end = (12f + 4f * morph + UiStyle.miniSide).dp, bottom = (3f + 2f * morph + UiStyle.miniBottom).dp,
             )
+            // Свечение мини-плеера: тот же переключатель, что и у полного плеера; на паузе не рисуется.
             .playGlow(
                 active = s.isPlaying, enabled = ThemeSettings.glowPlayer,
-                color = MaterialTheme.colorScheme.primary,
+                color = miniGlowColor,
                 cornerRadius = miniRadius,
                 spread = 12.dp, strength = 0.5f,
                 shape = miniShape,
@@ -11484,6 +12914,7 @@ private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolea
                 onDragStopped = { v -> sheet.settleOpening(v) },
             )
             .pointerInput(Unit) {
+                // Вибро-тики при пролистывании — по шагам, как у ползунка перемотки.
                 var lastTick = 0
                 detectHorizontalDragGestures(
                     onDragStart = { lastTick = 0; scope.launch { offset.stop() } },
@@ -11517,15 +12948,20 @@ private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolea
                 }
             },
     ) {
+        // Нажатие висит внутри Surface: рябь обрезается формой мини-плеера и не вылезает прямоугольником за скругление.
         Column(
             Modifier.fillMaxWidth().clickable { sheet.open() }.drawBehind {
                 if (showFill) drawRect(progressColor, size = Size(size.width * progress, size.height))
             },
         ) {
-            Row(
+            // Не поместившаяся кнопка переносится на вторую строку мини-плеера, а не наезжает на соседнюю.
+            WrapRow(
                 Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 8.dp, bottom = if (!linearBar) 8.dp else 2.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                // Блоки мини-плеера (обложка, текст, кнопки) идут в порядке из редактора интерфейса. Обложка и текст «уезжают»
+                // за пальцем при свайпе; при смене трека кнопками / автопереходом «выпрыгивают» сбоку пружиной
+                // (при свайпе анимация не нужна — там трек уже приехал за пальцем).
                 val trackSpec: AnimatedContentTransitionScope<Track>.() -> ContentTransform = {
                     if (swipeSwitch[0]) {
                         androidx.compose.animation.EnterTransition.None togetherWith androidx.compose.animation.ExitTransition.None
@@ -11542,6 +12978,8 @@ private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolea
                     animationSpec = fxSpring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessMediumLow),
                     label = "miniCorner",
                 )
+                // Кнопка ровно по центру и того же размера, что обложка: системный минимум 48 dp отключён,
+                // иначе кнопка в 40 dp «съезжала» внутри круга прогресса и выбивалась из ряда.
                 val playButton: @Composable () -> Unit = {
                     CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides Dp.Unspecified) {
                         FilledIconButton(
@@ -11570,7 +13008,8 @@ private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolea
                     val slot = Modifier.padding(
                         start = UiLayout.padH(LScreen.MINI, blk).dp, top = UiLayout.gap(LScreen.MINI, blk).dp,
                         end = UiLayout.padH(LScreen.MINI, blk).dp, bottom = UiLayout.gapBottom(LScreen.MINI, blk).dp,
-                    )
+                    ).layoutEdit(LScreen.MINI, blk)
+                    val miniSpan = UiLayout.span(LScreen.MINI, blk).coerceAtLeast(1)
                     when (blk) {
                         MiniBlock.Cover -> Box(
                             slot.graphicsLayer {
@@ -11591,7 +13030,7 @@ private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolea
                             }
                         }
                         MiniBlock.Info -> Box(
-                            slot.weight(1f).graphicsLayer {
+                            slot.wrapFill().graphicsLayer {
                                 translationX = offset.value
                                 alpha = (1f - kotlin.math.abs(offset.value) / widthPx * 0.9f).coerceIn(0f, 1f)
                                 horizontalMotionBlur(offset.velocity)
@@ -11621,28 +13060,34 @@ private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolea
                         }
                         MiniBlock.Prev -> Box(slot) {
                             ZoomBox(bz) {
-                                IconButton(onClick = { vm.previous() }, modifier = Modifier.size(40.dp)) {
-                                    Icon(painterResource(R.drawable.ms_skip_previous), contentDescription = "Предыдущий трек", modifier = Modifier.size(24.dp))
+                                SpanBox(miniSpan, 40.dp) {
+                                    IconButton(onClick = { vm.previous() }, modifier = Modifier.size(40.dp)) {
+                                        Icon(painterResource(R.drawable.ms_skip_previous), contentDescription = "Предыдущий трек", modifier = Modifier.size(24.dp))
+                                    }
                                 }
                             }
                         }
                         MiniBlock.Next -> Box(slot) {
                             ZoomBox(bz) {
-                                IconButton(onClick = { vm.next() }, modifier = Modifier.size(40.dp)) {
-                                    Icon(painterResource(R.drawable.ms_skip_next), contentDescription = "Следующий трек", modifier = Modifier.size(24.dp))
+                                SpanBox(miniSpan, 40.dp) {
+                                    IconButton(onClick = { vm.next() }, modifier = Modifier.size(40.dp)) {
+                                        Icon(painterResource(R.drawable.ms_skip_next), contentDescription = "Следующий трек", modifier = Modifier.size(24.dp))
+                                    }
                                 }
                             }
                         }
                         MiniBlock.Like -> Box(slot) {
                             ZoomBox(bz) {
                                 val miniLiked = s.liked.any { it.id == t.id }
-                                IconButton(onClick = { vm.toggleLike(t) }, modifier = Modifier.size(40.dp)) {
-                                    Icon(
-                                        painterResource(if (miniLiked) R.drawable.ms_favorite else R.drawable.ms_favorite_border),
-                                        contentDescription = "Нравится",
-                                        tint = if (miniLiked) MaterialTheme.colorScheme.primary else LocalContentColor.current,
-                                        modifier = Modifier.size(24.dp),
-                                    )
+                                SpanBox(miniSpan, 40.dp) {
+                                    IconButton(onClick = { vm.toggleLike(t) }, modifier = Modifier.size(40.dp)) {
+                                        Icon(
+                                            painterResource(if (miniLiked) R.drawable.ms_favorite else R.drawable.ms_favorite_border),
+                                            contentDescription = "Нравится",
+                                            tint = if (miniLiked) MaterialTheme.colorScheme.primary else LocalContentColor.current,
+                                            modifier = Modifier.size(24.dp),
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -11663,7 +13108,8 @@ private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolea
                         }
                     }
                 }
-                if (UiLayout.isHidden(LScreen.MINI, MiniBlock.Info)) Spacer(Modifier.weight(1f))
+                // Без блока «Название и исполнитель» свободное место всё равно остаётся справа от кнопок.
+                if (UiLayout.isHidden(LScreen.MINI, MiniBlock.Info)) Spacer(Modifier.wrapFill())
             }
             if (linearBar) {
                 Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 6.dp, bottom = 2.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -11698,7 +13144,10 @@ private fun MiniPlayer(vm: AppViewModel, sheet: PlayerSheetState, island: Boolea
     }
 }
 
-private class SeekUi(
+// ---------- Полный плеер ----------
+
+/** Состояние перемотки: плавная позиция из плеера, перетаскивание не дёргает трек до отпускания. */
+internal class SeekUi(
     val shown: Float,
     val dur: Long,
     val amp: Float,
@@ -11707,7 +13156,7 @@ private class SeekUi(
 )
 
 @Composable
-private fun rememberSeek(vm: AppViewModel, trackId: String, durationMs: Long, isPlaying: Boolean): SeekUi {
+internal fun rememberSeek(vm: AppViewModel, trackId: String, durationMs: Long, isPlaying: Boolean): SeekUi {
     val dur = durationMs.coerceAtLeast(1)
     var dragging by remember { mutableStateOf(false) }
     var dragValue by remember { mutableFloatStateOf(0f) }
@@ -11715,6 +13164,8 @@ private fun rememberSeek(vm: AppViewModel, trackId: String, durationMs: Long, is
     LaunchedEffect(trackId, dur, isPlaying, dragging) {
         live = (vm.livePosition().toFloat() / dur).coerceIn(0f, 1f)
         if (isPlaying && !dragging) {
+            // Раз в ~66 мс (≈15 кадров/с), а не каждый кадр: сдвиг полосы за это время меньше пикселя, зато
+            // плеер перерисовывается в 4 раза реже (волна анимируется отдельно и остаётся плавной).
             var last = 0L
             while (true) {
                 val now = withFrameMillis { it }
@@ -11743,7 +13194,7 @@ private fun rememberSeek(vm: AppViewModel, trackId: String, durationMs: Long, is
 }
 
 @Composable
-private fun SeekTimes(seek: SeekUi, durationMs: Long) {
+internal fun SeekTimes(seek: SeekUi, durationMs: Long) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
         Text(seekTime((seek.shown * seek.dur).toLong()), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         Spacer(Modifier.weight(1f))
@@ -11751,6 +13202,7 @@ private fun SeekTimes(seek: SeekUi, durationMs: Long) {
     }
 }
 
+/** Память анимации смены трека в [PlayerCover]: какой трек был, какой следовал за ним, направление и сила эффекта. */
 private class SwitchMemo {
     var id: String? = null
     var nextId: String? = null
@@ -11759,12 +13211,20 @@ private class SwitchMemo {
     var travel = 0f
     var wobble = 0f
     var fade = false
+    /** Куда провернулось «кольцо» обложек при смене трека не свайпом: 1 — вперёд, -1 — назад, 0 — не крутили. */
     var ringDir = 0
 }
 
+/**
+ * Обложка подстраивается под свободное место: плеер целиком помещается на любом экране.
+ * Свайп влево/вправо по обложке переключает трек (как в Яндекс Музыке): обложка уезжает за пальцем, а соседние
+ * треки выглядывают по бокам. Нажатие открывает обложку крупно — в том же окне, что и фото исполнителя,
+ * с кнопкой «Скачать» внизу. К альбому ведёт его название ниже.
+ */
 @Composable
 private fun PlayerCover(
     vm: AppViewModel, t: Track, isPlaying: Boolean, modifier: Modifier, clipCovers: Boolean = false,
+    /** Кнопка «Волна по…» в углу обложки; null — не показывать. */
     onWaveFrom: (() -> Unit)? = null,
 ) {
     val coverScale by animateFloatAsState(
@@ -11779,27 +13239,34 @@ private fun PlayerCover(
     val saveName = listOf(t.artists, t.title).filter { it.isNotBlank() }.joinToString(" - ").ifBlank { "Обложка" }
 
     val offset = remember { Animatable(0f) }
+    // Во время переключения держим «снимок» трёх обложек, чтобы после смены трека не мигнул лишний кадр.
     var frozen by remember { mutableStateOf<Triple<Track?, Track, Track?>?>(null) }
     val curId by rememberUpdatedState(t.id)
+    val glowColor = rememberGlowColor(t.cover(160))
     val live = remember(t.id, isPlaying) { Triple(vm.neighborTrack(false), t, vm.neighborTrack(true)) }
     val trio = frozen ?: live
     val trioNow by rememberUpdatedState(trio)
 
+    // «Кольцо» обложек: при смене трека кнопкой (или из уведомления/виджета) обложки не появляются из ниоткуда, а
+    // проворачиваются на шаг по кругу — так же, как при свайпе. rot измеряется в шагах между обложками и бежит к 0.
+    // Выставляем его прямо в композиции, чтобы первый кадр с новым треком уже стоял «в начале» поворота (без мигания).
     var rot by remember { mutableFloatStateOf(0f) }
     val memo = remember { SwitchMemo() }
     remember(t.id) {
         val old = memo.id
         val dir = when {
             old == null || old == t.id || memo.bySwipe -> 0
-            live.first?.id == old -> 1
-            live.third?.id == old -> -1
-            else -> 0
+            live.first?.id == old -> 1   // ушли вперёд: прежняя обложка теперь слева
+            live.third?.id == old -> -1  // ушли назад: прежняя обложка теперь справа
+            else -> 0                    // прыжок на далёкий трек — старая «влетающая» анимация
         }
         memo.ringDir = dir
         if (dir != 0) rot = (rot + dir).coerceIn(-1f, 1f)
         dir
     }
 
+    // Анимация смены трека: новая обложка «влетает» с поворотом и пружинным отскоком. Если трек сменили свайпом —
+    // обложка уже приехала за пальцем, поэтому там только лёгкий «толчок» масштаба.
     val pop = remember { Animatable(1f) }
     LaunchedEffect(t.id) {
         val oldId = memo.id
@@ -11811,6 +13278,7 @@ private fun PlayerCover(
         val ringed = memo.ringDir != 0
         memo.bySwipe = false
         memo.dir = if (fwd) 1 else -1
+        // Свайп и поворот кольца уже сами привезли обложку — «влёт» с поворотом нужен только при прыжке на далёкий трек.
         val soft = bySwipe || ringed
         memo.travel = if (soft) 0f else 0.55f
         memo.wobble = if (soft) 0f else 14f
@@ -11835,6 +13303,7 @@ private fun PlayerCover(
         if (side >= 72.dp) {
             Box(
                 Modifier.fillMaxSize().pointerInput(side) {
+                    // Вибро-тики при пролистывании обложки — по шагам, как у ползунка перемотки.
                     var lastTick = 0
                     detectHorizontalDragGestures(
                         onDragStart = { lastTick = 0; scope.launch { offset.stop() } },
@@ -11870,6 +13339,7 @@ private fun PlayerCover(
                         change.consume()
                         val (prev, _, next) = trioNow
                         val target = offset.value + drag
+                        // Если в эту сторону трека нет — обложка «тянется» с сопротивлением и возвращается.
                         val blocked = (target < 0 && next == null) || (target > 0 && prev == null)
                         val moved = if (blocked) offset.value + drag * 0.3f else target
                         val step = swipeTickStep(moved, sidePx)
@@ -11879,6 +13349,8 @@ private fun PlayerCover(
                 },
                 contentAlignment = Alignment.Center,
             ) {
+                // Свечение рисуется отдельно от обложек и вне их обрезки: в альбомной ориентации соседние обложки
+                // прячутся по краю панели, а свет должен выходить за него и не упираться в рамки.
                 Spacer(
                     Modifier.size(side)
                         .graphicsLayer {
@@ -11886,6 +13358,7 @@ private fun PlayerCover(
                             val near = if (rot == 0f) {
                                 (1f - kotlin.math.abs(offset.value) / stepPx).coerceIn(0f, 1f)
                             } else {
+                                // Идёт поворот кольца: свет остаётся по центру и «дышит» между уходящей и приходящей обложкой.
                                 val u = offset.value / stepPx + rot
                                 (1f - 2f * kotlin.math.abs(u - Math.round(u))).coerceIn(0f, 1f)
                             }
@@ -11894,7 +13367,7 @@ private fun PlayerCover(
                         }
                         .playGlow(
                             active = isPlaying, enabled = ThemeSettings.glowPlayer,
-                            color = MaterialTheme.colorScheme.primary,
+                            color = glowColor,
                             cornerRadius = corner.dp, spread = 44.dp, strength = 0.7f,
                             shape = rounded(corner),
                         ),
@@ -11913,10 +13386,15 @@ private fun PlayerCover(
                                     val x = offset.value + (rot + k) * stepPx
                                     translationX = x
                                     val near = (1f - kotlin.math.abs(x) / stepPx).coerceIn(0f, 1f)
+                                    // Кольцо: обложка, уходящая вбок, «заезжает за спину» — уменьшается, приподнимается
+                                    // и тускнеет, а приходящая так же выезжает вперёд. Центральная всегда сверху.
                                     translationY = -(1f - near) * sidePx * 0.07f
+                                    // Соседние обложки видны только пока их тянут или проворачивают: в покое они полностью
+                                    // прозрачны и не выглядывают по бокам полосами.
                                     alpha = if (onTop) 0.45f + 0.55f * near else near * near
                                     var sc = coverScale * (0.8f + 0.2f * near)
                                     if (onTop) {
+                                        // «Прикольная» анимка смены трека (pop идёт 0 → 1 с перелётом).
                                         val p = pop.value
                                         translationX = x + (1f - p) * memo.travel * sidePx * memo.dir
                                         rotationZ = (1f - p) * memo.wobble * memo.dir
@@ -11938,6 +13416,7 @@ private fun PlayerCover(
                     Slot(trio.third, 1, false)
                     Slot(trio.second, 0, true)
                 }
+                // Кнопка «Волна по…» в углу обложки: при свайпе гаснет, чтобы не мешать.
                 if (onWaveFrom != null && frozen == null) {
                     Box(
                         Modifier.size(side).graphicsLayer { scaleX = coverScale; scaleY = coverScale },
@@ -11968,6 +13447,7 @@ private fun PlayerCover(
     }
 }
 
+/** Название, исполнители (нажатие открывает исполнителя) и альбом (нажатие открывает альбом). */
 @Composable
 private fun PlayerTrackInfo(vm: AppViewModel, t: Track, onNav: () -> Unit) {
     Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -11978,6 +13458,7 @@ private fun PlayerTrackInfo(vm: AppViewModel, t: Track, onNav: () -> Unit) {
             )
             if (t.explicit) { Spacer(Modifier.width(8.dp)); ExplicitMark(size = 18) }
         }
+        // Приписка к названию («минус», «a.k.a. …»): нажатие открывает информацию о треке.
         t.version?.let { v ->
             val showInfo = LocalShowTrackInfo.current
             Text(
@@ -12010,7 +13491,9 @@ private fun PlayerTrackInfo(vm: AppViewModel, t: Track, onNav: () -> Unit) {
         }
         val album = t.albumTitle?.takeIf { it.isNotBlank() }
         if (album != null) {
+            // Альбом — выразительная «таблетка» Material 3: тональный фон, значок, название и стрелка перехода.
             val albumId = t.albumId
+            // Файл с устройства: нажатие открывает его альбом среди файлов (режим «Локальные файлы»).
             val deviceAlbum = albumId == null && t.isLocal && LocalModeSettings.enabled
             val shape = containerShape(20)
             Row(
@@ -12079,6 +13562,7 @@ private fun PlayerControls(vm: AppViewModel, isPlaying: Boolean, seek: SeekUi, s
             }
         }
         if (style.circular) {
+            // Круговой индикатор вокруг кнопки: по кольцу можно перематывать
             M3CircularSeek(
                 value = seek.shown, onValueChange = seek.onChange, onValueChangeFinished = seek.onFinish, haptic = true,
                 size = maxOf(92.dp, circularRingSize(64.dp, style.thickness.dp, style.wavy)),
@@ -12096,16 +13580,17 @@ private fun PlayerBottomRow(vm: AppViewModel, t: Track, lyricsOn: Boolean, onLyr
     val s by vm.state.collectAsStateWithLifecycle()
     val isLiked = s.liked.any { it.id == t.id }
     val isDisliked = t.id in s.dislikedIds
+    // Порядок, видимость и размер кнопок задаются в редакторе интерфейса (вкладка «Плеер»).
     val btnOrder = UiLayout.order(LScreen.PLAYER, PlayerBtn.entries)
-    Row(
-        Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
+    // Кнопки, которые не помещаются (растянули или увеличили), переносятся на следующую строку, а не наезжают на соседей.
+    WrapRow(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         btnOrder.forEach { btn ->
             if (UiLayout.isHidden(LScreen.PLAYER, btn)) return@forEach
             if ((btn == PlayerBtn.Dislike || btn == PlayerBtn.Like) && t.isLocal) return@forEach
-            if (btn == PlayerBtn.Gap) { Spacer(Modifier.weight(1f)); return@forEach }
+            if (btn == PlayerBtn.Gap) { Spacer(Modifier.wrapFill().layoutEdit(LScreen.PLAYER, btn)); return@forEach }
             ZoomBox(UiLayout.playerBtnZoom * UiLayout.zoom(LScreen.PLAYER, btn)) {
+              Box(Modifier.layoutEdit(LScreen.PLAYER, btn)) {
+              SpanBox(UiLayout.span(LScreen.PLAYER, btn).coerceAtLeast(1), 48.dp) {
                 when (btn) {
                     PlayerBtn.Output -> {
             IconButton(onClick = onOutput) {
@@ -12114,6 +13599,7 @@ private fun PlayerBottomRow(vm: AppViewModel, t: Track, lyricsOn: Boolean, onLyr
                     }
                     PlayerBtn.More -> {
             if (!t.isLocal) {
+                // «⋮»: скачать любой трек (не только из лайков), информация о треке, добавить в плейлист.
                 val dl by vm.downloads.collectAsStateWithLifecycle()
                 val downloaded = dl.items.any { it.id == t.id }
                 val progress = dl.progress[t.id]
@@ -12138,11 +13624,13 @@ private fun PlayerBottomRow(vm: AppViewModel, t: Track, lyricsOn: Boolean, onLyr
                             leadingIcon = { Icon(painterResource(R.drawable.ms_add), null) },
                             onClick = { menu = false; addToPlaylist(t) },
                         )
+                        MixNextMenuItem(vm) { menu = false }
                         TrackActionItems(t) { menu = false }
                     }
                 }
             }
             if (t.isLocal) {
+                // У файла с устройства меню короче: свой исполнитель и обложка, отправить файл.
                 val editLocal = LocalEditLocalTrack.current
                 val localCtx = LocalContext.current
                 var lmenu by remember { mutableStateOf(false) }
@@ -12151,6 +13639,7 @@ private fun PlayerBottomRow(vm: AppViewModel, t: Track, lyricsOn: Boolean, onLyr
                         Icon(painterResource(R.drawable.ms_more_vert), contentDescription = "Ещё")
                     }
                     DropdownMenu(expanded = lmenu, onDismissRequest = { lmenu = false }) {
+                        MixNextMenuItem(vm) { lmenu = false }
                         DropdownMenuItem(
                             text = { Text("Изменить название, исполнителя и обложку") },
                             leadingIcon = { Icon(painterResource(R.drawable.ms_edit), null) },
@@ -12166,11 +13655,13 @@ private fun PlayerBottomRow(vm: AppViewModel, t: Track, lyricsOn: Boolean, onLyr
             }
                     }
                     PlayerBtn.Repeat -> {
+            // Пока играет «Моя волна», на месте «Повтора» (для бесконечной волны он не нужен) стоит «Встряхнуть»:
+            // так в ряду остаётся столько же кнопок, и плеер не растягивается и не прокручивается.
             Crossfade(targetState = s.waveOn, animationSpec = tween(fxMs(200)), label = "repeatOrShake") { wave ->
                 if (wave) {
                     IconButton(onClick = { vm.restartWave() }, enabled = !s.waveLoading) {
                         if (s.waveLoading) LoadingIndicator(Modifier.size(28.dp))
-                        else Icon(painterResource(R.drawable.ms_refresh), contentDescription = "Встряхнуть Мою волну")
+                        else Icon(painterResource(R.drawable.ms_refresh), contentDescription = if (ActiveProvider.isVk) "Встряхнуть VK Микс" else if (ActiveProvider.isSc) "Встряхнуть волну" else "Встряхнуть Мою волну")
                     }
                 } else {
                 val repeatOn = s.repeatMode != androidx.media3.common.Player.REPEAT_MODE_OFF
@@ -12197,7 +13688,15 @@ private fun PlayerBottomRow(vm: AppViewModel, t: Track, lyricsOn: Boolean, onLyr
                 )
             }
                     }
-                    PlayerBtn.Dislike -> {
+                    PlayerBtn.Mix -> {
+            IconButton(onClick = { MixSession.openFromPlayer(t) }) {
+                Icon(
+                    painterResource(R.drawable.ms_graphic_eq), contentDescription = "Микс треков",
+                    tint = if (MixSession.isActiveFor(t)) MaterialTheme.colorScheme.primary else LocalContentColor.current,
+                )
+            }
+                    }
+                    PlayerBtn.Dislike -> if (ActiveProvider.caps.dislikes) {
             IconToggleButton(checked = isDisliked, onCheckedChange = { vm.toggleDislike(t) }) {
                 Icon(
                     painterResource(if (isDisliked) R.drawable.ms_thumb_down else R.drawable.ms_thumb_down_outline),
@@ -12217,11 +13716,17 @@ private fun PlayerBottomRow(vm: AppViewModel, t: Track, lyricsOn: Boolean, onLyr
                     }
                     PlayerBtn.Gap -> Unit
                 }
+              }
+              }
             }
         }
     }
 }
 
+/**
+ * Полный плеер без прокрутки: обложка занимает всё свободное место (сжимается на маленьких экранах),
+ * остальное — компактный блок управления. В альбомной ориентации обложка слева, управление справа.
+ */
 @Composable
 private fun FullPlayer(
     vm: AppViewModel,
@@ -12238,27 +13743,41 @@ private fun FullPlayer(
     val style = ThemeSettings.seekStyle
     var lyricsFull by remember { mutableStateOf(false) }
     var showWaveFrom by remember { mutableStateOf(false) }
+    // Выбранный вручную источник текста действует и на панели, и на весь экран; при смене трека сбрасывается.
     var lyricsPick by remember(t.id) { mutableStateOf<String?>(null) }
 
+    // На месте обложки — либо она сама (со свайпом для смены трека), либо текст песни.
     @Composable
     fun CoverOrLyrics(modifier: Modifier, clipCovers: Boolean = false) {
+        // Обложка остаётся в композиции всё время и лишь гаснет, а текст кладётся поверх в тех же границах. Раньше здесь был
+        // Crossfade: он пересоздавал обложку и на секунду мерил её по размеру блока текста — отсюда обрезка при открытии текста.
+        val lyricsA by animateFloatAsState(if (showLyrics) 1f else 0f, tween(fxMs(220)), label = "coverLyrics")
         Box(modifier) {
-            Crossfade(targetState = showLyrics, animationSpec = tween(fxMs(220)), label = "coverLyrics") { on ->
-                if (on) LyricsPanel(vm, t, s.isPlaying, lyricsPick, { lyricsPick = it }, { lyricsFull = true }, Modifier.fillMaxSize())
-                else PlayerCover(
-                    vm, t, s.isPlaying, Modifier.fillMaxSize(), clipCovers,
-                    onWaveFrom = if (s.loggedIn && !t.isLocal) ({ showWaveFrom = true }) else null,
+            PlayerCover(
+                vm, t, s.isPlaying,
+                Modifier.fillMaxSize().graphicsLayer { alpha = 1f - lyricsA; compositingStrategy = androidx.compose.ui.graphics.CompositingStrategy.ModulateAlpha },
+                clipCovers,
+                onWaveFrom = if (s.loggedIn && !t.isLocal && !showLyrics) ({ showWaveFrom = true }) else null,
+            )
+            if (showLyrics || lyricsA > 0.001f) {
+                // pointerInput не даёт касаниям (свайп по пустым местам текста) проваливаться к обложке под ним и менять трек.
+                LyricsPanel(
+                    vm, t, s.isPlaying, lyricsPick, { lyricsPick = it }, { lyricsFull = true },
+                    Modifier.fillMaxSize().graphicsLayer { alpha = lyricsA }.pointerInput(Unit) { detectTapGestures { } },
                 )
             }
         }
     }
 
+    // Части плеера (обложка, название, перемотка, управление, громкость, нижний ряд кнопок): порядок, видимость,
+    // размер и отступы — в редакторе интерфейса (вкладка «Плеер»).
     val partOrder = UiLayout.order(LScreen.PLAYER_FULL, PlayerPart.entries)
 
     @Composable
     fun PartContent(p: PlayerPart) {
         when (p) {
             PlayerPart.Info -> {
+                // При смене трека название и исполнители «выпрыгивают» снизу, а старые уезжают вверх.
                 AnimatedContent(
                     targetState = t,
                     contentKey = { it.id },
@@ -12291,10 +13810,12 @@ private fun FullPlayer(
         }
     }
 
+    // Одна часть управления с отступом сверху «как было» и размером / отступами из редактора.
     @Composable
     fun PartSlot(p: PlayerPart) {
         if (p == PlayerPart.Cover) return
         if (UiLayout.isHidden(LScreen.PLAYER_FULL, p)) return
+        // В альбомной ориентации нижний ряд кнопок перенесён в шапку (см. PlayerSheet).
         if (p == PlayerPart.Buttons && landscape) return
         if (p == PlayerPart.Volume && !PlayerSettings.fullVolume) return
         val top = when (p) {
@@ -12325,13 +13846,17 @@ private fun FullPlayer(
                 horizontalArrangement = Arrangement.spacedBy(if (widePlayer) 40.dp else 24.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                // Обложка слева, если в редакторе она стоит выше блока «Кнопки управления», иначе справа.
                 val coverFirst = partOrder.indexOf(PlayerPart.Cover) < partOrder.indexOf(PlayerPart.Controls)
 
                 @Composable
                 fun CoverSlot() {
-                    if (!coverHidden) CoverOrLyrics(Modifier.weight(1f).fillMaxHeight(), clipCovers = true)
+                    // Соседние обложки при свайпе выезжают за край и прячутся за ним, а не заходят под элементы управления.
+                    if (!coverHidden) CoverOrLyrics(Modifier.weight(1f).fillMaxHeight().layoutEdit(LScreen.PLAYER_FULL, PlayerPart.Cover), clipCovers = true)
                 }
                 if (coverFirst) CoverSlot()
+                // Блок управления никогда не прокручивается: если он выше экрана (низкая альбомная ориентация),
+                // он сам немного уменьшается и по центру помещается целиком.
                 androidx.compose.ui.layout.Layout(
                     content = { Controls(Modifier) },
                     modifier = Modifier.weight(1f).fillMaxHeight(),
@@ -12350,10 +13875,12 @@ private fun FullPlayer(
                 if (!coverFirst) CoverSlot()
             }
         } else {
+            // На планшете в портретной ориентации плеер не растягивается на весь экран: колонка не шире 640 dp, по центру.
             Column(
                 Modifier.align(Alignment.TopCenter).widthIn(max = if (LocalWide.current) 640.dp else Dp.Infinity).fillMaxSize().padding(bottom = 8.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
+                // Без обложки управление уходит вниз, как и раньше.
                 if (coverHidden) Spacer(Modifier.weight(1f))
                 partOrder.forEach { p ->
                     if (p == PlayerPart.Cover) {
@@ -12363,7 +13890,7 @@ private fun FullPlayer(
                                     .padding(
                                         start = UiLayout.padH(LScreen.PLAYER_FULL, p).dp, top = UiLayout.gap(LScreen.PLAYER_FULL, p).dp,
                                         end = UiLayout.padH(LScreen.PLAYER_FULL, p).dp, bottom = UiLayout.gapBottom(LScreen.PLAYER_FULL, p).dp,
-                                    ),
+                                    ).layoutEdit(LScreen.PLAYER_FULL, p),
                             ) { CoverOrLyrics(Modifier.fillMaxSize()) }
                             Spacer(Modifier.height(8.dp))
                         }
@@ -12377,6 +13904,10 @@ private fun FullPlayer(
     if (lyricsFull) LyricsFullscreen(vm, t, s.isPlaying, s.durationMs, lyricsPick, { lyricsPick = it }) { lyricsFull = false }
 }
 
+/**
+ * Громкость в полном плеере: значок динамика слева сворачивает и разворачивает ползунок (выбор запоминается),
+ * ползунок занимает всю оставшуюся ширину строки и не выходит за рамки плеера. Полностью выключается в Настройки → Плеер.
+ */
 @Composable
 private fun PlayerVolumeRow(vm: AppViewModel, playing: Boolean, style: SeekBarStyle) {
     val vol = rememberVolume(vm, true)
@@ -12405,26 +13936,51 @@ private fun PlayerVolumeRow(vm: AppViewModel, playing: Boolean, style: SeekBarSt
     }
 }
 
-private fun LyricsSource.chipLabel(): String = if (isSynced) "$name · в такт" else name
+/** Подпись источника на переключателе: «LRCLIB · в такт» — если у текста есть таймкоды. */
+private fun LyricsSource.chipLabel(): String {
+    val base = when (id) {
+        "pin" -> "Закреплён · $name"
+        "manual" -> "Вручную · $name"
+        else -> name
+    }
+    return if (isSynced) "$base · в такт" else base
+}
 
+/**
+ * Источник, который показываем: выбранный на переключателе, затем найденный вручную («manual»),
+ * затем привязанный к треку («pin»), иначе первый с таймкодами, иначе первый попавшийся.
+ */
 private fun pickLyricsSource(sources: List<LyricsSource>, pick: String?): LyricsSource? =
-    sources.firstOrNull { it.id == pick } ?: sources.firstOrNull { it.isSynced } ?: sources.firstOrNull()
+    sources.firstOrNull { it.id == pick } ?: sources.firstOrNull { it.id == "manual" } ?: sources.firstOrNull { it.id == "pin" }
+        ?: sources.firstOrNull { it.isSynced } ?: sources.firstOrNull()
 
 @Composable
-private fun LyricsSourceChips(sources: List<LyricsSource>, selected: String?, onPick: (String) -> Unit, modifier: Modifier = Modifier) {
+private fun LyricsSourceChips(
+    sources: List<LyricsSource>, selected: String?, onPick: (String) -> Unit, onSearch: () -> Unit, modifier: Modifier = Modifier,
+) {
     Row(
         modifier.horizontalScroll(rememberScrollState()),
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // Отдельная кнопка ручного поиска текста — всегда первая в ряду.
+        AssistChip(
+            onClick = onSearch,
+            label = { Text("Искать") },
+            leadingIcon = { Icon(painterResource(R.drawable.ms_search), null, Modifier.size(18.dp)) },
+        )
         sources.forEach { s ->
             FilterChip(selected = s.id == selected, onClick = { onPick(s.id) }, label = { Text(s.chipLabel()) })
         }
     }
 }
 
+/** Содержимое текста: загрузка, «не найден», строки в такт или обычный текст. [big] — крупный шрифт для полного экрана. */
 @Composable
-private fun LyricsBody(vm: AppViewModel, t: Track, playing: Boolean, cur: LyricsState, src: LyricsSource?, big: Boolean, modifier: Modifier = Modifier) {
+private fun LyricsBody(
+    vm: AppViewModel, t: Track, playing: Boolean, cur: LyricsState, src: LyricsSource?, big: Boolean,
+    onSearch: () -> Unit, modifier: Modifier = Modifier,
+) {
     Box(modifier.fillMaxWidth()) {
         when {
             src == null && !cur.done -> LoadingIndicator(Modifier.align(Alignment.Center))
@@ -12439,6 +13995,7 @@ private fun LyricsBody(vm: AppViewModel, t: Track, playing: Boolean, cur: Lyrics
                 )
                 Spacer(Modifier.height(8.dp))
                 TextButton(onClick = { vm.reloadLyrics(t) }) { Text("Искать снова") }
+                TextButton(onClick = onSearch) { Text("Искать самому") }
             }
             src.isSynced -> SyncedLyrics(vm, t.id, src.synced, playing, big)
             else -> Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 16.dp)) {
@@ -12452,6 +14009,11 @@ private fun LyricsBody(vm: AppViewModel, t: Track, playing: Boolean, cur: Lyrics
     }
 }
 
+/**
+ * Текст песни на месте обложки. Источников несколько: Яндекс Музыка, LRCLIB, NetEase, Kugou, QQ Music, Genius, lyrics.ovh.
+ * Тексты с таймкодами подсвечиваются в такт песне, по строке можно нажать и перемотать. Если текст нашли несколько
+ * источников, сверху появляется переключатель; по умолчанию берётся первый с таймкодами. Кнопка справа разворачивает текст на весь экран.
+ */
 @Composable
 private fun LyricsPanel(
     vm: AppViewModel, t: Track, playing: Boolean,
@@ -12462,6 +14024,9 @@ private fun LyricsPanel(
     LaunchedEffect(t.id) { vm.loadLyrics(t) }
     val cur = ly.takeIf { it.trackId == t.id } ?: LyricsState(trackId = t.id, loading = true)
     val src = pickLyricsSource(cur.sources, pick)
+    var searching by remember(t.id) { mutableStateOf(false) }
+    if (searching) LyricsSearchDialog(vm, t, onDismiss = { searching = false }) { id -> onPick(id); searching = false }
+    // Если у плеера свой фон (размытая обложка или матовое стекло), блок текста не закрывает его собственной подложкой.
     val playerHasOwnBg = !ThemeSettings.optimize && (PlayerSettings.playerBgBlur || GlassSettings.playerGlass)
     Surface(
         modifier, shape = containerShape(28),
@@ -12469,25 +14034,23 @@ private fun LyricsPanel(
     ) {
         Column(Modifier.fillMaxSize()) {
             Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                if (cur.sources.size > 1) LyricsSourceChips(cur.sources, src?.id, onPick, Modifier.weight(1f))
-                else Spacer(Modifier.weight(1f))
+                LyricsSourceChips(cur.sources, src?.id, onPick, { searching = true }, Modifier.weight(1f))
                 IconButton(onClick = onExpand) {
                     Icon(painterResource(R.drawable.ms_open_in_full), contentDescription = "Текст на весь экран")
                 }
             }
-            LyricsBody(vm, t, playing, cur, src, big = false, modifier = Modifier.weight(1f))
+            LyricsBody(vm, t, playing, cur, src, big = false, onSearch = { searching = true }, modifier = Modifier.weight(1f))
             if (src != null) {
-                Text(
-                    "Текст: ${src.name}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
-                )
+                LyricsFooter(vm, t, src, Modifier.padding(horizontal = 20.dp, vertical = 2.dp))
             }
         }
     }
 }
 
+/**
+ * Текст песни на весь экран: крупные строки в такт, сверху — трек и переключатель источников, снизу — перемотка,
+ * пауза/воспроизведение и переключение песен. При смене трека текст подгружается сам.
+ */
 @Composable
 private fun LyricsFullscreen(
     vm: AppViewModel, t: Track, playing: Boolean, durationMs: Long,
@@ -12497,6 +14060,8 @@ private fun LyricsFullscreen(
     LaunchedEffect(t.id) { vm.loadLyrics(t) }
     val cur = ly.takeIf { it.trackId == t.id } ?: LyricsState(trackId = t.id, loading = true)
     val src = pickLyricsSource(cur.sources, pick)
+    var searching by remember(t.id) { mutableStateOf(false) }
+    if (searching) LyricsSearchDialog(vm, t, onDismiss = { searching = false }) { id -> onPick(id); searching = false }
     val seek = rememberSeek(vm, t.id, durationMs, playing)
     val style = ThemeSettings.seekStyle
 
@@ -12504,9 +14069,17 @@ private fun LyricsFullscreen(
         onDismissRequest = onDismiss,
         properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
     ) {
+        // Фон: сильно размытая обложка трека (при «Оптимизации» — обычная поверхность), поверх — «матовое стекло» под текстом.
+        val glass = !ThemeSettings.optimize
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
+            if (glass) PlayerBackdrop(t)
             BoxWithConstraints(Modifier.fillMaxSize().systemBarsPadding().padding(horizontal = 16.dp)) {
                 val landscape = maxWidth > maxHeight * 1.1f
+                val glassMod = if (glass) Modifier
+                    .clip(rounded(28))
+                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.28f))
+                    .border(1.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = 0.10f), rounded(28))
+                else Modifier
 
                 @Composable
                 fun Header() {
@@ -12520,7 +14093,7 @@ private fun LyricsFullscreen(
                                 Text(t.artists, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
                         }
-                        if (cur.sources.size > 1) LyricsSourceChips(cur.sources, src?.id, onPick, Modifier.fillMaxWidth().padding(start = 4.dp, bottom = 4.dp))
+                        LyricsSourceChips(cur.sources, src?.id, onPick, { searching = true }, Modifier.fillMaxWidth().padding(start = 4.dp, bottom = 4.dp))
                     }
                 }
 
@@ -12537,12 +14110,7 @@ private fun LyricsFullscreen(
                         Spacer(Modifier.height(4.dp))
                         PlayerControls(vm, playing, seek, style)
                         if (src != null) {
-                            Text(
-                                "Текст: ${src.name}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(top = 8.dp),
-                            )
+                            LyricsFooter(vm, t, src, Modifier.padding(top = 4.dp))
                         }
                         Spacer(Modifier.height(8.dp))
                     }
@@ -12552,14 +14120,14 @@ private fun LyricsFullscreen(
                     Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
                         Column(Modifier.weight(1.4f).fillMaxHeight()) {
                             Header()
-                            LyricsBody(vm, t, playing, cur, src, big = true, modifier = Modifier.weight(1f))
+                            LyricsBody(vm, t, playing, cur, src, big = true, onSearch = { searching = true }, modifier = Modifier.weight(1f).then(glassMod))
                         }
                         Transport(Modifier.weight(1f).fillMaxHeight().verticalScroll(rememberScrollState()).wrapContentHeight(Alignment.CenterVertically))
                     }
                 } else {
                     Column(Modifier.fillMaxSize()) {
                         Header()
-                        LyricsBody(vm, t, playing, cur, src, big = true, modifier = Modifier.weight(1f))
+                        LyricsBody(vm, t, playing, cur, src, big = true, onSearch = { searching = true }, modifier = Modifier.weight(1f).then(glassMod))
                         Transport(Modifier.fillMaxWidth())
                     }
                 }
@@ -12568,6 +14136,204 @@ private fun LyricsFullscreen(
     }
 }
 
+/** Подпись «Текст: источник»; у привязанного к треку текста — пометка и кнопка «Открепить». */
+@Composable
+private fun LyricsFooter(vm: AppViewModel, t: Track, src: LyricsSource, modifier: Modifier = Modifier) {
+    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            if (src.id == "pin") "Текст: ${src.name} · закреплён за треком" else "Текст: ${src.name}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f, fill = false),
+        )
+        if (src.id == "pin") {
+            TextButton(onClick = { vm.unpinLyrics(t) }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
+                Text("Открепить", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+    }
+}
+
+/**
+ * Ручной поиск текста. Строка поиска как в поисковике: по мере набора все включённые в настройках источники
+ * предлагают варианты — исполнитель, название, источник и есть ли таймкоды («в такт»). Выбор варианта — с окном
+ * подтверждения и галочкой «Привязать текст к этому треку» (оба шага отключаются в настройках).
+ * [onPicked] получает id источника на переключателе («manual» или «pin»).
+ */
+@Composable
+private fun LyricsSearchDialog(vm: AppViewModel, t: Track, onDismiss: () -> Unit, onPicked: (String) -> Unit) {
+    var query by rememberSaveable { mutableStateOf("") }
+    val results = remember { mutableStateMapOf<String, List<LyricsCandidate>>() }
+    var pending by remember { mutableIntStateOf(0) }
+    var confirm by remember { mutableStateOf<LyricsCandidate?>(null) }
+    var applying by remember { mutableStateOf(false) }
+    val searchers = remember { vm.lyricsSearchers() }
+    val focus = remember { FocusRequester() }
+
+    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
+    LaunchedEffect(query) {
+        val q = query.trim()
+        if (q.length < 2) { results.clear(); pending = 0; return@LaunchedEffect }
+        delay(350)   // ждём, пока человек допишет
+        results.clear()
+        pending = searchers.size
+        coroutineScope {
+            searchers.forEach { s ->
+                launch {
+                    val r = try { s.search(q) } catch (e: CancellationException) { throw e } catch (e: Exception) { emptyList() }
+                    results[s.id] = r
+                    pending--
+                }
+            }
+        }
+    }
+
+    fun apply(c: LyricsCandidate, pin: Boolean) {
+        if (applying) return
+        applying = true
+        vm.applyLyricsCandidate(t, c, pin) { id ->
+            applying = false
+            if (id != null) onPicked(id)
+        }
+    }
+
+    // Варианты разных источников чередуются: сначала лучший у каждого, потом вторые и т. д.
+    val lists = searchers.map { results[it.id].orEmpty() }
+    val merged = buildList {
+        for (rank in 0 until (lists.maxOfOrNull { it.size } ?: 0)) lists.forEach { l -> l.getOrNull(rank)?.let(::add) }
+    }
+
+    androidx.compose.ui.window.Dialog(
+        onDismissRequest = onDismiss,
+        properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false),
+    ) {
+        Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.surface) {
+            Column(Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
+                Row(Modifier.fillMaxWidth().padding(start = 4.dp, end = 12.dp, top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onDismiss) {
+                        Icon(painterResource(R.drawable.ms_arrow_back), contentDescription = "Назад")
+                    }
+                    OutlinedTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        singleLine = true,
+                        placeholder = { Text("Исполнитель или название") },
+                        leadingIcon = { Icon(painterResource(R.drawable.ms_search), null) },
+                        trailingIcon = {
+                            if (query.isNotEmpty()) {
+                                IconButton(onClick = { query = "" }) {
+                                    Icon(painterResource(R.drawable.ms_close), contentDescription = "Очистить")
+                                }
+                            }
+                        },
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        shape = rounded(28),
+                        modifier = Modifier.weight(1f).focusRequester(focus),
+                    )
+                }
+                Box(Modifier.fillMaxWidth().height(4.dp).padding(horizontal = 16.dp, vertical = 1.dp)) {
+                    if (pending > 0) LinearProgressIndicator(Modifier.fillMaxSize())
+                }
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    when {
+                        merged.isNotEmpty() -> LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {
+                            itemsIndexed(merged, key = { i, c -> "$i|${c.key}" }) { _, c ->
+                                ListItem(
+                                    headlineContent = { Text(c.title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                    supportingContent = {
+                                        Column {
+                                            Text(c.artist, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                                Text(c.sourceName, style = MaterialTheme.typography.labelMedium)
+                                                Text(" · ", style = MaterialTheme.typography.labelMedium)
+                                                Text(
+                                                    if (c.synced) "в такт" else "без тактов",
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = if (c.synced) FontWeight.SemiBold else FontWeight.Normal,
+                                                    color = if (c.synced) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                )
+                                            }
+                                        }
+                                    },
+                                    trailingContent = {
+                                        if (c.durationMs > 0) {
+                                            val sec = c.durationMs / 1000
+                                            Text("%d:%02d".format(sec / 60, sec % 60), style = MaterialTheme.typography.labelMedium)
+                                        }
+                                    },
+                                    modifier = Modifier.clickable {
+                                        if (PlayerSettings.lyricsConfirm) confirm = c
+                                        else apply(c, PlayerSettings.lyricsPin)
+                                    },
+                                )
+                            }
+                        }
+                        pending > 0 -> LoadingIndicator(Modifier.align(Alignment.Center))
+                        else -> Text(
+                            if (query.trim().length < 2) "Начните вводить название песни или исполнителя — варианты появятся из всех включённых источников"
+                            else "Ничего не найдено",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            modifier = Modifier.align(Alignment.Center).padding(32.dp),
+                        )
+                    }
+                    if (applying) {
+                        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f)), contentAlignment = Alignment.Center) {
+                            LoadingIndicator()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    confirm?.let { c ->
+        var pin by remember(c) { mutableStateOf(true) }
+        AlertDialog(
+            onDismissRequest = { confirm = null },
+            title = { Text("Использовать этот текст?") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    Text(c.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(c.artist, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        "${c.sourceName} · ${if (c.synced) "в такт" else "без тактов"}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = if (c.synced) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                    c.preview?.let { pv ->
+                        Surface(
+                            shape = containerShape(16), color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            modifier = Modifier.fillMaxWidth().padding(top = 12.dp),
+                        ) {
+                            Text(pv, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(12.dp), maxLines = 4, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                    if (PlayerSettings.lyricsPin) {
+                        Row(
+                            Modifier.fillMaxWidth().padding(top = 8.dp).clip(containerShape(16)).clickable { pin = !pin }.padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Checkbox(checked = pin, onCheckedChange = { pin = it })
+                            Text("Привязать текст к этому треку", Modifier.padding(start = 4.dp), style = MaterialTheme.typography.bodyLarge)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { confirm = null; apply(c, PlayerSettings.lyricsPin && pin) }) { Text("Выбрать") }
+            },
+            dismissButton = { TextButton(onClick = { confirm = null }) { Text("Отмена") } },
+        )
+    }
+}
+
+/**
+ * Текст с таймкодами: текущая строка подсвечена и держится в верхней части панели, нажатие на строку перематывает к ней.
+ * Длинная строка не обрезается: шрифт сам уменьшается, пока строка не поместится в панель (в том числе в низкой, альбомной).
+ */
 @Composable
 private fun SyncedLyrics(vm: AppViewModel, trackId: String, lines: List<LyricLine>, playing: Boolean, big: Boolean = false) {
     var pos by remember(trackId) { mutableLongStateOf(vm.livePosition()) }
@@ -12577,41 +14343,64 @@ private fun SyncedLyrics(vm: AppViewModel, trackId: String, lines: List<LyricLin
     }
     val idx = lines.indexOfLast { it.timeMs <= pos + 250 }
     val listState = rememberLazyListState()
-    LaunchedEffect(idx) {
-        if (idx >= 0 && !listState.isScrollInProgress) {
-            listState.animateScrollToItem(idx, scrollOffset = -(listState.layoutInfo.viewportSize.height / 3))
-        }
-    }
+    // Раньше к отступу списка добавлялся ещё и сдвиг строки на треть высоты: в низкой панели строка уезжала к нижнему краю и обрезалась.
+    // Теперь отступ сверху — доля высоты панели, строка встаёт точно в его начало, а снизу отступ нужен, чтобы последние строки могли подняться.
     val base = MaterialTheme.colorScheme.onSurface
+    // Размытие строк: чем дальше строка от текущей, тем она мутнее. Пока текст листают пальцем, он чёткий, чтобы его можно было читать.
+    // В плеере и на весь экран размытие включается отдельными переключателями.
     val blurOn = (if (big) PlayerSettings.lyricsBlurFull else PlayerSettings.lyricsBlur) && !ThemeSettings.optimize && android.os.Build.VERSION.SDK_INT >= 31
     val scrolling = listState.isScrollInProgress
-    LazyColumn(Modifier.fillMaxSize(), state = listState, contentPadding = PaddingValues(horizontal = 16.dp, vertical = 96.dp)) {
-        itemsIndexed(lines) { i, l ->
-            val color by animateColorAsState(if (i == idx) base else base.copy(alpha = 0.38f), tween(fxMs(250)), label = "lyricLine")
-            val blurTarget = if (!blurOn || scrolling || idx < 0 || i == idx) 0f else (1.5f + kotlin.math.abs(i - idx) * 1.2f).coerceAtMost(6f)
-            val blurDp by animateFloatAsState(blurTarget, tween(fxMs(300)), label = "lyricBlur")
-            Text(
-                l.text.ifBlank { "♪" },
-                style = if (big) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-                color = color,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .graphicsLayer {
-                        val r = blurDp * density
-                        if (r > 0.5f) renderEffect = androidx.compose.ui.graphics.BlurEffect(r, r, androidx.compose.ui.graphics.TileMode.Decal)
-                    }
-                    .clip(textShape(10)).clickable { vm.seekTo(l.timeMs) }.padding(horizontal = 4.dp, vertical = if (big) 10.dp else 8.dp),
-            )
+    val lineStyle = if (big) MaterialTheme.typography.headlineMedium else MaterialTheme.typography.titleLarge
+    val baseSp = lineStyle.fontSize.value
+    val itemPad = if (big) 10.dp else 8.dp
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val heightPx = with(androidx.compose.ui.platform.LocalDensity.current) { maxHeight.toPx() }
+        val itemPadPx = with(androidx.compose.ui.platform.LocalDensity.current) { (itemPad * 2).toPx() }
+        val topPad = maxHeight * 0.18f
+        // Строка начинается на 18% высоты и должна целиком уместиться в оставшееся место с небольшим запасом снизу.
+        val maxLinePx = (heightPx * 0.74f - itemPadPx).coerceAtLeast(40f)
+        LaunchedEffect(idx) {
+            if (idx >= 0 && !listState.isScrollInProgress) listState.animateScrollToItem(idx, scrollOffset = 0)
+        }
+        LazyColumn(
+            Modifier.fillMaxSize(), state = listState,
+            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = topPad, bottom = maxHeight * 0.8f),
+        ) {
+            itemsIndexed(lines) { i, l ->
+                val color by animateColorAsState(if (i == idx) base else base.copy(alpha = 0.38f), tween(fxMs(250)), label = "lyricLine")
+                val blurTarget = if (!blurOn || scrolling || idx < 0 || i == idx) 0f else (1.5f + kotlin.math.abs(i - idx) * 1.2f).coerceAtMost(6f)
+                val blurDp by animateFloatAsState(blurTarget, tween(fxMs(300)), label = "lyricBlur")
+                // Подгонка размера: если строка выше доступного места, шрифт уменьшается ступенями (не меньше 45% обычного).
+                var fs by remember(l.text, baseSp, maxLinePx) { mutableFloatStateOf(baseSp) }
+                Text(
+                    l.text.ifBlank { "♪" },
+                    style = lineStyle,
+                    fontSize = fs.sp,
+                    lineHeight = (fs * 1.25f).sp,
+                    fontWeight = FontWeight.Bold,
+                    color = color,
+                    onTextLayout = { r ->
+                        if (r.size.height > maxLinePx && fs > baseSp * 0.45f) fs = (fs * 0.92f).coerceAtLeast(baseSp * 0.45f)
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .graphicsLayer {
+                            val r = blurDp * density
+                            if (r > 0.5f) renderEffect = androidx.compose.ui.graphics.BlurEffect(r, r, androidx.compose.ui.graphics.TileMode.Decal)
+                        }
+                        .clip(textShape(10)).clickable { vm.seekTo(l.timeMs) }.padding(horizontal = 4.dp, vertical = itemPad),
+                )
+            }
         }
     }
 }
 
-private fun seekTime(ms: Long): String {
+internal fun seekTime(ms: Long): String {
     val total = (ms / 1000).coerceAtLeast(0)
     return "%d:%02d".format(total / 60, total % 60)
 }
 
+/** Типы устройств вывода, которые имеет смысл предлагать (динамик, проводные, Bluetooth, USB, HDMI и т.д.). */
 private val OutputTypes = setOf(2, 3, 4, 8, 9, 11, 12, 22, 23, 26, 27, 30)
 
 private fun outputLabel(d: android.media.AudioDeviceInfo): String {
@@ -12625,6 +14414,7 @@ private fun outputLabel(d: android.media.AudioDeviceInfo): String {
     }
 }
 
+/** Выбор устройства вывода звука: «Авто», подключённые к телефону и колонки/устройства Яндекса (как в Яндекс Музыке). */
 @Composable
 private fun AudioOutputDialog(vm: AppViewModel, onDismiss: () -> Unit) {
     val ctx = LocalContext.current
@@ -12634,12 +14424,14 @@ private fun AudioOutputDialog(vm: AppViewModel, onDismiss: () -> Unit) {
         val am = ctx.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
         am.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS).filter { it.type in OutputTypes }
     }
+    // Список колонок приходит из аккаунта Яндекса; закрыли окно, а на колонке ничего не играет — соединение закрываем.
     DisposableEffect(Unit) {
         vm.openConnect()
         onDispose { vm.connectDialogClosed() }
     }
     val remoteId = if (vm.remoteActive()) cs.remoteId else null
     val yandexDevices = cs.devices.filter { it.canPlay && !it.offline }
+    // Вход в Яндекс для управления колонкой по Wi-Fi (Glagol): cookies берутся из WebView.
     var showStationLogin by remember { mutableStateOf(false) }
     @Composable
     fun Option(label: String, isSelected: Boolean, sub: String? = null, icon: Int? = null, onPick: () -> Unit) {
@@ -12669,6 +14461,7 @@ private fun AudioOutputDialog(vm: AppViewModel, onDismiss: () -> Unit) {
         title = { Text("Вывод звука") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
+                // Выбор любого из этих вариантов возвращает музыку с колонки на телефон.
                 Option("Авто (как выберет система)", remoteId == null && selected == null) {
                     vm.releaseConnect(); vm.setAudioOutput(null); onDismiss()
                 }
@@ -12738,7 +14531,11 @@ private fun AudioOutputDialog(vm: AppViewModel, onDismiss: () -> Unit) {
     }
 }
 
+
+// ---------- Обновления (GitHub releases) ----------
+
 private fun openUrl(ctx: Context, url: String) {
+    // Адрес приходит из ответа GitHub: открываем только https, чтобы не запустить чужую схему (intent:, file: и т.п.).
     if (!url.startsWith("https://", ignoreCase = true)) return
     runCatching {
         ctx.startActivity(
@@ -12748,6 +14545,7 @@ private fun openUrl(ctx: Context, url: String) {
     }
 }
 
+/** Настройки → Обновления: ветка (stable / beta), проверка при запуске и ручная проверка. */
 @Composable
 private fun UpdatesPage(onBack: () -> Unit) {
     val ctx = LocalContext.current
@@ -12806,10 +14604,12 @@ private fun UpdatesPage(onBack: () -> Unit) {
     }
 }
 
+/** Алерт внизу экрана: найдено обновление при проверке на запуске. */
 @Composable
 private fun UpdateBanner() {
     val info = Updates.banner
     val ctx = LocalContext.current
+    // Держим последнее найденное, чтобы карточка красиво уезжала, а не пустела.
     var last by remember { mutableStateOf<UpdateInfo?>(null) }
     if (info != null) last = info
     AnimatedVisibility(
@@ -12846,6 +14646,7 @@ private fun UpdateBanner() {
     }
 }
 
+/** Модалка с итогом ручной проверки: есть обновление / стоит последняя версия / ошибка. */
 @Composable
 private fun UpdateDialog() {
     val res = Updates.dialog ?: return

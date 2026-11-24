@@ -17,6 +17,14 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 
+/**
+ * Наклон телефона по горизонтали от −1 до 1 (по акселерометру), с учётом поворота экрана.
+ * Положительное значение — правый край экрана ниже левого (вода «стекает» вправо).
+ *
+ * Датчик слушается только пока [enabled] и экран на переднем плане (RESUMED); при выходе из композиции
+ * или сворачивании приложения слушатель снимается, поэтому батарею это не тратит.
+ * Если акселерометра в телефоне нет, всегда 0.
+ */
 @Composable
 fun rememberTilt(enabled: Boolean): State<Float> {
     val ctx = LocalContext.current
@@ -34,6 +42,7 @@ fun rememberTilt(enabled: Boolean): State<Float> {
         val listener = object : SensorEventListener {
             override fun onSensorChanged(e: SensorEvent) {
                 if (e.values.size < 2) return
+                // Ось X датчика привязана к корпусу, а не к экрану: при повороте экрана берём ту ось, что стала «горизонтальной».
                 val rot = runCatching { view.display?.rotation }.getOrNull() ?: Surface.ROTATION_0
                 val sx = when (rot) {
                     Surface.ROTATION_90 -> -e.values[1]
@@ -41,6 +50,7 @@ fun rememberTilt(enabled: Boolean): State<Float> {
                     Surface.ROTATION_270 -> e.values[1]
                     else -> e.values[0]
                 }
+                // Датчик показывает реакцию опоры, т. е. при наклоне вправо X отрицательный — поэтому минус.
                 val target = (-sx / 6f).coerceIn(-1f, 1f)
                 smooth += (target - smooth) * 0.35f
                 tilt.floatValue = smooth

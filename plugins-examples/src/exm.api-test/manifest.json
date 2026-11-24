@@ -1,0 +1,83 @@
+{
+  "id": "exm.api-test",
+  "name": "Тест API",
+  "version": "1.1.0",
+  "author": "ExMusic",
+  "description": "Тестовый плагин: проверяет Lua-API (storage, json, плеер, события, настройки, тема), песочницу и защиту сети; итог показывает уведомлением.",
+  "api": 2,
+  "icon": "icon.png",
+  "contributes": {
+    "lua": {
+      "main": "main.lua"
+    },
+    "settings": [
+      {
+        "key": "announce",
+        "type": "switch",
+        "title": "Сообщать о событиях",
+        "summary": "Уведомление при смене трека и паузе/воспроизведении",
+        "default": true
+      },
+      {
+        "key": "level",
+        "type": "slider",
+        "title": "Ползунок",
+        "summary": "При изменении плагин получит событие setting_changed",
+        "min": 0,
+        "max": 100,
+        "step": 5,
+        "default": 50
+      },
+      {
+        "key": "count",
+        "type": "number",
+        "title": "Число",
+        "min": 1,
+        "max": 99,
+        "step": 1,
+        "default": 7
+      },
+      {
+        "key": "note",
+        "type": "text",
+        "title": "Текст",
+        "default": "привет"
+      },
+      {
+        "key": "mode",
+        "type": "choice",
+        "title": "Выбор",
+        "default": "b",
+        "options": [
+          { "value": "a", "title": "Вариант A" },
+          { "value": "b", "title": "Вариант B" },
+          { "value": "c", "title": "Вариант C" }
+        ]
+      },
+      {
+        "key": "run_tests",
+        "type": "button",
+        "title": "Запустить самотест",
+        "summary": "Проверит storage, json, os.date, плеер, настройки, песочницу и защиту сети"
+      },
+      {
+        "key": "show_state",
+        "type": "button",
+        "title": "Показать состояние плеера",
+        "summary": "Текущий трек, позиция, громкость, скорость"
+      },
+      {
+        "key": "accent",
+        "type": "button",
+        "title": "Сменить акцент",
+        "summary": "Перебирает цвета; после последнего возвращает исходный"
+      },
+      {
+        "key": "reset",
+        "type": "button",
+        "title": "Сбросить данные теста",
+        "summary": "Очистит storage плагина и вернёт тему"
+      }
+    ]
+  }
+}

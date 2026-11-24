@@ -27,11 +27,13 @@ import app.ymusic.m3e.player.PlaybackService
 import java.net.HttpURLConnection
 import java.net.URL
 
+/** Единственный виджет приложения — плеер: обложка, название, исполнитель, назад / play-pause / вперёд и кнопка открытия приложения. */
 class PlayerWidgetProvider : AppWidgetProvider() {
     override fun onUpdate(context: Context, appWidgetManager: AppWidgetManager, appWidgetIds: IntArray) {
         PlayerWidget.update(context)
     }
 
+    // Пользователь изменил размер виджета — выбираем подходящий макет (обложка слева / сверху / без обложки).
     override fun onAppWidgetOptionsChanged(
         context: Context, appWidgetManager: AppWidgetManager, appWidgetId: Int, newOptions: Bundle,
     ) {
@@ -52,9 +54,13 @@ object PlayerWidget {
     const val ACTION_NEXT = "app.ymusic.m3e.widget.NEXT"
     const val ACTION_TOGGLE = "app.ymusic.m3e.widget.TOGGLE"
 
+    /** Макет виджета зависит от его размера. */
     private enum class Variant(val layout: Int) {
+        /** Обложка слева на всю высоту, справа текст и кнопки. */
         Row(R.layout.widget_player),
+        /** Узкий, но высокий: обложка сверху, текст и кнопки снизу. */
         Top(R.layout.widget_player_top),
+        /** Мелкий: без обложки. */
         Compact(R.layout.widget_player_compact),
     }
 
@@ -72,6 +78,7 @@ object PlayerWidget {
     private var cachedBitmap: Bitmap? = null
     private var loadingUrl: String? = null
 
+    /** Нажатия кнопок виджета. Работает, пока жив процесс приложения (плеер живёт в нём). */
     fun handle(context: Context, action: String) {
         val app = App.instance
         if (!app.playerReady) { update(context); return }
@@ -94,6 +101,7 @@ object PlayerWidget {
         update(context)
     }
 
+    /** Перерисовывает все экземпляры виджета по текущему состоянию плеера (вызывать в главном потоке). */
     fun update(context: Context) {
         val ctx = context.applicationContext
         val mgr = AppWidgetManager.getInstance(ctx)
@@ -117,6 +125,7 @@ object PlayerWidget {
                 playing = p.playWhenReady && (p.playbackState == Player.STATE_READY || p.playbackState == Player.STATE_BUFFERING)
             }
         }
+        // Если обложки нет (или она ещё грузится) — рисуем заглушку той же формы, чтобы макет не прыгал.
         val bmp = (if (artwork != null && artwork == cachedUrl) cachedBitmap else null) ?: placeholder(ctx)
         push(ctx, mgr, ids, hasMedia, title, artist, playing, bmp)
 
@@ -135,6 +144,7 @@ object PlayerWidget {
         }
     }
 
+    /** Выбор макета по текущему размеру экземпляра виджета (в dp). */
     private fun pickVariant(ctx: Context, mgr: AppWidgetManager, id: Int): Variant {
         val o = mgr.getAppWidgetOptions(id)
         val land = ctx.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -144,8 +154,11 @@ object PlayerWidget {
         val iw = w - PAD_DP * 2
         val ih = h - PAD_DP * 2
         return when {
+            // Обложка — квадрат на всю высоту; справа должно остаться место под текст и кнопки.
             ih >= MIN_ROW_H_DP && iw - ih - COVER_GAP_DP >= MIN_TEXT_W_DP -> Variant.Row
+            // Узко, но высоко — обложка сверху.
             ih >= MIN_TOP_H_DP -> Variant.Top
+            // Мелкий виджет — без обложки.
             else -> Variant.Compact
         }
     }
@@ -165,6 +178,7 @@ object PlayerWidget {
             v.setOnClickPendingIntent(R.id.w_prev, broadcast(ctx, ACTION_PREV, 1))
             v.setOnClickPendingIntent(R.id.w_play, broadcast(ctx, ACTION_TOGGLE, 2))
             v.setOnClickPendingIntent(R.id.w_next, broadcast(ctx, ACTION_NEXT, 3))
+            // Нажатие на обложку / текст — просто открыть приложение.
             val open = PendingIntent.getActivity(
                 ctx, 4,
                 Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP),
@@ -172,6 +186,7 @@ object PlayerWidget {
             )
             v.setOnClickPendingIntent(R.id.w_info, open)
             if (variant != Variant.Compact) v.setOnClickPendingIntent(R.id.w_cover, open)
+            // Кнопка «открыть» — приложение сразу с развёрнутым плеером.
             val openPlayer = PendingIntent.getActivity(
                 ctx, 5,
                 Intent(ctx, MainActivity::class.java)
@@ -185,6 +200,7 @@ object PlayerWidget {
         }
     }
 
+    /** Скруглённая заглушка вместо обложки (когда ничего не играет или обложка ещё грузится). */
     private fun placeholder(ctx: Context): Bitmap {
         val key = ctx.resources.configuration.uiMode
         placeholderBitmap?.let { if (placeholderKey == key) return it }
@@ -214,12 +230,15 @@ object PlayerWidget {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
 
+    /** Загружает обложку и сразу скругляет углы (RemoteViews не умеет обрезать по форме). */
     private fun loadCover(ctx: Context, url: String): Bitmap? = runCatching {
         val raw: Bitmap? = if (url.startsWith("http")) {
-            val c = URL(url).openConnection() as HttpURLConnection
-            c.connectTimeout = 8000
-            c.readTimeout = 8000
-            try { c.inputStream.use { BitmapFactory.decodeStream(it) } } finally { c.disconnect() }
+            // Через общий клиент приложения: обложки SoundCloud идут в обход блокировки.
+            val http = app.ymusic.m3e.App.instance.http.newBuilder()
+                .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS).readTimeout(8, java.util.concurrent.TimeUnit.SECONDS).build()
+            http.newCall(okhttp3.Request.Builder().url(url).build()).execute().use { r ->
+                if (!r.isSuccessful) null else r.body?.byteStream()?.let { BitmapFactory.decodeStream(it) }
+            }
         } else {
             ctx.contentResolver.openInputStream(Uri.parse(url))?.use { BitmapFactory.decodeStream(it) }
         }

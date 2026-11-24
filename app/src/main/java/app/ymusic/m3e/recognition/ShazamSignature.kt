@@ -10,12 +10,17 @@ import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.sin
 
+/**
+ * Генератор «отпечатка» (сигнатуры) в формате Shazam: 16 кГц, моно, 16 бит.
+ * Из звука считается спектрограмма (окно 2048, шаг 128), в ней ищутся устойчивые пики по четырём
+ * диапазонам частот, затем пики пакуются в бинарный формат, который принимает сервер Shazam.
+ */
 object ShazamSignature {
     const val SAMPLE_RATE = 16000
 
     private const val WINDOW = 2048
     private const val HOP = 128
-    private const val BINS = WINDOW / 2 + 1
+    private const val BINS = WINDOW / 2 + 1 // 1025
     private const val RING = 256
     private const val DELAY = 46
     private const val MAX_SECONDS = 3.1
@@ -24,6 +29,7 @@ object ShazamSignature {
     class Peak(val pass: Int, val magnitude: Int, val bin: Int)
 
     class Result(val numberSamples: Int, val bands: List<List<Peak>>) {
+        /** Длительность отпечатка в миллисекундах. */
         val sampleMs: Int get() = (numberSamples.toLong() * 1000 / SAMPLE_RATE).toInt()
     }
 
@@ -67,6 +73,7 @@ object ShazamSignature {
         }
     }
 
+    /** Кольцевой буфер спектров: индекс 0 — самый старый из хранимых, отрицательные — «от конца». */
     private class FrameRing {
         val data = Array(RING) { DoubleArray(BINS) }
         var pos = 0
@@ -79,6 +86,10 @@ object ShazamSignature {
         }
     }
 
+    /**
+     * Строит отпечаток из [pcm] (16 кГц, моно), начиная с отсчёта [start].
+     * Возвращает null, если пиков не нашлось (тишина).
+     */
     fun generate(pcm: ShortArray, start: Int = 0): Result? {
         val fft = Fft(WINDOW)
         val fftRing = FrameRing()
@@ -92,6 +103,7 @@ object ShazamSignature {
         var pos = start
 
         while (pos + HOP <= pcm.size && (samples.toDouble() / SAMPLE_RATE < MAX_SECONDS || peakCount < MAX_PEAKS)) {
+            // Скользящее окно: сдвигаем на HOP и дописываем новые отсчёты.
             System.arraycopy(window, HOP, window, 0, WINDOW - HOP)
             for (i in 0 until HOP) window[WINDOW - HOP + i] = pcm[pos + i].toDouble()
             for (i in 0 until WINDOW) { re[i] = window[i] * hann[i]; im[i] = 0.0 }
@@ -165,6 +177,7 @@ object ShazamSignature {
         return found
     }
 
+    /** Бинарный вид отпечатка (формат Shazam). */
     fun encode(r: Result): ByteArray {
         val body = java.io.ByteArrayOutputStream()
         for ((band, peaks) in r.bands.withIndex()) {
@@ -192,11 +205,11 @@ object ShazamSignature {
 
         val header = ByteBuffer.allocate(48).order(ByteOrder.LITTLE_ENDIAN)
         header.putInt(0xcafe2580L.toInt())
-        header.putInt(0)
+        header.putInt(0) // crc32, посчитаем ниже
         header.putInt(contents.size + 8)
         header.putInt(0x94119c00L.toInt())
         header.putInt(0); header.putInt(0); header.putInt(0)
-        header.putInt(3 shl 27)
+        header.putInt(3 shl 27) // 16000 Гц
         header.putInt(0); header.putInt(0)
         header.putInt((r.numberSamples + SAMPLE_RATE * 0.24).toInt())
         header.putInt((15 shl 19) + 0x40000)
@@ -215,12 +228,13 @@ object ShazamSignature {
     private fun le32(v: Int) = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(v).array()
     private fun le16(v: Int) = ByteBuffer.allocate(2).order(ByteOrder.LITTLE_ENDIAN).putShort(v.toShort()).array()
 
+    /** Понижает частоту дискретизации с [fromRate] до 16 кГц (ФНЧ на окне Ханна + интерполяция). */
     fun resampleTo16k(src: ShortArray, fromRate: Int): ShortArray {
         if (fromRate == SAMPLE_RATE) return src
         val ratio = fromRate.toDouble() / SAMPLE_RATE
         val outLen = (src.size / ratio).toInt()
         val half = 24
-        val fc = 0.45 / ratio
+        val fc = 0.45 / ratio // срез чуть ниже частоты Найквиста выходного сигнала
         val out = ShortArray(outLen)
         for (n in 0 until outLen) {
             val t = n * ratio

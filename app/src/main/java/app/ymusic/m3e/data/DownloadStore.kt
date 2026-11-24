@@ -29,6 +29,21 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.OutputStream
 
+/**
+ * Скачивание у SoundCloud доступно, только если его разрешил автор трека. true — автор запретил скачивание
+ * (флаг приходит вместе с данными трека; пока он неизвестен, скачивание пробуется, а решение принимает SoundCloud).
+ */
+fun Track.isDownloadBlocked(): Boolean = ScIds.isSc(id) && ScDownloads.isForbidden(id)
+
+/** Трек можно пробовать скачать: не файл с устройства и автор не запретил скачивание. */
+fun Track.canDownload(): Boolean = !isLocal && !isDownloadBlocked()
+
+/**
+ * Куда сохранять скачанную песню.
+ * [Files] — обычный файл в папке скачивания (по умолчанию Download/ExMusic), его видно в файловом менеджере и других плеерах.
+ * [App] — «как в Яндекс Музыке»: песня лежит в закрытой папке приложения, слушать её можно только в ExMusic.
+ * [Both] — и файл, и копия внутри приложения.
+ */
 enum class DownloadMode(val title: String, val hint: String) {
     Files("Файлами на устройство", "Файл в папке скачивания — виден в проводнике и других плеерах"),
     App("Только в приложении", "Как в Яндекс Музыке: слушать можно только в ExMusic, файлов в памяти не видно"),
@@ -43,11 +58,15 @@ data class DownloadedTrack(
     val title: String,
     val artists: String,
     val album: String?,
+    /** content://- или file://-адрес файла в папке скачивания; пусто — файла нет (трек только в приложении). */
     val uri: String,
     val size: Long,
     val ts: Long,
+    /** Путь к копии в закрытой папке приложения; null — копии нет (трек только файлом). */
     val appPath: String? = null,
+    /** Расширение файла: mp3, flac, m4a. */
     val ext: String = "mp3",
+    /** Полные данные трека — по ним список скачанного открывается без интернета. */
     val meta: Track? = null,
 ) {
     val inFiles: Boolean get() = uri.isNotBlank()
@@ -58,36 +77,49 @@ data class DownloadedTrack(
     )
 }
 
+/** По какой сети разрешено скачивать песни. */
 enum class DownloadNetwork(val title: String) {
     Wifi("Только Wi-Fi"),
     Mobile("Только мобильная сеть"),
     Any("Wi-Fi и мобильная сеть"),
 }
 
+/** Идущее сейчас массовое скачивание (лайки, плейлист или альбом). */
 data class BulkDownload(val name: String, val done: Int, val total: Int)
 
 data class DownloadsState(
     val items: List<DownloadedTrack> = emptyList(),
+    /** Скачивающиеся сейчас: id трека → доля 0..1 (-1, если размер неизвестен). */
     val progress: Map<String, Float> = emptyMap(),
+    /** Папка в понятном виде, например «Download/ExMusic». */
     val dirLabel: String = DEFAULT_LABEL,
     val isDefault: Boolean = true,
     val network: DownloadNetwork = DownloadNetwork.Any,
+    /** Массовое скачивание «Любимого», плейлиста или альбома; null — не идёт. */
     val bulk: BulkDownload? = null,
+    /** Куда сохранять по умолчанию (отдельные треки и выбор в окне «Скачать»). */
     val mode: DownloadMode = DownloadMode.Files,
+    /** Спрашивать ли, куда сохранять, при скачивании «Любимого», плейлиста или альбома. false — сразу в [mode]. */
     val askMode: Boolean = true,
+    /** Ключи списков с включённым автоскачиванием ([AUTO_LIKED] или playlistSourceKey). По умолчанию пусто — всё выключено. */
     val auto: Set<String> = emptySet(),
 ) {
     val totalBytes: Long get() = items.sumOf { it.size }
 
     companion object {
         const val DEFAULT_LABEL = "Download/ExMusic"
+        /** Ключ автоскачивания для «Любимого». */
         const val AUTO_LIKED = "liked"
     }
 }
 
-class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
+/**
+ * Скачивание песен: файлом в «Загрузки/ExMusic» (MediaStore, без разрешений) или в выбранную папку, и/или в закрытую
+ * папку приложения (слушать можно только в ExMusic). Индекс скачанного хранится в SharedPreferences.
+ */
+class DownloadStore(private val ctx: Context, private val api: MusicApi) {
     private val prefs = ctx.getSharedPreferences("downloads", Context.MODE_PRIVATE)
-    private val http = OkHttpClient()
+    private val http = ScProxy.applyTo(OkHttpClient.Builder()).build()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val resolver get() = ctx.contentResolver
 
@@ -97,6 +129,8 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
     val state: StateFlow<DownloadsState> = _state
 
     init { scope.launch { verify() } }
+
+    // ---------- Индекс ----------
 
     private fun readItems(): List<DownloadedTrack> = runCatching {
         val arr = JSONArray(prefs.getString("items", "[]"))
@@ -134,6 +168,12 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         }
     }
 
+    /**
+     * Приводит запись в порядок: убирает ссылки на файлы, которых больше нет; запись без единого файла пропадает.
+     * Файл считается пропавшим только когда это точно известно ([isGone]): если проверить его не удалось (нет доступа
+     * к папке, провайдер файлов не ответил, сразу после запуска), запись остаётся. Раньше такая запись удалялась навсегда,
+     * и в списке оставались единицы треков из сотен скачанных.
+     */
     private fun fix(d: DownloadedTrack): DownloadedTrack? {
         val app = d.appPath?.takeIf { File(it).exists() }
         val files = if (d.inFiles && !isGone(Uri.parse(d.uri))) d.uri else ""
@@ -144,8 +184,11 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         }
     }
 
+    /** Убирает записи и части записей, чьи файлы удалили вручную. */
     private fun verify() {
+        // Файлы проверяются вне блокировки состояния: проверка сотен адресов не должна держать общий update.
         val checked = _state.value.items.associate { it.id to (it to fix(it)) }
+        // Запись, изменившаяся за время проверки (трек успели перекачать), остаётся как есть.
         commit { cur ->
             cur.mapNotNull { d ->
                 val c = checked[d.id]
@@ -154,6 +197,7 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         }
     }
 
+    /** true — файл точно удалён; при любом сомнении (нет доступа, ошибка провайдера) false. */
     private fun isGone(u: Uri): Boolean {
         if (u.scheme == "file") return !File(u.path ?: return false).exists()
         return try {
@@ -168,8 +212,11 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
 
     private fun exists(u: Uri): Boolean = !isGone(u)
 
+    // ---------- Закрытая папка приложения ----------
+
     private val appDir: File get() = File(ctx.filesDir, "offline").apply { mkdirs() }
 
+    /** Адрес, откуда плеер берёт скачанный трек (копия в приложении важнее файла); null — трек не скачан. */
     fun playableUri(id: String): Uri? {
         val d = _state.value.items.firstOrNull { it.id == id } ?: return null
         d.appPath?.let { p -> File(p).takeIf { it.exists() }?.let { return Uri.fromFile(it) } }
@@ -177,6 +224,8 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
     }
 
     fun isDownloaded(id: String): Boolean = _state.value.items.any { it.id == id }
+
+    // ---------- Режим по умолчанию ----------
 
     private fun readMode(): DownloadMode =
         DownloadMode.entries.firstOrNull { it.name == prefs.getString("mode", null) } ?: DownloadMode.Files
@@ -186,20 +235,25 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         _state.update { it.copy(mode = m) }
     }
 
+    /** Показывать ли окно «Куда сохранять?» при скачивании целого списка. */
     fun setAskMode(ask: Boolean) {
         prefs.edit().putBoolean("askMode", ask).apply()
         _state.update { it.copy(askMode = ask) }
     }
 
+    /** «Не показывать снова»: выбранный способ становится способом по умолчанию, и окно больше не появляется. */
     fun setModeAndStopAsking(m: DownloadMode) {
         prefs.edit().putString("mode", m.name).putBoolean("askMode", false).apply()
         _state.update { it.copy(mode = m, askMode = false) }
     }
 
+    // ---------- Автоскачивание ----------
+
     private fun readAuto(): Set<String> = prefs.getStringSet("auto", emptySet())?.toSet() ?: emptySet()
 
     fun isAuto(key: String): Boolean = key in _state.value.auto
 
+    /** Включает/выключает автоскачивание списка. По умолчанию для всех списков выключено. */
     fun setAuto(key: String, on: Boolean) {
         val next = _state.value.auto.let { if (on) it + key else it - key }
         prefs.edit().putStringSet("auto", next).apply()
@@ -210,10 +264,14 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
     private class PendingAuto(val name: String, val tracks: List<Track>, val onFinish: (Int, Int, String?) -> Unit)
     private val pendingAuto = LinkedHashMap<String, PendingAuto>()
 
+    /**
+     * Тихо докачивает недостающие треки списка, если для него включено автоскачивание. Если сейчас уже идёт другое
+     * массовое скачивание, список встаёт в очередь и докачивается после него.
+     */
     fun autoSync(key: String, name: String, tracks: List<Track>, onFinish: (done: Int, failed: Int, stopReason: String?) -> Unit) {
         if (!isAuto(key)) return
         val m = _state.value.mode
-        if (tracks.none { !it.isLocal && needs(it, m) }) return
+        if (tracks.none { it.canDownload() && needs(it, m) }) return
         if (bulkJob?.isActive == true) {
             synchronized(pendingAuto) { pendingAuto[key] = PendingAuto(name, tracks, onFinish) }
             return
@@ -230,11 +288,14 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         autoSync(next.first, next.second.name, next.second.tracks, next.second.onFinish)
     }
 
+    // ---------- Папка ----------
+
     private fun treeUri(): Uri? = prefs.getString("tree", null)?.let(Uri::parse)
 
     private fun dirLabel(): String {
         val t = treeUri() ?: return DownloadsState.DEFAULT_LABEL
         val id = runCatching { DocumentsContract.getTreeDocumentId(t) }.getOrNull() ?: return t.toString()
+        // «primary:Music/ExMusic» → «Music/ExMusic»
         return id.substringAfter(':', id).ifBlank { "Память устройства" }
     }
 
@@ -251,6 +312,8 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         _state.update { it.copy(dirLabel = dirLabel(), isDefault = true) }
     }
 
+    // ---------- Сеть ----------
+
     private fun readNetwork(): DownloadNetwork =
         DownloadNetwork.entries.firstOrNull { it.name == prefs.getString("network", null) } ?: DownloadNetwork.Any
 
@@ -259,6 +322,7 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         _state.update { it.copy(network = m) }
     }
 
+    /** null — скачивать можно; иначе причина, по которой нельзя (показывается пользователю). */
     fun networkBlockReason(): String? {
         val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return null
         val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) } ?: return "Нет подключения к интернету"
@@ -270,6 +334,8 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
             DownloadNetwork.Mobile -> if (mobile && !wifi) null else "Скачивание разрешено только по мобильной сети (настройка «Скачивание песен»)"
         }
     }
+
+    // ---------- Скачивание ----------
 
     private class Target(val uri: Uri, val out: OutputStream, val finish: () -> Unit)
 
@@ -298,6 +364,7 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
                 resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
             }
         }
+        // Android 8–9: без разрешения на память — папка приложения
         val dir = File(ctx.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: ctx.filesDir, "ExMusic").apply { mkdirs() }
         var f = File(dir, name)
         var n = 1
@@ -315,8 +382,9 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         }
     }
 
-    private fun mimeOf(ext: String) = when (ext) { "flac" -> "audio/flac"; "m4a" -> "audio/mp4"; else -> "audio/mpeg" }
+    private fun mimeOf(ext: String) = when (ext) { "flac" -> "audio/flac"; "m4a" -> "audio/mp4"; "wav" -> "audio/wav"; "ogg" -> "audio/ogg"; else -> "audio/mpeg" }
 
+    /** Обложка для тегов: сначала 1000×1000, потом поменьше; без сети и при ошибке — null (теги всё равно запишутся). */
     private fun fetchCover(t: Track): ByteArray? {
         if (t.coverUri == null) return null
         val client = http.newBuilder().callTimeout(15, java.util.concurrent.TimeUnit.SECONDS).build()
@@ -332,12 +400,14 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         return null
     }
 
+    /** Копирует скачанный файл в папку скачивания, записывая теги и обложку. Возвращает адрес нового файла. */
     private fun exportFile(src: File, t: Track, ext: String): Uri {
         val name = (safeName("${t.artists} - ${t.title}").take(120).ifBlank { "track-${t.id}" }) + ".$ext"
         val cover = fetchCover(t)
         val tg = openTarget(name, mimeOf(ext))
         try {
             tg.out.use { out ->
+                // Теги и обложка пишутся для mp3, flac и m4a; при ошибке разбора файл копируется как есть.
                 AudioTagger.write(src, out, ext, t, cover)
             }
             tg.finish()
@@ -348,16 +418,22 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         return tg.uri
     }
 
+    /** Скачивает трек в фоне. [mode] — куда сохранить (null — по умолчанию из настроек). [onDone] вызывается из фонового потока. */
     fun download(t: Track, mode: DownloadMode? = null, onDone: (Result<Unit>) -> Unit) {
-        if (t.isLocal || _state.value.progress.containsKey(t.id)) return
+        if (t.isLocal || t.isDownloadBlocked() || _state.value.progress.containsKey(t.id)) return
         scope.launch { onDone(downloadSuspend(t, mode ?: _state.value.mode)) }
     }
 
+    /** Нужно ли что-то делать с треком, чтобы он лежал там, куда просит [mode]. */
     private fun needs(t: Track, mode: DownloadMode): Boolean {
         val d = _state.value.items.firstOrNull { it.id == t.id } ?: return true
         return (mode.toApp && !d.inApp) || (mode.toFiles && !d.inFiles)
     }
 
+    /**
+     * Дополняет уже скачанный трек недостающей частью (из файла в приложение или наоборот) без интернета.
+     * false — исходных файлов не осталось, нужно качать заново.
+     */
     private fun completeParts(d: DownloadedTrack, t: Track, mode: DownloadMode): Boolean {
         val appFile = d.appPath?.let(::File)?.takeIf { it.exists() }
         val filesOk = d.inFiles && exists(Uri.parse(d.uri))
@@ -383,8 +459,10 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         return true
     }
 
+    /** Скачивает один трек и ждёт окончания. Учитывает настройку сети. */
     private suspend fun downloadSuspend(t: Track, mode: DownloadMode): Result<Unit> {
         if (t.isLocal) return Result.success(Unit)
+        if (t.isDownloadBlocked()) return Result.failure(IllegalStateException(ScDownloads.FORBIDDEN))
         var started = false
         _state.update {
             if (it.progress.containsKey(t.id)) { started = false; it }
@@ -406,11 +484,19 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
     }
 
     private suspend fun downloadFresh(t: Track, mode: DownloadMode) {
-        val url = api.downloadUrl(t.id)
         val tmp = File(appDir, "${t.id}.part")
         var dest: File? = null
         try {
-            val ext = http.newCall(Request.Builder().url(url).build()).execute().use { r ->
+            // VK отдаёт HLS с шифрованием: он скачивается и собирается в обычный файл отдельным путём (см. VkHls).
+            val job = kotlin.coroutines.coroutineContext[Job]
+            val customExt = if (VkIds.isVk(t.id) || ScIds.isSc(t.id)) {
+                api.downloadCustom(
+                    t.id, tmp,
+                    { f -> _state.update { it.copy(progress = it.progress + (t.id to f)) } },
+                    { job?.ensureActive() },
+                )
+            } else null
+            val ext = customExt ?: http.newCall(Request.Builder().url(api.downloadUrl(t.id)).build()).execute().use { r ->
                 if (!r.isSuccessful) error("Сервер вернул HTTP ${r.code}")
                 val body = r.body ?: error("Пустой ответ сервера")
                 val ctype = r.header("Content-Type").orEmpty()
@@ -426,6 +512,7 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
                     body.byteStream().use { input ->
                         val buf = ByteArray(64 * 1024)
                         while (true) {
+                            // Отмена массового скачивания обрывает загрузку на следующем куске.
                             kotlin.coroutines.coroutineContext.ensureActive()
                             val n = input.read(buf)
                             if (n < 0) break
@@ -467,12 +554,19 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
         }
     }
 
+    // ---------- Массовое скачивание ----------
+
     private var bulkJob: Job? = null
 
+    /**
+     * Скачивает все ещё не скачанные треки по очереди (лайки, плейлист или альбом) в выбранный [mode]; уже скачанные,
+     * но не туда, докладываются без интернета. Останавливается, если сеть перестала подходить под настройку.
+     * [onFinish]: скачано, ошибок, причина остановки.
+     */
     fun downloadAll(name: String, tracks: List<Track>, mode: DownloadMode? = null, onFinish: (done: Int, failed: Int, stopReason: String?) -> Unit) {
         if (bulkJob?.isActive == true) { onFinish(0, 0, "уже идёт другое скачивание"); return }
         val m = mode ?: _state.value.mode
-        val todo = tracks.filter { !it.isLocal }.distinctBy { it.id }.filter { needs(it, m) }
+        val todo = tracks.filter { it.canDownload() }.distinctBy { it.id }.filter { needs(it, m) }
         if (todo.isEmpty()) { onFinish(0, 0, null); return }
         _state.update { it.copy(bulk = BulkDownload(name, 0, todo.size)) }
         bulkJob = scope.launch {
@@ -482,6 +576,7 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
             try {
                 for (t in todo) {
                     ensureActive()
+                    // Сеть нужна только для настоящего скачивания, а не для переноса уже скачанного файла.
                     val blocked = if (_state.value.items.any { it.id == t.id }) null else networkBlockReason()
                     if (blocked != null) { reason = blocked; break }
                     val r = downloadSuspend(t, m)
@@ -496,6 +591,7 @@ class DownloadStore(private val ctx: Context, private val api: YandexMusicApi) {
             }
             onFinish(ok, failed, reason)
         }
+        // Когда задача уже завершена, берём из очереди следующий список с автоскачиванием.
         bulkJob?.invokeOnCompletion { runPendingAuto() }
     }
 

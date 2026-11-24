@@ -2,20 +2,32 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Определяем тип сети (Wi-Fi / мобильная) для настройки скачивания -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Поиск Яндекс Станции в Wi-Fi сети (mDNS _yandexio._tcp) и управление ей по локальной сети -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Виброотклик на нажатия (Настройки → Вибрация) -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- Файлы с устройства: «С устройства» в плейлистах и в поиске -->
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <!-- Распознавание музыки: микрофон и запись звука устройства (MediaProjection + foreground-сервис) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- «Поверх других приложений»: с этим правом система разрешает открыть приложение с найденным треком из фона
+         (Настройки → Распознавание музыки → «Когда трек узнан»). Без него придёт всплывающее уведомление. -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- Обход блокировки SoundCloud: видим, установлен ли ByeByeDPI, и можем его запустить -->
+    <queries>
+        <package android:name="io.github.romanvht.byedpi" />
+    </queries>
 
     <application
         android:name=".App"
@@ -33,12 +45,22 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask">
+            <!-- Значок запуска теперь у <activity-alias> ниже (смена иконки приложения). -->
+            <!-- Возврат из oauth.yandex.ru: ymusicm3e://auth#access_token=... -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="ymusicm3e" android:host="auth" />
             </intent-filter>
+            <!-- Возврат из входа SoundCloud: ymusicm3e://soundcloud?code=...&state=... -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="ymusicm3e" android:host="soundcloud" />
+            </intent-filter>
+            <!-- Ссылки «Поделиться»: трек, альбом, исполнитель и публичный плейлист Яндекс Музыки открываются в приложении. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -63,12 +85,52 @@
                 <data android:pathPrefix="/users/" />
                 <data android:pathPrefix="/playlists/" />
             </intent-filter>
+            <!-- Ссылки SoundCloud: трек, плейлист и профиль (в том числе короткие on.soundcloud.com/…) открываются в приложении. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" />
+                <data android:scheme="http" />
+                <data android:host="soundcloud.com" />
+                <data android:host="www.soundcloud.com" />
+                <data android:host="m.soundcloud.com" />
+                <data android:host="on.soundcloud.com" />
+            </intent-filter>
+            <!-- Ссылки VK Музыки: трек (vk.com/audio…), плейлист и альбом (vk.com/music/…), исполнитель (vk.com/artist/…) открываются в приложении. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" />
+                <data android:scheme="http" />
+                <data android:host="vk.com" />
+                <data android:host="www.vk.com" />
+                <data android:host="m.vk.com" />
+                <data android:host="vk.ru" />
+                <data android:host="www.vk.ru" />
+                <data android:host="m.vk.ru" />
+                <data android:host="music.vk.com" />
+                <data android:host="music.vk.ru" />
+                <data android:pathPrefix="/audio" />
+                <data android:pathPrefix="/music" />
+                <data android:pathPrefix="/artist" />
+            </intent-filter>
+            <!-- «Поделиться» → ExMusic: ссылка на Яндекс Музыку или SoundCloud из любого приложения (работает и там, где прошивка,
+                 например ColorOS, не отдаёт веб-ссылки приложению сама). -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <!-- Ссылки самого приложения Яндекс Музыки (yandexmusic://album/123, track/…, artist/…): кнопки «Открыть в приложении» на сайте. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="yandexmusic" />
             </intent-filter>
+            <!-- Плагины: файл .exm открывается в приложении, появляется окно установки. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -90,6 +152,12 @@
             </intent-filter>
         </activity>
 
+        <!--
+            Варианты иконки приложения (Настройки → Внешний вид → Иконка приложения).
+            Включён ровно один alias; остальные выключены и переключаются из кода (ui/AppIconSettings.kt).
+            Имена alias должны совпадать с AppIcon.alias.
+        -->
+        <!-- ExMusic (основная) -->
         <activity-alias
             android:name=".IconDefault"
             android:targetActivity=".MainActivity"
@@ -104,6 +172,7 @@
             </intent-filter>
         </activity-alias>
 
+        <!-- (не) клод -->
         <activity-alias
             android:name=".IconNotClaude"
             android:targetActivity=".MainActivity"
@@ -118,6 +187,7 @@
             </intent-filter>
         </activity-alias>
 
+        <!-- говно -->
         <activity-alias
             android:name=".IconBrown"
             android:targetActivity=".MainActivity"
@@ -132,6 +202,7 @@
             </intent-filter>
         </activity-alias>
 
+        <!-- Индиго -->
         <activity-alias
             android:name=".IconIndigo"
             android:targetActivity=".MainActivity"
@@ -146,6 +217,7 @@
             </intent-filter>
         </activity-alias>
 
+        <!-- клянусь -->
         <activity-alias
             android:name=".IconSwear"
             android:targetActivity=".MainActivity"
@@ -160,6 +232,7 @@
             </intent-filter>
         </activity-alias>
 
+        <!-- лимиты - В С Е -->
         <activity-alias
             android:name=".IconLimits"
             android:targetActivity=".MainActivity"
@@ -174,6 +247,7 @@
             </intent-filter>
         </activity-alias>
 
+        <!-- Матча -->
         <activity-alias
             android:name=".IconMatcha"
             android:targetActivity=".MainActivity"
@@ -188,6 +262,7 @@
             </intent-filter>
         </activity-alias>
 
+        <!-- Черно-белая -->
         <activity-alias
             android:name=".IconBw"
             android:targetActivity=".MainActivity"
@@ -211,6 +286,7 @@
             </intent-filter>
         </service>
 
+        <!-- Распознавание музыки -->
         <service
             android:name=".recognition.RecognitionService"
             android:exported="false"
@@ -224,6 +300,7 @@
             android:taskAffinity=""
             android:theme="@style/Theme.YMusic.Sheet" />
 
+        <!-- Плитка для шторки быстрых настроек -->
         <service
             android:name=".recognition.RecognizeTileService"
             android:exported="true"
@@ -235,6 +312,7 @@
             </intent-filter>
         </service>
 
+        <!-- Виджет: плеер -->
         <receiver
             android:name=".widget.PlayerWidgetProvider"
             android:exported="true"
@@ -246,5 +324,15 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/player_widget_info" />
         </receiver>
+        <!-- Отдача QR-кода другим приложениям (поделиться / копировать картинкой) -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

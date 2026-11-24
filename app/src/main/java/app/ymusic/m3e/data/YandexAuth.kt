@@ -15,6 +15,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 
+/** Ответ oauth.yandex.ru/device/code: пользователь вводит [userCode] на [verificationUrl] (ya.ru/device). */
 data class DeviceCode(
     val deviceCode: String,
     val userCode: String,
@@ -23,6 +24,11 @@ data class DeviceCode(
     val expiresInSec: Int,
 )
 
+/**
+ * DNS для входа. Обычное разрешение имён по умолчанию; если система не смогла (например, пока приложение в фоне, а вы подтверждаете код
+ * в браузере, Android режет ему сеть, или DNS-фильтр отдаёт пустой ответ) — запасной путь через DNS-over-HTTPS (Cloudflare, затем Google).
+ * Запасной путь работает только для адресов Яндекса и только после сбоя системного DNS.
+ */
 private object AuthDns : Dns {
     private val allowed = setOf("oauth.yandex.ru", "ya.ru", "passport.yandex.ru")
 
@@ -56,6 +62,7 @@ private object AuthDns : Dns {
                 val a = answers.optJSONObject(i) ?: continue
                 if (a.optInt("type") != 1) continue
                 val ip = a.optString("data")
+                // Только IPv4-литералы: getByName на цифрах имён не разрешает.
                 if (ip.isNotEmpty() && ip.all { it.isDigit() || it == '.' }) out += InetAddress.getByName(ip)
             }
             return out
@@ -73,12 +80,14 @@ object YandexAuth {
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
+    /** Понятный текст вместо «Unable to resolve host…». */
     fun friendlyError(e: Throwable): String = when (e) {
         is UnknownHostException -> "Нет связи с oauth.yandex.ru. Проверьте интернет, VPN и «Частный DNS» и нажмите «Повторить»"
         is IOException -> "Сбой сети при входе. Проверьте интернет и нажмите «Повторить»"
         else -> e.message ?: "Не удалось войти"
     }
 
+    /** Шаг 1 device-flow: получаем код, который пользователь вводит на ya.ru/device. */
     fun requestDeviceCode(): DeviceCode {
         val body = FormBody.Builder()
             .add("client_id", CLIENT_ID)
@@ -86,6 +95,7 @@ object YandexAuth {
             .add("device_name", "EshaMusic")
             .build()
         val req = Request.Builder().url("https://oauth.yandex.ru/device/code").post(body).build()
+        // Сеть в момент открытия экрана бывает ещё не готова (смена Wi-Fi/мобильной сети, пробуждение): пробуем до трёх раз.
         var last: IOException? = null
         for (attempt in 0 until 3) {
             if (attempt > 0) Thread.sleep(1200L * attempt)
@@ -109,6 +119,7 @@ object YandexAuth {
         throw last ?: IOException("Не удалось получить код входа")
     }
 
+    /** Шаг 2 device-flow: опрашиваем oauth.yandex.ru/token, пока пользователь не подтвердит вход. */
     suspend fun pollToken(dc: DeviceCode): String {
         var interval = dc.intervalSec
         var netFailures = 0
@@ -122,6 +133,8 @@ object YandexAuth {
                 .add("client_secret", CLIENT_SECRET)
                 .build()
             val req = Request.Builder().url("https://oauth.yandex.ru/token").post(body).build()
+            // Пока вы подтверждаете код в браузере, приложение в фоне, и Android может на время закрыть ему сеть
+            // («Unable to resolve host»). Раньше первый такой сбой обрывал вход и стирал код; теперь просто ждём следующей попытки.
             val answer = try {
                 http.newCall(req).execute().use { it.isSuccessful to it.body?.string().orEmpty() }
             } catch (e: IOException) {
@@ -154,12 +167,14 @@ object YandexAuth {
             .appendQueryParameter("client_id", CLIENT_ID)
             .build()
 
+    /** Токен принимаем только со страниц Яндекса по https: иначе любая страница в WebView могла бы подсунуть чужой токен. */
     fun isTrustedAuthUrl(url: String?): Boolean {
         val u = runCatching { Uri.parse(url ?: return false) }.getOrNull() ?: return false
         val h = u.host?.lowercase() ?: return false
         return u.scheme == "https" && (h == "ya.ru" || h == "yandex.ru" || h == "yandex.com" || h.endsWith(".yandex.ru") || h.endsWith(".yandex.com"))
     }
 
+    /** Достаёт access_token из скопированной ссылки редиректа или напрямую из строки. */
     fun parseToken(input: String?): String? {
         val text = input?.trim() ?: return null
         if (text.startsWith("y0_") && !text.contains(" ")) return text

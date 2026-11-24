@@ -1,0 +1,38 @@
+{
+  "id": "exm.listen-stats",
+  "name": "Статистика прослушиваний",
+  "version": "1.2.0",
+  "author": "ExMusic",
+  "description": "Считает, сколько треков вы слушаете в день, и помнит любимых исполнителей.",
+  "api": 2,
+  "icon": "icon.png",
+  "contributes": {
+    "lua": {
+      "main": "main.lua"
+    },
+    "settings": [
+      {
+        "key": "cheer",
+        "type": "switch",
+        "title": "Поздравления",
+        "summary": "Уведомление, когда набирается круглое число треков за день",
+        "default": true
+      },
+      {
+        "key": "milestone",
+        "type": "number",
+        "title": "Поздравлять каждые N треков",
+        "min": 2,
+        "max": 1000,
+        "step": 1,
+        "default": 10
+      },
+      {
+        "key": "reset",
+        "type": "button",
+        "title": "Сбросить статистику",
+        "summary": "Удалит счётчики дня и список исполнителей"
+      }
+    ]
+  }
+}

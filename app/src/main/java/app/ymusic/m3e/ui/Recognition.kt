@@ -44,7 +44,6 @@ import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
 import androidx.compose.material3.LoadingIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -81,10 +80,17 @@ import app.ymusic.m3e.recognition.RecognitionSettings
 import app.ymusic.m3e.recognition.Recognizer
 import coil3.compose.AsyncImage
 
+/**
+ * Панель распознавания музыки. Одна и та же панель живёт в приложении (плитка на главной) и в прозрачном окне
+ * из плитки шторки быстрых настроек. [onOpenInApp] — найти распознанный трек в Яндекс Музыке.
+ * [autoOpen] — окно из плитки: когда трек узнан, а в настройках («Когда трек узнан») выбрано открытие приложения,
+ * сразу переходим в приложение к найденному треку.
+ */
 @Composable
-fun RecognitionContent(onClose: () -> Unit, onOpenInApp: (RecResult) -> Unit, autoOpen: Boolean = false) {
+fun RecognitionContent(onClose: () -> Unit, onOpenInApp: (RecResult) -> Unit, autoOpen: Boolean = false, inApp: Boolean = false) {
     val ctx = LocalContext.current
     val state by Recognizer.state.collectAsState()
+    // Пока окно на экране, результат виден в нём: сервису не нужно ни открывать приложение, ни слать уведомление.
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         var shown = false
@@ -100,10 +106,12 @@ fun RecognitionContent(onClose: () -> Unit, onOpenInApp: (RecResult) -> Unit, au
     }
     LaunchedEffect(state) {
         val f = state as? RecState.Found
-        if (autoOpen && f != null && RecognitionSettings.onFound != FoundAction.Notify) onOpenInApp(f.result)
+        // В приложении трек, как только узнан, сразу открывается в поиске; из плитки шторки — по настройке «Когда трек узнан».
+        if (f != null && (inApp || (autoOpen && RecognitionSettings.onFound != FoundAction.Notify))) onOpenInApp(f.result)
     }
     var pendingSource by remember { mutableStateOf<RecSource?>(null) }
 
+    // Захват звука устройства: система спрашивает разрешение (MediaProjection), потом запись идёт в сервисе.
     val projection = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
         val data = r.data
         if (r.resultCode == Activity.RESULT_OK && data != null) {
@@ -143,6 +151,8 @@ fun RecognitionContent(onClose: () -> Unit, onOpenInApp: (RecResult) -> Unit, au
 
     var showHistory by remember { mutableStateOf(false) }
     BackHandler(enabled = showHistory && LocalPageActive.current) { showHistory = false }
+    // Переход главная ⇄ история: история выезжает справа (назад — уезжает вправо), а высота окна плавно
+    // подстраивается: большая история «сжимается» в маленькое окно распознавания и наоборот.
     val switchAnim = ThemeSettings.animRecognition && !ThemeSettings.optimize
     AnimatedContent(
         targetState = showHistory,
@@ -171,12 +181,15 @@ fun RecognitionContent(onClose: () -> Unit, onOpenInApp: (RecResult) -> Unit, au
                 "Распознать музыку", style = MaterialTheme.typography.titleLargeEmphasized,
                 modifier = Modifier.align(Alignment.Center),
             )
+            // История распознавания: все найденные раньше треки.
             IconButton(onClick = { showHistory = true }, modifier = Modifier.align(Alignment.CenterEnd)) {
                 Icon(painterResource(R.drawable.ms_history), contentDescription = "История распознавания")
             }
         }
         Spacer(Modifier.height(16.dp))
         val animOn = ThemeSettings.animRecognition && !ThemeSettings.optimize
+        // Смена состояний (слушаю → ищу → найдено) идёт плавно; секунды таймера не считаются сменой. Отключается в
+        // Настройки → Внешний вид → Анимации.
         AnimatedContent(
             targetState = state,
             modifier = Modifier.fillMaxWidth(),
@@ -251,7 +264,7 @@ fun RecognitionContent(onClose: () -> Unit, onOpenInApp: (RecResult) -> Unit, au
                 Button(onClick = { onOpenInApp(r) }, Modifier.fillMaxWidth().height(56.dp)) {
                     Icon(painterResource(R.drawable.ms_search), null)
                     Spacer(Modifier.width(8.dp))
-                    Text("Найти в Яндекс Музыке")
+                    Text(if (ActiveProvider.isVk) "Найти в VK Музыке" else "Найти в Яндекс Музыке")
                 }
                 Spacer(Modifier.height(8.dp))
                 TextButton(onClick = { Recognizer.reset() }) { Text("Распознать ещё") }
@@ -286,11 +299,13 @@ fun RecognitionContent(onClose: () -> Unit, onOpenInApp: (RecResult) -> Unit, au
     }
 }
 
+/** История распознавания: найденные треки, новые сверху. Нажатие — найти трек в Яндекс Музыке, крестик — убрать запись. */
 @Composable
 private fun RecognitionHistoryPanel(onBack: () -> Unit, onOpen: (RecResult) -> Unit) {
     val items = RecognitionHistory.items
     val fmt = remember { java.text.SimpleDateFormat("d MMM, HH:mm", java.util.Locale.getDefault()) }
     Column(
+        // Высота плавно меняется, когда записи убирают или очищают историю: большое окно сжимается в маленькое.
         Modifier.fillMaxWidth().animateContentSize(spring(dampingRatio = 0.85f, stiffness = 380f)).verticalScroll(rememberScrollState())
             .navigationBarsPadding().padding(horizontal = 16.dp).padding(bottom = 24.dp),
     ) {
@@ -356,6 +371,7 @@ private fun SourceButton(text: String, icon: Int, modifier: Modifier, onClick: (
     }
 }
 
+/** Необязательное поле для ключа AudD (запасной сервис). */
 @Composable
 fun TokenField(modifier: Modifier = Modifier) {
     var text by remember { mutableStateOf(RecognitionSettings.auddToken) }

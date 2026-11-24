@@ -9,6 +9,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
+/**
+ * Режим «Локальные файлы»: приложение работает без Яндекс Музыки — только музыка с устройства и свои плейлисты из неё.
+ * Включается кнопкой «Пропустить» на экране входа (справа сверху). Хранится в SharedPreferences «local_mode».
+ */
 object LocalModeSettings {
     private var prefs: SharedPreferences? = null
 
@@ -27,10 +31,15 @@ object LocalModeSettings {
     }
 }
 
+/**
+ * Плейлист, собранный из файлов устройства. [trackIds] — id локальных треков ("local:<MediaStore id>") по порядку.
+ * [folder] — путь папки: плейлист-папка, в нём играют все файлы из этой папки (см. [LocalFolders]); [trackIds] у него пуст.
+ */
 data class DevicePlaylist(val id: String, val name: String, val trackIds: List<String>, val folder: String? = null) {
     val isFolder: Boolean get() = folder != null
 }
 
+/** Свои плейлисты из файлов устройства (режим «Локальные файлы»). Лежат только на телефоне, в SharedPreferences «device_playlists». */
 object DevicePlaylists {
     private var prefs: SharedPreferences? = null
 
@@ -73,12 +82,14 @@ object DevicePlaylists {
         prefs?.edit()?.putString("items", arr.toString())?.apply()
     }
 
+    /** Создаёт плейлист (при необходимости сразу с одним треком) и возвращает его. */
     fun create(name: String, firstTrackId: String? = null): DevicePlaylist {
         val p = DevicePlaylist(UUID.randomUUID().toString(), name.trim().ifEmpty { "Плейлист" }, listOfNotNull(firstTrackId))
         save(items + p)
         return p
     }
 
+    /** Создаёт плейлист-папку: название по умолчанию — имя папки, его можно переименовать. */
     fun createFromFolder(folder: String, name: String? = null): DevicePlaylist {
         val p = DevicePlaylist(
             UUID.randomUUID().toString(),
@@ -98,6 +109,7 @@ object DevicePlaylists {
 
     fun delete(id: String) = save(items.filterNot { it.id == id })
 
+    /** Добавляет треки в конец плейлиста; уже лежащие в нём пропускаются. */
     fun addTracks(id: String, trackIds: Collection<String>) {
         save(items.map { p ->
             if (p.id != id) p else p.copy(trackIds = p.trackIds + trackIds.filter { it !in p.trackIds }.distinct())

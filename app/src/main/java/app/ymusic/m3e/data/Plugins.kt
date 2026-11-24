@@ -14,10 +14,31 @@ import org.json.JSONObject
 import java.io.File
 import java.util.zip.ZipFile
 
+/*
+ * Система плагинов.
+ *
+ * Плагин — один файл `.exm`. Это обычный ZIP-архив, в котором лежат манифест `manifest.json` и Lua-файлы плагина
+ * (плюс необязательная иконка). Приложение хранит плагин одним файлом (filesDir/plugins/<id>.exm) и читает из него
+ * манифест и скрипты прямо из архива, ничего не распаковывая.
+ *
+ * Плагин состоит только из Lua-кода: contributes.lua = { "main": "main.lua" }. Скрипт запускается в песочнице LuaJ
+ * (см. LuaPlugins.kt и PLUGINS_LUA.md): плеер, уведомления, хранилище, сеть, тема, волна — через API приложения.
+ * Старый «декларативный» вид плагинов (только цвет/станции в manifest.json, без кода) убран: то же самое делается
+ * Lua-скриптом (theme.set_accent, wave.add_station).
+ */
+
+/** Ошибка разбора плагина с текстом, который можно показать пользователю. */
 class PluginException(message: String) : Exception(message)
 
+/** Станция волны из плагина: [station] — идентификатор станции Яндекс Музыки (например, `genre:rock`). */
 data class PluginStation(val title: String, val station: String, val subtitle: String = "")
 
+/**
+ * Поле настроек плагина. Плагин только ОПИСЫВАЕТ поле, а рисует и проверяет его приложение, поэтому код плагина в интерфейс не попадает.
+ * Типы со значением: switch (Boolean), slider и number (Double, с min/max/step), text (String), choice (String из options),
+ * color (String «#RRGGBB»). Без значения: button (кнопка), section (заголовок группы), info (поясняющий текст).
+ * Поле можно показывать только при условии: [showIfKey] — ключ другого поля, [showIfEquals] — значение, при котором поле видно.
+ */
 data class PluginSetting(
     val key: String,
     val type: String,
@@ -28,29 +49,44 @@ data class PluginSetting(
     val max: Double = 100.0,
     val step: Double = 1.0,
     val maxLength: Int = 100,
+    /** Для choice: пары «значение → подпись». */
     val options: List<Pair<String, String>> = emptyList(),
     val showIfKey: String? = null,
     val showIfEquals: Any? = null,
 ) {
+    /** У поля есть значение (его хранят и отдают скрипту); у кнопки, заголовка и текста — нет. */
     val hasValue: Boolean get() = type != "button" && type != "section" && type != "info"
 }
 
+/** Страница настроек, созданная самим Lua-скриптом (ui.settings_page). [menu] — показывать ли её пунктом в главных Настройках. */
 class PluginUiEntry(val id: String, val title: String, val summary: String, val menu: Boolean, val transient: Boolean = false)
 
+/** Кнопка диалога из Lua: [style] — default, primary или danger. */
 class PluginDialogButton(val title: String, val style: String)
 
+/**
+ * Диалог, который открыл Lua-скрипт (ui.dialog / alert / confirm / prompt). [key] — номер диалога внутри плагина: по нему
+ * ответ находит нужный Lua-колбэк. [inputValue] != null — в диалоге есть поле ввода.
+ */
 class PluginDialog(
     val key: Int, val pluginId: String, val pluginName: String, val title: String, val text: String,
     val buttons: List<PluginDialogButton>, val inputValue: String?, val inputHint: String, val inputMaxLength: Int,
     val cancelable: Boolean,
 )
 
+/** Нижняя модалка, открытая из Lua (ui.sheet / ui.open_page). [closing] — Lua попросил закрыть: шторка уедет с анимацией. */
 data class PluginSheetReq(val pluginId: String, val entryId: String, val closing: Boolean = false)
 
+/**
+ * Один компонент страницы, которую Lua вернул из render(). Описание поля — [st] (тот же вид, что и у настроек из манифеста),
+ * [value] — текущее значение (null у section/info/button), [index] — позиция в странице (по ней находится колбэк в Lua).
+ */
 class PluginUiNode(val index: Int, val st: PluginSetting, val value: Any?)
 
+/** Свой пункт плагина в главных настройках приложения (contributes.settings_entry): открывает настройки плагина. */
 data class PluginMenuEntry(val title: String, val summary: String = "")
 
+/** Манифест плагина (manifest.json внутри .exm). */
 data class PluginManifest(
     val id: String,
     val name: String,
@@ -58,67 +94,106 @@ data class PluginManifest(
     val author: String,
     val description: String,
     val api: Int,
+    /** Имя файла иконки внутри архива (null — иконки нет). */
     val icon: String?,
+    /** Сколько файлов в архиве и сколько они занимают (в распакованном виде). */
     val fileCount: Int,
     val unpackedBytes: Long,
+    /** Имя главного Lua-скрипта внутри архива (contributes.lua.main). */
     val lua: String,
+    /** Поля настроек плагина (contributes.settings). */
     val settings: List<PluginSetting> = emptyList(),
+    /** Пункт плагина в Настройках (contributes.settings_entry); null — пункта нет. */
     val menuEntry: PluginMenuEntry? = null,
+    /**
+     * Хуки, которые плагин объявил (contributes.hooks). Название и описание задаёт сам плагин, а логику хука (когда он действует)
+     * плагин пишет в своём Lua-коде: `hooks.on(id, function() return true end)`. Если хуки объявлены, в настройках плагина всегда
+     * есть главный выключатель «Хуки» (по умолчанию выключен), а при установке приложение спрашивает, включать ли их.
+     */
     val hooks: List<PluginHook> = emptyList(),
+    /**
+     * Плагину нужен доступ к Java (contributes.unsafe_java). Тогда у пользователя в настройках плагина (при включённых хуках)
+     * появляется выключатель «Отключить песочницу» — после предупреждения. Само по себе поле ничего не включает.
+     */
     val unsafeJava: Boolean = false,
 )
 
+/** Хук плагина: [id] — имя, которое плагин придумал сам, [title] и [summary] — его подписи в настройках и окне установки. */
 data class PluginHook(val id: String, val title: String, val summary: String)
 
+/**
+ * Хуки плагина. Приложение НЕ содержит никакой логики хуков: плагин сам объявляет их в манифесте (contributes.hooks) и сам пишет
+ * их код в Lua: `hooks.on(id, function(active) ... end)`. Приложение только даёт пользователю выключатели и вызывает обработчик,
+ * когда хук включается или выключается. Пока главный выключатель «Включить хуки» в настройках плагина выключен (по умолчанию он
+ * выключен, при установке приложение спрашивает), ни один хук не вызывается.
+ *
+ * Отдельный режим «Отключить песочницу» (только для плагинов с contributes.unsafe_java, только при включённых хуках, только после
+ * предупреждения): скрипт получает luajava и доступ к объектам приложения и может выполнять Java-код.
+ */
 object PluginHooks {
+    /** Префикс ключа выключателей хуков в настройках плагина; свои настройки плагина с таким префиксом запрещены. */
     const val KEY_PREFIX = "hook_"
 
+    /** Главный выключатель хуков плагина: по умолчанию выключен, спрашивается при установке. */
     const val MASTER_KEY = KEY_PREFIX + "enabled"
 
+    /** «Отключить песочницу» для этого плагина: по умолчанию выключено, перед включением показывается предупреждение. */
     const val UNSAFE_KEY = KEY_PREFIX + "unsafe"
 
     fun key(id: String) = KEY_PREFIX + id
 }
 
+/** Установленный плагин. Включён он или нет, можно менять; хранится в настройках. */
 class InstalledPlugin(val manifest: PluginManifest, val file: File, val iconBytes: ByteArray?, enabled: Boolean = true) {
     var enabled by mutableStateOf(enabled)
         internal set
     val id: String get() = manifest.id
 
+    /** Состояние Lua-скрипта для списка плагинов («Работает», текст ошибки); null — скрипт остановлен. */
     var luaStatus by mutableStateOf<String?>(null)
         internal set
 
+    /** Цвет акцента и AMOLED, заданные из Lua (theme.set_accent / theme.set_amoled), и станции волны из Lua (wave.add_station). */
     var luaAccent by mutableStateOf<Int?>(null)
         internal set
     var luaAmoled by mutableStateOf<Boolean?>(null)
         internal set
     val luaStations = mutableStateListOf<PluginStation>()
 
+    /** Пользователь включил хуки этого плагина (главный выключатель в настройках плагина). */
     val hooksOn: Boolean get() = manifest.hooks.isNotEmpty() && settingValues[PluginHooks.MASTER_KEY] == true
 
+    /** Для этого плагина отключена песочница (ОПАСНО): нужны хуки, объявленный unsafe_java и включённый пользователем выключатель. */
     val unsafeOn: Boolean get() = manifest.unsafeJava && hooksOn && settingValues[PluginHooks.UNSAFE_KEY] == true
 
+    /** Текущие значения настроек (для интерфейса) и их неизменяемая копия для потока Lua. */
     val settingValues = mutableStateMapOf<String, Any>()
 
+    /** Страницы настроек, которые плагин создал из Lua (ui.settings_page), и их последняя отрисовка (id страницы → компоненты). */
     val uiEntries = mutableStateListOf<PluginUiEntry>()
     val uiPages = mutableStateMapOf<String, List<PluginUiNode>>()
     @Volatile var settingsCopy: Map<String, Any> = emptyMap()
         internal set
 }
 
+/** Прочитанный, но ещё не установленный плагин: показывается в окне установки. */
 class PluginPreview(
     val manifest: PluginManifest,
     val file: File,
     val iconBytes: ByteArray?,
+    /** Версия, которая уже установлена (если это обновление или переустановка). */
     val installed: PluginManifest?,
+    /** Размер самого .exm файла. */
     val fileBytes: Long,
 )
 
 private class ParsedPackage(val manifest: PluginManifest, val iconBytes: ByteArray?)
 
 object PluginSystem {
+    /** Версия API плагинов, которую понимает это приложение. */
     const val API_VERSION = 2
 
+    /** Расширение файла плагина. */
     const val EXTENSION = "exm"
 
     private const val TAG = "Plugins"
@@ -145,19 +220,24 @@ object PluginSystem {
     private val main = Handler(Looper.getMainLooper())
     private var disabled: Set<String> = emptySet()
 
+    /** Главный выключатель: пока он выключен, ни один плагин не действует (но остаётся установленным). По умолчанию включён. */
     var enabled by mutableStateOf(true)
         private set
 
     val plugins = mutableStateListOf<InstalledPlugin>()
 
+    /** Плагин, который предлагается установить (его показывает окно снизу). */
     var pending by mutableStateOf<PluginPreview?>(null)
         private set
 
+    /** Текст ошибки, если файл не получилось прочитать. */
     var error by mutableStateOf<String?>(null)
         private set
 
+    /** Диалоги из Lua: показывается последний; открыть можно не больше [MAX_DIALOGS_PER_PLUGIN] от одного плагина. */
     val luaDialogs = mutableStateListOf<PluginDialog>()
 
+    /** Нижняя модалка, открытая из Lua; её рисует главный экран. */
     var sheetReq by mutableStateOf<PluginSheetReq?>(null)
         private set
 
@@ -167,6 +247,7 @@ object PluginSystem {
         if (luaDialogs.count { it.pluginId == d.pluginId } < MAX_DIALOGS_PER_PLUGIN) luaDialogs.add(d)
     }
 
+    /** Пользователь ответил на диалог: [button] — номер кнопки, -1 — закрыл без выбора; [input] — текст из поля (если оно было). */
     fun answerDialog(d: PluginDialog, button: Int, input: String?) {
         if (!luaDialogs.remove(d)) return
         plugins.firstOrNull { it.id == d.pluginId }?.let { LuaPlugins.dialogEvent(it, d.key, button, input) }
@@ -174,22 +255,26 @@ object PluginSystem {
 
     fun openSheet(pluginId: String, entryId: String) { sheetReq = PluginSheetReq(pluginId, entryId) }
 
+    /** Lua просит закрыть свою шторку (entryId = null — любую свою). */
     fun requestCloseSheet(pluginId: String, entryId: String?) {
         val r = sheetReq ?: return
         if (r.pluginId == pluginId && (entryId == null || r.entryId == entryId)) sheetReq = r.copy(closing = true)
     }
 
+    /** Шторка закрыта (пальцем или по просьбе Lua): сообщаем скрипту (on_close). */
     fun finishSheet() {
         val r = sheetReq ?: return
         sheetReq = null
         plugins.firstOrNull { it.id == r.pluginId }?.let { LuaPlugins.sheetClosed(it, r.entryId) }
     }
 
+    /** Плагин остановлен или выключен: его диалоги и шторка больше не нужны. */
     fun dropUi(pluginId: String) {
         luaDialogs.removeAll { it.pluginId == pluginId }
         if (sheetReq?.pluginId == pluginId) sheetReq = null
     }
 
+    /** Идёт чтение файла плагина. */
     var busy by mutableStateOf(false)
         private set
 
@@ -203,6 +288,7 @@ object PluginSystem {
         val d = File(app.filesDir, "plugins").apply { mkdirs() }
         dir = d
         cacheDir = app.cacheDir
+        // Подчищаем недокачанные файлы прошлых запусков.
         app.cacheDir.listFiles()?.filter { it.name.startsWith("plugin_pending_") }?.forEach { it.delete() }
         plugins.clear()
         d.listFiles { f -> f.isFile && f.extension.equals(EXTENSION, true) }
@@ -241,16 +327,20 @@ object PluginSystem {
         runCatching { appContext?.deleteSharedPreferences(settingsPrefsName(p.id)) }
     }
 
+    // ---------- Настройки плагинов ----------
+
     private fun settingsPrefsName(id: String) = "plugin_settings_$id"
 
     private fun settingsPrefs(id: String): SharedPreferences? = appContext?.getSharedPreferences(settingsPrefsName(id), Context.MODE_PRIVATE)
 
+    /** Значение в допустимых границах: для slider/number — в диапазоне и по шагу. */
     fun snapSetting(s: PluginSetting, v: Double): Double {
         val c = v.coerceIn(s.min, s.max)
         val k = Math.round((c - s.min) / s.step)
         return (s.min + k * s.step).coerceIn(s.min, s.max)
     }
 
+    /** Проверяет значение по описанию поля; null — значение не подходит. */
     fun normalizeSetting(s: PluginSetting, raw: Any?): Any? = when (s.type) {
         "switch" -> raw as? Boolean
         "slider", "number" -> (raw as? Number)?.toDouble()?.takeIf { !it.isNaN() && !it.isInfinite() }?.let { snapSetting(s, it) }
@@ -279,6 +369,7 @@ object PluginSystem {
         p.settingsCopy = map
     }
 
+    /** Пользователь изменил настройку плагина: значение проверяется, сохраняется и сообщается скрипту (событие setting_changed). */
     fun setSetting(p: InstalledPlugin, key: String, raw: Any?, notify: Boolean = true) {
         val s = p.manifest.settings.firstOrNull { it.key == key && it.hasValue } ?: return
         val v = normalizeSetting(s, raw) ?: return
@@ -289,6 +380,11 @@ object PluginSystem {
         if (notify && enabled && p.enabled) LuaPlugins.settingChanged(p, key, v)
     }
 
+    /**
+     * Пользователь тронул компонент на странице, созданной Lua: значение проверяется по описанию поля, на экране обновляется
+     * сразу (чтобы переключатель не отставал), а Lua-колбэк вызывается в потоке Lua; после него страница перерисовывается.
+     * Для кнопок [raw] = null.
+     */
     fun uiEvent(p: InstalledPlugin, entryId: String, index: Int, raw: Any?) {
         if (!enabled || !p.enabled) return
         val nodes = p.uiPages[entryId] ?: return
@@ -298,10 +394,12 @@ object PluginSystem {
         LuaPlugins.uiEvent(p, entryId, index, v)
     }
 
+    /** Окно настроек открыли: просим Lua заново нарисовать страницу [entryId] (null — все страницы плагина). */
     fun requestPage(p: InstalledPlugin, entryId: String?) {
         if (enabled && p.enabled) LuaPlugins.renderPages(p, entryId)
     }
 
+    /** Условие показа поля (show_if): true — поле нужно рисовать. */
     fun isSettingVisible(p: InstalledPlugin, s: PluginSetting): Boolean {
         val k = s.showIfKey ?: return true
         val cur = p.settingValues[k]
@@ -314,6 +412,7 @@ object PluginSystem {
         }
     }
 
+    /** Нажата кнопка из настроек плагина (событие action). */
     fun pressSettingButton(p: InstalledPlugin, key: String) {
         if (enabled && p.enabled && p.manifest.settings.any { it.key == key && it.type == "button" }) LuaPlugins.action(p, key)
     }
@@ -322,21 +421,34 @@ object PluginSystem {
         for (s in p.manifest.settings) if (s.hasValue) setSetting(p, s.key, s.default)
     }
 
+    // ---------- Что плагины добавляют в приложение ----------
+
+    /** Станции волны из включённых плагинов (пусто, если система выключена). */
     val activeStations: List<Pair<InstalledPlugin, PluginStation>>
         get() = if (!enabled) emptyList() else plugins.filter { it.enabled }.flatMap { p -> p.luaStations.map { p to it } }
 
+    /** Цвет акцента из включённых плагинов (первый по списку); null — плагины цвет не задают. */
     val themeAccent: Int?
         get() = if (!enabled) null else plugins.firstOrNull { it.enabled && it.luaAccent != null }?.luaAccent
 
+    /** Плагин включил AMOLED-фон. */
     val themeAmoled: Boolean
         get() = enabled && plugins.any { it.enabled && it.luaAmoled == true }
 
+    /** Читает файл из архива плагина (например, свои данные); null, если файла нет или он слишком большой. */
     fun readFile(p: InstalledPlugin, name: String, maxBytes: Int = MAX_DATA_BYTES): ByteArray? =
         runCatching { ZipFile(p.file).use { z -> z.getEntry(name)?.let { readEntry(z, it, maxBytes) } } }.getOrNull()
 
+    // ---------- Установка ----------
+
+    /**
+     * Читает файл плагина по [uri] (из «Открыть с помощью…» или из выбора файла) и, если он годится, показывает
+     * окно установки ([pending]). Вызывать с главного потока.
+     */
     fun offerInstall(context: Context, uri: Uri) {
         val app = context.applicationContext
         val cd = cacheDir ?: app.cacheDir
+        // Чужое приложение может прислать file:// на закрытые файлы самого ExMusic (токены, настройки): такие адреса не читаем.
         if (uri.scheme.equals("file", true)) {
             val path = runCatching { File(uri.path ?: "").canonicalPath }.getOrNull()
             val own = runCatching { app.filesDir.parentFile?.canonicalPath }.getOrNull()
@@ -371,6 +483,10 @@ object PluginSystem {
         }.start()
     }
 
+    /**
+     * «Установить» в окне установки: сохраняет .exm в папку плагинов (заменяя прежнюю версию).
+     * [hooksOn] — ответ пользователя на вопрос «Включить хуки?» (только если плагин объявил хуки); по умолчанию выключено.
+     */
     fun confirmInstall(hooksOn: Boolean = false) {
         val pv = pending ?: return
         val d = dir
@@ -387,6 +503,7 @@ object PluginSystem {
         if (!ok) { error = "Не удалось сохранить плагин"; return }
         val ip = InstalledPlugin(pv.manifest, target, pv.iconBytes, true)
         loadSettings(ip)
+        // Хуки: ответ из окна установки (в окне обновления там стоит прежнее значение). Сохраняем до запуска скрипта.
         if (pv.manifest.hooks.isNotEmpty()) setSetting(ip, PluginHooks.MASTER_KEY, hooksOn, notify = false)
         val i = plugins.indexOfFirst { it.id == pv.manifest.id }
         if (i >= 0) plugins[i] = ip else plugins.add(ip)
@@ -394,16 +511,20 @@ object PluginSystem {
             disabled = disabled - pv.manifest.id
             prefs?.edit()?.putStringSet("disabled", disabled)?.apply()
         }
+        // Установили плагин — значит, он нужен: если система была выключена, включаем её, чтобы плагин сразу заработал.
         if (!enabled) { enabled = true; prefs?.edit()?.putBoolean("enabled", true)?.apply() }
         LuaPlugins.sync()
     }
 
+    /** «Отмена» или закрытие окна установки. */
     fun dismissPending() {
         pending?.file?.delete()
         pending = null
     }
 
     fun clearError() { error = null }
+
+    // ---------- Разбор архива ----------
 
     private fun copyLimited(ctx: Context, uri: Uri, to: File) {
         val input = ctx.contentResolver.openInputStream(uri) ?: throw PluginException("Не удалось открыть файл")
@@ -445,6 +566,7 @@ object PluginSystem {
         zip.use { z ->
             var count = 0
             var unpacked = 0L
+            // Папки тоже считаем: архив из миллионов пустых записей иначе съел бы память ещё до проверки числа файлов.
             if (z.size() > MAX_ENTRIES * 2) throw PluginException("В архиве слишком много файлов (больше $MAX_ENTRIES)")
             val names = HashSet<String>()
             val entries = z.entries()
@@ -453,6 +575,7 @@ object PluginSystem {
                 val n = e.name
                 if (n.startsWith("/") || n.contains("\\") || n.split('/').any { it == ".." } || n.length > 200 || n.any { it.isISOControl() })
                     throw PluginException("В архиве недопустимое имя файла: «${n.filter { !it.isISOControl() }.take(80)}»")
+                // Два файла с одним именем: проверяли бы один, а запускался бы другой.
                 if (!names.add(n)) throw PluginException("В архиве два файла с одинаковым именем: «${n.take(80)}»")
                 if (!e.isDirectory) {
                     count++
@@ -482,6 +605,7 @@ object PluginSystem {
             if (api > API_VERSION) throw PluginException("Плагин сделан для более новой версии API ($api), а здесь поддерживается $API_VERSION. Обновите приложение")
             if (api < 1) throw PluginException("Неверная версия API плагина")
 
+            // Иконка необязательна: если с ней что-то не так, плагин всё равно ставится, просто с значком «пазл».
             var iconBytes: ByteArray? = null
             val iconName = json.optString("icon").trim().takeIf { it.isNotEmpty() }
             if (iconName != null) {
@@ -490,6 +614,7 @@ object PluginSystem {
                     val ext = iconName.substringAfterLast('.', "").lowercase()
                     if (ext !in setOf("png", "jpg", "jpeg", "webp")) error("формат")
                     val ib = readEntry(z, ie, MAX_ICON_BYTES)
+                    // Размер картинки проверяем до декодирования: маленький файл может «раскрыться» в огромный битмап.
                     val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
                     android.graphics.BitmapFactory.decodeByteArray(ib, 0, ib.size, bounds)
                     if (bounds.outWidth <= 0 || bounds.outHeight <= 0 || bounds.outWidth > MAX_ICON_SIDE || bounds.outHeight > MAX_ICON_SIDE) error("размер")
@@ -499,6 +624,7 @@ object PluginSystem {
 
             val contributes = json.optJSONObject("contributes") ?: JSONObject()
 
+            // ---- Lua-скрипт ----
             if (!contributes.has("lua")) throw PluginException("Плагин должен содержать Lua-скрипт: в manifest.json нужно contributes.lua = {\"main\": \"main.lua\"}")
             val rawLua = contributes.get("lua")
             val luaMain = when (rawLua) {
@@ -511,6 +637,7 @@ object PluginSystem {
             if (le.isDirectory) throw PluginException("lua: «$luaMain» — это папка, а не файл")
             if (le.size > MAX_LUA_BYTES) throw PluginException("lua: скрипт «$luaMain» слишком большой (больше ${MAX_LUA_BYTES / 1024} КБ)")
 
+            // ---- Настройки плагина (только вместе с Lua) ----
             val settings = ArrayList<PluginSetting>()
             if (contributes.has("settings")) {
                 val arr = contributes.optJSONArray("settings") ?: throw PluginException("settings: нужен массив полей")
@@ -565,6 +692,7 @@ object PluginSystem {
                         "button", "section", "info" -> PluginSetting(key, type, title, summary)
                         else -> throw PluginException("$n: неизвестный тип «$type» (switch, slider, number, text, choice, color, button, section, info)")
                     }
+                    // Условие показа: "show_if": {"key": "другое_поле", "equals": значение}.
                     val si = o.optJSONObject("show_if")
                     if (si != null) {
                         val sk = si.optString("key").trim()
@@ -581,6 +709,8 @@ object PluginSystem {
                 }
             }
 
+            // ---- Хуки (contributes.hooks): плагин сам объявляет хуки и их подписи, код — в его Lua (hooks.on) ----
+            // Элемент — объект {"id", "title", "summary"} или просто строка-id. id — как ключ настройки: a-z, 0-9, _.
             val hooks = ArrayList<PluginHook>()
             if (contributes.has("hooks")) {
                 val ha = contributes.optJSONArray("hooks") ?: throw PluginException("hooks: нужен массив хуков")
@@ -610,6 +740,8 @@ object PluginSystem {
             val unsafeJava = contributes.optBoolean("unsafe_java", false)
             if (unsafeJava && hooks.isEmpty()) throw PluginException("unsafe_java: нужен хотя бы один хук (contributes.hooks): песочница отключается только вместе с хуками")
             if (hooks.isNotEmpty()) {
+                // Хуки объявлены: настройки у плагина есть всегда. Заголовок, главный выключатель (по умолчанию ВЫКЛЮЧЕН),
+                // при unsafe_java — выключатель песочницы (по умолчанию выключен) и по выключателю на каждый хук.
                 val hs = ArrayList<PluginSetting>()
                 hs += PluginSetting("hooks_header", "section", "Хуки", "Хуки меняют поведение приложения. Код хуков находится в самом плагине")
                 hs += PluginSetting(
@@ -632,6 +764,7 @@ object PluginSystem {
                 settings.addAll(0, hs)
             }
 
+            // ---- Свой пункт в главных настройках (contributes.settings_entry) ----
             var menuEntry: PluginMenuEntry? = null
             if (contributes.has("settings_entry")) {
                 if (settings.isEmpty()) throw PluginException("settings_entry: у плагина нет настроек, открывать нечего")

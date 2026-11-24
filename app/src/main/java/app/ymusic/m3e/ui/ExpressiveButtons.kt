@@ -38,10 +38,29 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
+// ---------- Нажатие кнопок в стиле Material 3 Expressive ----------
+// Здесь одноимённые обёртки над кнопками Material 3. Они лежат в пакете app.ymusic.m3e.ui и перекрывают
+// material3.* (звёздочный импорт) во всех файлах пакета, поэтому существующие вызовы Button / TextButton /
+// IconButton / FloatingActionButton / SegmentedButton и т.д. получают анимацию нажатия без правок на местах.
+//
+// Что делает каждая кнопка (как в спецификации M3E):
+// Как в спецификации M3E (m3.material.io → Buttons), кнопка с контейнером при нажатии НЕ сжимается, а меняет форму:
+//  • «перетекание» формы: круг/таблетка → скругление 12 dp, пока кнопка нажата (Button, Tonal, Outlined, Text,
+//    Filled/FilledTonal IconButton, FAB); анимация — быстрая «пространственная» пружина темы M3E
+//    (fastSpatial: damping 0.6, stiffness 800), поэтому при отпускании форма «перелетает» и возвращается с отскоком;
+//  • в группе кнопок (Слушать / Вперемешку) нажатая кнопка расширяется на 15 %, соседняя уступает место (animateWidth);
+//  • у значков без контейнера (IconButton) и у элементов без доступа к форме (чипы, сегменты, пункты меню) остаётся лёгкое сжатие;
+//  • у переключаемых значков (лайк, повтор, текст песни…) — «хлопок» значка при смене состояния.
+
+/** Быстрая пространственная пружина M3E для нажатия: заметный отскок при отпускании. */
 private fun pressSpring() = fxSpring<Float>(dampingRatio = 0.6f, stiffness = 800f)
 
 internal class PressState(val source: MutableInteractionSource, val fraction: State<Float>)
 
+/**
+ * Состояние нажатия: [fraction] плавно идёт от 0 до 1 (с «перелётом» из-за пружины).
+ * Если [source] передан снаружи (например, для группы кнопок), нажатие читается из него.
+ */
 @Composable
 internal fun rememberPress(
     enabled: Boolean,
@@ -51,6 +70,7 @@ internal fun rememberPress(
 ): PressState {
     val src = source ?: remember { MutableInteractionSource() }
     val pressed by src.collectIsPressedAsState()
+    // Вибро в момент нажатия и тики с нарастанием при удержании (для кнопок с включённым виброоткликом).
     if (hold) HoldHaptics(pressed && enabled, downTick)
     val fraction = animateFloatAsState(
         targetValue = if (pressed && enabled) 1f else 0f,
@@ -66,6 +86,7 @@ internal fun Modifier.pressScale(press: PressState, amount: Float): Modifier = g
     scaleY = v
 }
 
+/** Форма, у которой углы плавно сжимаются до [pressed] (но не больше исходного радиуса) на [f] от 0 до 1. */
 internal fun CornerBasedShape.morphed(f: Float, pressed: Dp): CornerBasedShape {
     fun c(base: CornerSize): CornerSize = object : CornerSize {
         override fun toPx(shapeSize: Size, density: Density): Float {
@@ -80,6 +101,12 @@ internal fun CornerBasedShape.morphed(f: Float, pressed: Dp): CornerBasedShape {
 private fun Shape.pressMorph(press: PressState, pressed: Dp): Shape =
     (this as? CornerBasedShape)?.morphed(press.fraction.value, pressed) ?: this
 
+// ---------- Группа кнопок: нажатая кнопка расширяется, соседние уступают место ----------
+
+/**
+ * Вес кнопки в строке-группе. Пока нажата [self] — вес растёт, пока нажата одна из [others] — уменьшается;
+ * изменения идут пружиной M3E, поэтому ряд «дышит» при нажатии.
+ */
 @Composable
 internal fun RowScope.groupWeight(
     self: MutableInteractionSource,
@@ -93,6 +120,7 @@ internal fun RowScope.groupWeight(
         if (p) otherPressed = true
     }
     val w by animateFloatAsState(
+        // Суммарная ширина группы постоянна: нажатая кнопка +amount, остальные делят эту прибавку поровну.
         targetValue = 1f + (if (selfPressed) amount else 0f) -
             (if (otherPressed && !selfPressed) amount / others.size.coerceAtLeast(1) else 0f),
         animationSpec = pressSpring(),
@@ -100,6 +128,8 @@ internal fun RowScope.groupWeight(
     )
     return Modifier.weight(w.coerceAtLeast(0.2f))
 }
+
+// ---------- Кнопки ----------
 
 @Composable
 internal fun Button(
@@ -204,6 +234,8 @@ internal fun TextButton(
     )
 }
 
+// ---------- Кнопки-значки ----------
+
 @Composable
 internal fun IconButton(
     onClick: () -> Unit,
@@ -274,6 +306,10 @@ internal fun FilledTonalIconButton(
     ) { HintContent(tip, hint, content) }
 }
 
+/**
+ * Переключаемый значок (лайк, повтор, текст песни…): то же сжатие при нажатии, а при смене состояния значок
+ * «хлопает» — на мгновение уменьшается и пружинно отскакивает с перелётом.
+ */
 @Composable
 internal fun IconToggleButton(
     checked: Boolean,
@@ -326,6 +362,7 @@ internal fun FloatingActionButton(
     )
 }
 
+/** Сегментная кнопка (выбор из нескольких): сжимается при нажатии, как остальные кнопки. */
 @Composable
 internal fun SingleChoiceSegmentedButtonRowScope.SegmentedButton(
     selected: Boolean,

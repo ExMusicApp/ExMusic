@@ -1,0 +1,14 @@
+{
+  "id": "exm.smart-wave",
+  "name": "Умная волна",
+  "version": "1.2.0",
+  "author": "ExMusic",
+  "description": "Добавляет в окно «Включить волну» станции под время суток: утро, день, вечер, ночь. Список обновляется сам.",
+  "api": 2,
+  "icon": "icon.png",
+  "contributes": {
+    "lua": {
+      "main": "main.lua"
+    }
+  }
+}

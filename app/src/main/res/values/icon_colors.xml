@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Фон адаптивных иконок приложения (Настройки → Внешний вид → Иконка приложения) -->
     <color name="ic_launcher_notclaude_bg">#DE7356</color>
     <color name="ic_launcher_indigo_bg">#5100FF</color>
     <color name="ic_launcher_matcha_bg">#8A9A5B</color>

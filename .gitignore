@@ -1,16 +1,20 @@
-*.iml
-.gradle/
-.idea/
-.kotlin/
-build/
-captures/
-.externalNativeBuild/
-.cxx/
+# секреты подписи
 local.properties
-keystore.properties
 *.jks
 *.keystore
-*.apk
-*.aab
-*.hprof
+
+# сборка и IDE
+.gradle/
+build/
+/captures
+.idea/
+*.iml
+.kotlin/
+
+# мусор
+__pycache__/
+*.pyc
 .DS_Store
+
+# собранные плагины (создаются: python3 plugins-examples/build.py)
+plugins-examples/*.exm

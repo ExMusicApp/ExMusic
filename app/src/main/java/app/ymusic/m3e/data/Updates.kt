@@ -17,16 +17,24 @@ import org.json.JSONArray
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
+/**
+ * Ветка обновлений. Определяется по последней букве версии: 1.2.0B — beta, 1.2.0S (или просто 1.2.0) — stable.
+ * [rank] нужен, чтобы при одинаковом номере stable считался новее beta (1.2.0S новее 1.2.0B).
+ */
 enum class UpdateChannel(val title: String, val suffix: Char, val rank: Int) {
     Stable("Stable", 'S', 1),
     Beta("Beta", 'B', 0),
 }
 
+/** Версия вида `1.2.0B`: числа + буква ветки. */
 data class AppVersion(val nums: List<Int>, val channel: UpdateChannel) : Comparable<AppVersion> {
+    /** `1.2.0` */
     val number: String get() = nums.joinToString(".")
 
+    /** `1.2.0B` — как в теге релиза. */
     val tag: String get() = number + channel.suffix
 
+    /** Для экранов: `1.2.0 beta` / `1.2.0`. */
     val display: String get() = if (channel == UpdateChannel.Beta) "$number beta" else number
 
     override fun compareTo(other: AppVersion): Int {
@@ -42,6 +50,7 @@ data class AppVersion(val nums: List<Int>, val channel: UpdateChannel) : Compara
     companion object {
         private val re = Regex("""^[vV]?\s*(\d+(?:\.\d+)*)\s*[-_ ]?\s*([A-Za-z]*)$""")
 
+        /** `v1.2.0B`, `1.2.0S`, `1.2.0 beta`, `1.2.0` (без буквы = stable). Неизвестная буква → null (релиз пропускается). */
         fun parse(text: String?): AppVersion? {
             val m = re.matchEntire(text?.trim().orEmpty()) ?: return null
             val nums = m.groupValues[1].split('.').mapNotNull { it.toIntOrNull() }
@@ -70,6 +79,7 @@ sealed interface UpdateResult {
     data class Failed(val message: String) : UpdateResult
 }
 
+/** Проверка обновлений по релизам на GitHub (github.com/exmusicapp/exmusic/releases). */
 object Updates {
     const val REPO = "exmusicapp/exmusic"
     const val RELEASES_PAGE = "https://github.com/$REPO/releases"
@@ -84,21 +94,27 @@ object Updates {
         .callTimeout(20, TimeUnit.SECONDS)
         .build()
 
+    /** Версия установленного приложения (versionName из gradle, например `1.2.0B`). */
     val current: AppVersion =
         AppVersion.parse(BuildConfig.VERSION_NAME) ?: AppVersion(listOf(0, 0, 0), UpdateChannel.Beta)
 
+    /** Выбранная ветка обновлений. По умолчанию — ветка установленной сборки. */
     var channel by mutableStateOf(current.channel)
         private set
 
+    /** Проверять обновления при запуске приложения. */
     var checkOnStart by mutableStateOf(false)
         private set
 
+    /** Идёт проверка. */
     var checking by mutableStateOf(false)
         private set
 
+    /** Найденное при запуске обновление — показывается алертом внизу. */
     var banner by mutableStateOf<UpdateInfo?>(null)
         private set
 
+    /** Результат ручной проверки из настроек — показывается модалкой. */
     var dialog by mutableStateOf<UpdateResult?>(null)
         private set
 
@@ -124,10 +140,15 @@ object Updates {
     fun dismissBanner() { banner = null }
     fun dismissDialog() { dialog = null }
 
+    /** Проверка при запуске: молчит, если обновлений нет или сети нет; найденное — в [banner]. */
     fun checkOnLaunch() {
         if (checkOnStart) check(manual = false)
     }
 
+    /**
+     * [manual] = true — результат (обновление / «последняя версия» / ошибка) показывается модалкой [dialog];
+     * false — только алерт [banner], если нашлось обновление.
+     */
     fun check(manual: Boolean) {
         if (checking) return
         checking = true
@@ -179,6 +200,7 @@ object Updates {
             if (r.optBoolean("draft")) continue
             val tag = r.optString("tag_name")
             val v = AppVersion.parse(tag) ?: AppVersion.parse(r.optString("name")) ?: continue
+            // Stable видит только стабильные релизы; Beta — беты и стабильные (новее из них).
             if (channel == UpdateChannel.Stable && v.channel != UpdateChannel.Stable) continue
             if (best != null && v <= best.version) continue
             var apk: String? = null

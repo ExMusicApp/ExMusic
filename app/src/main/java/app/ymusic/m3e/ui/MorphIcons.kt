@@ -32,6 +32,11 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
+/**
+ * Галочка с анимацией «кружок → галочка»: на миг появляется кружок и стягивается в галочку, которая прорисовывается
+ * штрихом; снятие отмечает всё то же самое в обратную сторону. Отключается в Настройки → Внешний вид → Анимации.
+ * [appear] — отыграть появление, когда элемент только вошёл в композицию (например, «уже в плейлисте»).
+ */
 @Composable
 internal fun AnimatedCheck(
     checked: Boolean,
@@ -52,6 +57,7 @@ internal fun AnimatedCheck(
         if (p <= 0f) return@Canvas
         val w = this.size.minDimension
         val stroke = w * 0.1f
+        // Кружок: вспыхивает в начале и стягивается в центр, пока рисуется галочка (без анимации — не рисуется).
         val ring = if (on) (4f * p * (1f - p)).coerceIn(0f, 1f) else 0f
         if (ring > 0f) {
             drawCircle(
@@ -72,6 +78,11 @@ internal fun AnimatedCheck(
     }
 }
 
+/**
+ * Значок кнопки «играть/пауза» с состоянием загрузки: при загрузке трека значок сжимается в кружок, кружок
+ * распадается на три точки, которые пульсируют; когда трек загрузился, точки собираются обратно в кружок, и
+ * проявляется значок. Отключается в Настройки → Внешний вид → Анимации.
+ */
 @Composable
 internal fun LoadingDotsMorph(
     loading: Boolean,
@@ -87,6 +98,7 @@ internal fun LoadingDotsMorph(
         label = "dotsMorph",
     )
     Box(modifier.size(size), contentAlignment = Alignment.Center) {
+        // Значок гаснет и сжимается к центру в первой трети перехода и возвращается в последней.
         val iconA = (1f - q * 3f).coerceIn(0f, 1f)
         if (iconA > 0f) {
             Box(Modifier.graphicsLayer { alpha = iconA; scaleX = 0.6f + 0.4f * iconA; scaleY = 0.6f + 0.4f * iconA }) { content() }
@@ -101,12 +113,14 @@ internal fun LoadingDotsMorph(
             Canvas(Modifier.size(size)) {
                 val w = this.size.minDimension
                 val c = center
+                // Фаза 1 (q 0…0.4): кружок вырастает. Фаза 2 (0.4…1): кружок стягивается в среднюю точку,
+                // две боковые точки выезжают из центра. Обратный ход — то же задом наперёд.
                 val grow = (q / 0.4f).coerceIn(0f, 1f)
                 val split = ((q - 0.4f) / 0.6f).coerceIn(0f, 1f)
                 val r0 = w * 0.2f
                 val rDot = w * 0.085f
                 val gap = w * 0.24f * split
-                val settled = split
+                val settled = split // пульсация набирает силу, когда точки разошлись
                 fun pulseOf(i: Int): Float {
                     val ph = ((t - i / 3f) % 1f + 1f) % 1f
                     val bump = if (ph < 0.5f) kotlin.math.sin(ph * 2f * Math.PI.toFloat()) else 0f

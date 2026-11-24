@@ -43,7 +43,28 @@ import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 import kotlin.coroutines.resume
 
+/*
+ * Локальное управление Яндекс Станцией по протоколу Glagol — порт реализации из PulseSync
+ * (src/main/lib/yandexStation: YandexAuthClient, YandexQuasarClient, YandexMdnsDiscovery, YandexGlagolClient,
+ * YandexStationService, YandexStationRuntime и features/yandexStation.ts).
+ *
+ * Как это работает (то же, что в PulseSync, docs/yandex-station-api.md):
+ *   A. cookies Яндекса (из WebView, как у PulseSync из сессии Electron) -> x_token -> «производный» music_token;
+ *   B. список колонок аккаунта: iot.quasar.yandex.ru (имена и quasar_info.device_id/platform);
+ *   C. колонки в локальной сети: mDNS «_yandexio._tcp» (host, port, TXT deviceId/platform);
+ *   D. conversationToken: quasar.yandex.net/glagol/token (Authorization: OAuth <music_token>);
+ *   E. wss://<host>:<port> (сертификат у колонки свой — проверка отключена, как rejectUnauthorized=false),
+ *      команды {conversationToken, id, payload{command…}, sentTime}: play, stop, next, prev, rewind, setVolume, playMusic.
+ *
+ * Колонка по Glagol играет ОДИН трек (playMusic type=track), поэтому очередь, следующий/предыдущий и автопереход
+ * ведёт телефон — как PulseSync шлёт следующий трек заранее, перед концом текущего.
+ *
+ * Протокол неофициальный; если Яндекс его изменит, поломается только этот файл.
+ */
+
+/** Колонка, найденная в локальной сети. */
 data class StationSpeaker(
+    /** Glagol device_id (mDNS TXT deviceId / quasar_info.device_id). */
     val id: String,
     val name: String,
     val platform: String?,
@@ -51,6 +72,7 @@ data class StationSpeaker(
     val port: Int,
 )
 
+/** Служебное имя вроде «YandexIOReceiver» (mDNS-сервис) — человеку его показывать нельзя. */
 fun isGenericSpeakerName(name: String?): Boolean {
     val n = name?.trim()?.lowercase().orEmpty()
     if (n.isEmpty()) return true
@@ -62,11 +84,14 @@ fun isGenericSpeakerName(name: String?): Boolean {
 data class StationState(
     val scanning: Boolean = false,
     val speakers: List<StationSpeaker> = emptyList(),
+    /** Токен для колонки получить не удалось — нужен вход в Яндекс (WebView). */
     val loginRequired: Boolean = false,
+    /** id активной колонки (StationSpeaker.id), null — телефон колонкой не управляет. */
     val activeId: String? = null,
     val playing: Boolean = false,
     val progressMs: Long = 0,
     val durationMs: Long = 0,
+    /** Громкость 0..1, −1 — неизвестна. */
     val volume: Double = -1.0,
     val trackId: String? = null,
     val index: Int = -1,
@@ -75,6 +100,7 @@ data class StationState(
 
 private class StationAuthException(message: String, val needLogin: Boolean) : IOException(message)
 
+/** Cookies Яндекса из WebView (как PulseSync берёт их из Electron session): на диск не сохраняем и не логируем. */
 object StationCookies {
     private val urls = listOf(
         "https://passport.yandex.ru",
@@ -101,6 +127,7 @@ object StationCookies {
 
     fun hasSession(): Boolean = header()?.contains("Session_id=") == true
 
+    /** Выход: гасим cookies домена yandex.ru / ya.ru. */
     fun clear() {
         runCatching {
             val cm = CookieManager.getInstance()
@@ -123,6 +150,7 @@ class YandexStation(
     ctx: Context,
     base: OkHttpClient,
     private val appToken: () -> String?,
+    /** Колонка перестала отвечать / не удалось включить — телефон должен забрать музыку обратно. */
     private val onLost: (String) -> Unit,
 ) {
     private companion object {
@@ -135,14 +163,17 @@ class YandexStation(
         const val MOBILE_OAUTH_TOKEN = "https://oauth.mobile.yandex.net/1/token"
         const val GLAGOL_TOKEN = "https://quasar.yandex.net/glagol/token"
 
+        // Reverse-engineered константы (AlexxIT/YandexStation и официальные клиенты Яндекса), см. constants.js в PulseSync.
         const val PASSPORT_CLIENT_ID = "c0ebe342af7d48fbbbfcf2d2eedb8f9e"
         const val PASSPORT_CLIENT_SECRET = "ad0a908f0aa341a182a37ecd75bc319e"
         const val MUSIC_CLIENT_ID = "23cabbbdc6cd418abb4b39c32c41195d"
         const val MUSIC_CLIENT_SECRET = "53bc75238f0c4d08a118e51fe9203300"
 
         const val MDNS_SERVICE = "_yandexio._tcp"
+        /** Сколько сканируем сеть после запроса (PulseSync: mdnsTimeoutMs = 15 с). */
         const val SCAN_WINDOW_MS = 30_000L
         const val RESPONSE_TIMEOUT_MS = 8_000L
+        /** За сколько до конца трека шлём следующий (PulseSync шлёт по событию crossfade). */
         const val ADVANCE_LEAD_MS = 1_500L
         const val VOLUME_STEP = 0.05
     }
@@ -157,6 +188,8 @@ class YandexStation(
     private val _state = MutableStateFlow(StationState())
     val state: StateFlow<StationState> = _state
 
+    // ---------- TLS без проверки сертификата — только для локального wss:// колонки ----------
+
     private val wsClient: OkHttpClient = run {
         val trustAll = object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<X509Certificate>?, authType: String?) = Unit
@@ -167,6 +200,7 @@ class YandexStation(
         OkHttpClient.Builder()
             .sslSocketFactory(ssl.socketFactory, trustAll)
             .hostnameVerifier { _, _ -> true }
+            // Проверка сертификата отключена, поэтому соединяться можно только с адресами локальной сети: иначе MITM в интернете.
             .dns(object : okhttp3.Dns {
                 override fun lookup(hostname: String): List<java.net.InetAddress> {
                     val all = okhttp3.Dns.SYSTEM.lookup(hostname)
@@ -181,7 +215,10 @@ class YandexStation(
             .build()
     }
 
+    // ---------- Авторизация: cookies -> x_token -> music_token -> conversationToken ----------
+
     @Volatile private var derivedMusicToken: String? = null
+    /** null — ещё не проверяли; токен самого приложения тоже пробуем (вдруг колонка его принимает). */
     @Volatile private var appTokenWorks: Boolean? = null
     private val authMutex = Mutex()
 
@@ -206,6 +243,7 @@ class YandexStation(
     }
 
     private fun validateXToken(xToken: String) {
+        // В PulseSync проверка обязательна; здесь неудача не фатальна — реальный отказ всё равно проявится на следующем шаге.
         runCatching {
             val req = Request.Builder().url(PASSPORT_SHORT_INFO).header("Authorization", "OAuth $xToken").build()
             http.newCall(req).execute().use { r ->
@@ -231,6 +269,7 @@ class YandexStation(
         }
     }
 
+    /** GET quasar.yandex.net/glagol/token. 401/403 = этот music_token колонке не подходит. */
     private fun fetchConversationToken(musicToken: String, deviceId: String, platform: String): String {
         val url = Uri.parse(GLAGOL_TOKEN).buildUpon()
             .appendQueryParameter("device_id", deviceId)
@@ -240,6 +279,8 @@ class YandexStation(
         http.newCall(req).execute().use { r ->
             val j = readJson(r)
             val t = j?.optString("token").orEmpty()
+            // Любой отказ на уровне HTTP/ответа (401/403/400, status != ok) значит «этот music_token не подходит» — идём дальше по цепочке.
+            // Сетевые сбои и 5xx — обычные IOException, они цепочку не прерывают.
             if (r.code in 400..499 || (r.isSuccessful && (j?.optString("status") != "ok" || t.isBlank()))) {
                 throw StationAuthException("Яндекс не выдал токен колонки (HTTP ${r.code})", needLogin = false)
             }
@@ -248,6 +289,10 @@ class YandexStation(
         }
     }
 
+    /**
+     * conversationToken для колонки. Порядок: уже известный рабочий токен -> токен приложения -> цепочка из cookies.
+     * Бросает StationAuthException(needLogin = true), если нужен вход.
+     */
     private suspend fun conversationToken(deviceId: String, platform: String): String = authMutex.withLock {
         withContext(Dispatchers.IO) {
             derivedMusicToken?.let { t ->
@@ -281,6 +326,8 @@ class YandexStation(
             }
         }
     }
+
+    // ---------- Колонки аккаунта (iot.quasar.yandex.ru): имена и platform ----------
 
     private class AccountSpeaker(val iotId: String, val name: String, val glagolId: String?, val platform: String?)
 
@@ -340,8 +387,9 @@ class YandexStation(
     }
 
     private suspend fun refreshAccountSpeakers() {
+        // Список аккаунта (там настоящие имена колонок) иногда не отдаётся с первого раза — пробуем ещё пару раз.
         for (attempt in 0 until 3) {
-            val cookie = StationCookies.header() ?: return
+            val cookie = StationCookies.header() ?: return // не входили в Яндекс — имён из аккаунта не получить
             val loaded = runCatching { loadAccountSpeakers(cookie) }
                 .onFailure { Log.w(TAG, "account speakers failed: ${it.javaClass.simpleName}") }
                 .getOrDefault(emptyList())
@@ -355,6 +403,8 @@ class YandexStation(
         publishSpeakers()
     }
 
+    // ---------- mDNS: _yandexio._tcp.local (NsdManager вместо ручного multicast-dns) ----------
+
     private val localFound = ConcurrentHashMap<String, StationSpeaker>()
     private var nsd: NsdManager? = null
     private var discovery: NsdManager.DiscoveryListener? = null
@@ -366,16 +416,19 @@ class YandexStation(
         val acc = accountSpeakers
         val used = HashSet<AccountSpeaker>()
         val locals = localFound.values.toList()
+        // 1) точное совпадение по glagol device_id
         val matched = HashMap<String, AccountSpeaker>()
         for (sp in locals) {
             val a = acc.firstOrNull { it !in used && it.glagolId != null && it.glagolId.equals(sp.id, ignoreCase = true) }
             if (a != null) { used += a; matched[sp.id] = a }
         }
+        // 2) платформа + похожее имя
         for (sp in locals) {
             if (sp.id in matched) continue
             val a = acc.firstOrNull { x -> x !in used && sp.platform != null && x.platform.equals(sp.platform, true) && namesMatch(x.name, sp.name) }
             if (a != null) { used += a; matched[sp.id] = a }
         }
+        // 3) служебное имя и единственный подходящий кандидат по платформе
         for (sp in locals) {
             if (sp.id in matched || sp.platform == null) continue
             val cand = acc.filter { x -> x !in used && x.platform.equals(sp.platform, true) }
@@ -442,6 +495,7 @@ class YandexStation(
         }
     }
 
+    /** NsdManager резолвит по одному, поэтому очередь через Mutex и повторы. */
     private fun resolveAndStore(si: NsdServiceInfo) {
         scope.launch {
             resolveMutex.withLock {
@@ -524,12 +578,16 @@ class YandexStation(
         _state.update { it.copy(scanning = false) }
     }
 
+    // ---------- Публичное управление жизненным циклом ----------
+
+    /** Окно «Вывод звука» открыто: ищем колонки в сети и подтягиваем имена из аккаунта. */
     fun start() {
         startDiscovery()
         scope.launch { refreshAccountSpeakers() }
         scope.launch { probeAuth() }
     }
 
+    /** Повторный поиск (кнопка «Повторить»). */
     fun rescan() {
         localFound.clear()
         publishSpeakers()
@@ -537,6 +595,7 @@ class YandexStation(
         start()
     }
 
+    /** Окно закрыто и колонкой никто не управляет: сеть не сканируем, сокет не держим. */
     fun shutdown() {
         stopDiscovery()
         closeLink()
@@ -546,6 +605,7 @@ class YandexStation(
         _state.update { StationState() }
     }
 
+    /** После входа через WebView: токены считаем заново. */
     fun afterLogin() {
         derivedMusicToken = null
         appTokenWorks = null
@@ -554,7 +614,12 @@ class YandexStation(
         scope.launch { probeAuth() }
     }
 
+    /**
+     * Заранее проверяем, получится ли вообще управлять колонкой, — чтобы кнопка «Войти» появилась сразу, а не после неудачного
+     * нажатия на колонку.
+     */
     private suspend fun probeAuth() {
+        // Колонки могут найтись не сразу — ждём до нескольких секунд.
         var sp: StationSpeaker? = null
         for (i in 0 until 12) {
             sp = _state.value.speakers.firstOrNull { it.platform != null }
@@ -577,6 +642,8 @@ class YandexStation(
 
     fun speaker(id: String): StationSpeaker? = _state.value.speakers.firstOrNull { it.id == id }
 
+    // ---------- Glagol: постоянное WebSocket-соединение с колонкой ----------
+
     private inner class Link(val sp: StationSpeaker, val token: String) {
         @Volatile var socket: WebSocket? = null
         @Volatile var closedByUs = false
@@ -590,6 +657,7 @@ class YandexStation(
             socket = wsClient.newWebSocket(req, object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     openedAt = System.currentTimeMillis()
+                    // Как в PulseSync: softwareVersion «будит» колонку, она присылает текущее состояние.
                     send(JSONObject().put("command", "softwareVersion"))
                 }
 
@@ -667,6 +735,7 @@ class YandexStation(
 
     private var reconnectJob: Job? = null
 
+    /** Сокет упал при активной колонке: несколько попыток переподключиться, потом отдаём музыку телефону. */
     private fun linkDropped(l: Link) {
         if (link !== l || _state.value.activeId == null) return
         link = null
@@ -696,9 +765,12 @@ class YandexStation(
         onLost(msg)
     }
 
+    // ---------- Состояние колонки ----------
+
     private fun normalizeVolume(v: Double): Double =
         if (v.isNaN() || v < 0) -1.0 else (if (v > 1.0) v / 100.0 else v).coerceIn(0.0, 1.0)
 
+    /** playing/paused: основное поле — state.playing, запасные — как у extractStationPlaybackState в PulseSync. */
     private fun extractPlaying(st: JSONObject): Boolean? {
         if (st.has("playing")) return st.optBoolean("playing")
         val ps = st.optJSONObject("playerState")
@@ -727,6 +799,7 @@ class YandexStation(
         val volume = if (st.has("volume")) normalizeVolume(st.optDouble("volume", -1.0)) else prev.volume
         val reportedId = ps?.optString("id")?.substringBefore(':')?.ifBlank { null }
 
+        // Колонка сообщила трек, которого мы не запускали (голосовая команда, другой клиент), — если он в нашей очереди, следуем за ним.
         var idx = index
         var trackId = queue.getOrNull(idx)?.id ?: prev.trackId
         if (reportedId != null && reportedId != trackId) {
@@ -740,6 +813,7 @@ class YandexStation(
             }
         }
 
+        // Трек доигран и колонка остановилась, а следующий мы заранее не отправили — отправляем сейчас.
         val endedNaturally = prev.playing && !playing && prev.durationMs > 0 && prev.progressMs >= prev.durationMs - 2_500
         _state.update {
             it.copy(
@@ -759,6 +833,8 @@ class YandexStation(
             scheduleAdvance()
         }
     }
+
+    // ---------- Очередь и автопереход ----------
 
     @Volatile private var queue: List<Track> = emptyList()
     @Volatile private var index = -1
@@ -805,6 +881,7 @@ class YandexStation(
 
     private fun entityId(t: Track): String = if (!t.albumId.isNullOrBlank()) "${t.id}:${t.albumId}" else t.id
 
+    /** playMusic type=track [+ rewind на позицию с поправкой на задержку сети, как SET_PROGRESS + compensateLatency в PulseSync]. */
     private fun startTrack(i: Int, positionMs: Long) {
         val t = queue.getOrNull(i) ?: return
         val l = link ?: return
@@ -838,6 +915,9 @@ class YandexStation(
         index = -1
     }
 
+    // ---------- Команды (вызываются из YandexConnect) ----------
+
+    /** Запускает [tracks] с [startIndex]/[positionMs] на колонке [sp]. Соединение и токены готовятся в фоне. */
     fun play(sp: StationSpeaker, tracks: List<Track>, startIndex: Int, positionMs: Long, repeatMode: String) {
         queue = tracks
         index = startIndex
@@ -853,7 +933,7 @@ class YandexStation(
         scope.launch {
             try {
                 ensureLink(sp)
-                if (_state.value.activeId != sp.id) return@launch
+                if (_state.value.activeId != sp.id) return@launch // пока готовились, пользователь отменил
                 startTrack(startIndex, positionMs)
             } catch (e: CancellationException) {
                 throw e
@@ -910,6 +990,7 @@ class YandexStation(
         return true
     }
 
+    /** Громкость 0..1, шаг 5% как в PulseSync (VOLUME_STEP). */
     fun setVolume(v: Double) {
         val l = link ?: return
         val q = Math.round(v.coerceIn(0.0, 1.0) / VOLUME_STEP) * VOLUME_STEP
@@ -917,6 +998,7 @@ class YandexStation(
         _state.update { it.copy(volume = q) }
     }
 
+    /** Вернуть музыку телефону: колонка на паузу (как clearSpeaker в PulseSync), соединение закрываем. */
     fun release() {
         link?.send(JSONObject().put("command", "stop"))
         resetPlayback()

@@ -3,11 +3,14 @@ package app.ymusic.m3e.data
 import org.json.JSONArray
 import org.json.JSONObject
 
+/** Сохранение треков, альбомов и плейлистов в JSON (офлайн-кэш и индекс скачанного). */
+
 internal fun Track.toJson(): JSONObject = JSONObject()
     .put("id", id).put("albumId", albumId ?: "").put("title", title).put("artists", artists)
     .put("cover", coverUri ?: "").put("dur", durationMs).put("album", albumTitle ?: "")
     .put("explicit", explicit).put("year", year).put("label", label ?: "").put("genre", genre ?: "")
     .put("version", version ?: "")
+    .put("akey", accessKey ?: "")
     .put(
         "refs",
         JSONArray().also { arr ->
@@ -34,7 +37,8 @@ internal fun trackFromJson(o: JSONObject): Track {
         label = o.optString("label").ifBlank { null },
         genre = o.optString("genre").ifBlank { null },
         version = o.optString("version").ifBlank { null },
-    )
+        accessKey = o.optString("akey").ifBlank { null },
+    ).also { t -> VkKeys.remember(t) }
 }
 
 internal fun List<Track>.toJsonArray(): JSONArray = JSONArray().also { a -> forEach { a.put(it.toJson()) } }
@@ -44,13 +48,14 @@ internal fun tracksFromJson(a: JSONArray?): List<Track> =
 
 internal fun PlaylistInfo.toJson(): JSONObject = JSONObject()
     .put("kind", kind).put("owner", ownerUid).put("title", title).put("count", trackCount).put("cover", coverUri ?: "")
-    .put("visibility", visibility ?: "")
+    .put("visibility", visibility ?: "").put("akey", accessKey ?: "")
 
 internal fun playlistFromJson(o: JSONObject) = PlaylistInfo(
     kind = o.getInt("kind"), ownerUid = o.optString("owner"), title = o.optString("title"),
     trackCount = o.optInt("count"), coverUri = o.optString("cover").ifBlank { null },
     visibility = o.optString("visibility").ifBlank { null },
-)
+    accessKey = o.optString("akey").ifBlank { null },
+).also { p -> if (p.accessKey != null) VkKeys.rememberPlaylist(p.ownerUid, p.kind, p.accessKey) }
 
 internal fun AlbumInfo.toJson(): JSONObject = JSONObject()
     .put("id", id).put("title", title).put("artists", artists).put("cover", coverUri ?: "")

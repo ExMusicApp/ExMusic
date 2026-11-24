@@ -11,13 +11,21 @@ import androidx.compose.runtime.setValue
 import org.json.JSONObject
 import java.io.File
 
+/** Правки, внесённые пользователем в локальный трек: своё название, имя исполнителя и своя обложка. */
 data class LocalTrackEdit(val artist: String? = null, val coverPath: String? = null, val title: String? = null)
 
+/**
+ * Свои исполнитель и обложка для файлов с устройства. Сами аудиофайлы не меняются (на новых версиях Android
+ * приложению нельзя переписывать чужие файлы): правки лежат в приложении и накладываются при чтении списка
+ * файлов, поэтому работают везде — в списках, альбомах, исполнителях, плеере и поиске.
+ * Ключ — id трека («local:<id в MediaStore>»).
+ */
 object LocalTrackEdits {
     private var prefs: SharedPreferences? = null
     private var appContext: Context? = null
     private val map = HashMap<String, LocalTrackEdit>()
 
+    /** Растёт при каждом изменении — по нему экраны понимают, что список нужно перечитать. */
     var version by mutableIntStateOf(0)
         private set
 
@@ -58,6 +66,11 @@ object LocalTrackEdits {
         version++
     }
 
+    /**
+     * Сохраняет правку. [title] и [artist] — пустая строка или null: вернуть название / исполнителя из файла.
+     * [newCover] — выбранная картинка (копируется в приложение); [resetCover] — вернуть обложку из файла.
+     * Вызывать не из главного потока (картинка читается и сжимается).
+     */
     fun update(id: String, artist: String?, newCover: Uri?, resetCover: Boolean, title: String? = null): Boolean {
         val ctx = appContext ?: return false
         val old = get(id)
@@ -77,10 +90,12 @@ object LocalTrackEdits {
         return true
     }
 
+    /** Убирает все правки трека. */
     fun reset(id: String) {
         update(id, artist = null, newCover = null, resetCover = true)
     }
 
+    /** Копия картинки в приложении, уменьшенная до 1000 px по длинной стороне. Имя файла уникальное — Coil не отдаст старую из кэша. */
     private fun copyCover(ctx: Context, id: String, uri: Uri): String? = runCatching {
         val dir = coversDir() ?: return null
         val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null

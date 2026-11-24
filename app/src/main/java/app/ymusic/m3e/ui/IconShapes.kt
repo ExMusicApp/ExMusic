@@ -18,6 +18,7 @@ import kotlin.math.pow
 import kotlin.math.sign
 import kotlin.math.sin
 
+/** Форма карточек, обложек, кнопок и панелей — выбирается как «Форма значков» в AOSP. */
 enum class IconShape(val title: String) {
     Default("Material 3"),
     Circle("Круг"),
@@ -30,6 +31,7 @@ enum class IconShape(val title: String) {
     Square("Квадрат"),
 }
 
+/** Форма аватарок исполнителей (страница исполнителя, поиск, список авторов альбома). Выбирается в настройках. */
 enum class AvatarShape(val title: String) {
     Cookie12("Печенье"),
     Cookie9("Печенье мягкое"),
@@ -43,6 +45,7 @@ enum class AvatarShape(val title: String) {
     Rounded("Скруглённый квадрат"),
 }
 
+/** Суперэллипс (как у значков Pixel «squircle»): плавный переход от прямых сторон к углам. */
 object SquircleShape : Shape {
     override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
         val a = size.width / 2f
@@ -63,6 +66,7 @@ object SquircleShape : Shape {
     }
 }
 
+/** Шестиугольник с вершинами слева и справа. */
 object HexagonShape : Shape {
     override fun createOutline(size: Size, layoutDirection: LayoutDirection, density: Density): Outline {
         val w = size.width
@@ -81,6 +85,7 @@ object HexagonShape : Shape {
     }
 }
 
+/** Форма для элементов. [defaultDp] — радиус формы «Material 3» (для остальных форм не нужен). */
 fun IconShape.shape(defaultDp: Dp): Shape = when (this) {
     IconShape.Default -> RoundedCornerShape(defaultDp)
     IconShape.Circle -> RoundedCornerShape(50)
@@ -93,6 +98,11 @@ fun IconShape.shape(defaultDp: Dp): Shape = when (this) {
     IconShape.Square -> RectangleShape
 }
 
+/**
+ * Форма для больших контейнеров с текстом (группы настроек, строки списков, карточки, диалоги).
+ * У обычной [shape] углы заданы в процентах от меньшей стороны, и на высоком или широком блоке «круг», «капля»
+ * или шестиугольник срезают текст и обложки. Здесь радиус фиксирован в dp, а общий характер формы сохраняется.
+ */
 fun IconShape.containerShape(dp: Dp): Shape = when (this) {
     IconShape.Default, IconShape.Circle, IconShape.RoundedSquare, IconShape.Squircle -> RoundedCornerShape(dp)
     IconShape.Teardrop -> RoundedCornerShape(topStart = dp, topEnd = dp, bottomEnd = dp / 4f, bottomStart = dp)
@@ -101,8 +111,16 @@ fun IconShape.containerShape(dp: Dp): Shape = when (this) {
     IconShape.Square -> RectangleShape
 }
 
+/**
+ * Ближайшая угловая форма для системных компонентов Material (диалоги, меню, поля, чипы), которым нужен CornerBasedShape.
+ *
+ * Радиусы везде фиксированные, в dp, а не в процентах от меньшей стороны: у процентов высокое окно (выпадающее меню,
+ * диалог, шторка) получало огромное скругление, которое срезало текст, а шестиугольник и срезанный квадрат
+ * отрезали угол вместе с буквами. Общий характер выбранной формы сохраняется.
+ */
 fun IconShape.themeShape(dp: Dp): CornerBasedShape = when (this) {
     IconShape.Default -> RoundedCornerShape(dp)
+    // «Круг»: у небольших элементов (чипы, поля) получается капсула, у высоких — просто мягкий угол.
     IconShape.Circle -> if (dp >= 20.dp) RoundedCornerShape(dp) else RoundedCornerShape(20.dp)
     IconShape.RoundedSquare, IconShape.Squircle -> RoundedCornerShape(if (dp >= 20.dp) dp else dp * 1.5f)
     IconShape.Teardrop -> RoundedCornerShape(topStart = dp, topEnd = dp, bottomEnd = dp / 4f, bottomStart = dp)

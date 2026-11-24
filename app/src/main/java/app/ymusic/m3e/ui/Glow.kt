@@ -26,6 +26,20 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.unit.Dp
 
+/**
+ * Мягкое «дышащее» свечение вокруг элемента (обложка в плеере, кнопка «Моя волна», играющий плейлист).
+ *
+ * Рисуется ПОД элементом, поэтому ставить модификатор нужно раньше `clip(...)` / фона элемента, иначе
+ * свечение обрежется по его форме. Свечение включается, только когда [active] (музыка играет) и [enabled]
+ * (переключатель в Настройки → Оформление → Свечение); плавно появляется и гаснет. Пока свечения нет,
+ * бесконечная анимация не запускается и кадры не тратятся.
+ *
+ * Свет — скруглённый прямоугольник, нарисованный кистью с гауссовым размытием (BlurMaskFilter): ореол мягкий,
+ * без пикселизации и полос (работает на Android 8+ с аппаратным ускорением).
+ *
+ * [shape] — форма элемента (из «Формы значков» в настройках): свет повторяет её контур, а не только скруглённый
+ * прямоугольник. Без [shape] рисуется скруглённый прямоугольник с радиусом [cornerRadius].
+ */
 @Composable
 fun Modifier.playGlow(
     active: Boolean,
@@ -54,8 +68,12 @@ fun Modifier.playGlow(
             animationSpec = infiniteRepeatable(tween(3100, easing = LinearEasing), RepeatMode.Reverse),
             label = "glowB",
         )
+        // Две несоизмеримые «волны» дают неровное, живое дыхание вместо механического пульса.
         remember(a, b) { derivedStateOf { a.value * 0.6f + b.value * 0.4f } }
     } else null
+    // Кисть с настоящим гауссовым размытием (BlurMaskFilter): край свечения плавный, без «ступенек» и полос.
+    // Радиус размытия не меняется между кадрами, чтобы маска не пересчитывалась; «дыхание» делается
+    // изменением яркости и размера прямоугольника.
     val density = androidx.compose.ui.platform.LocalDensity.current
     val blurPx = with(density) { spread.toPx() } * 0.6f
     val paint = remember(blurPx) {
@@ -73,9 +91,12 @@ fun Modifier.playGlow(
             return@drawBehind
         }
         val basePx = cornerRadius.toPx()
+        // Прямоугольник чуть растёт и сжимается, оставаясь под элементом: наружу выходит только размытый ореол.
         val grow = spread.toPx() * (0.15f + 0.2f * p)
         val alpha = (strength * fade * (0.75f + 0.45f * p)).coerceIn(0f, 1f)
         if (android.os.Build.VERSION.SDK_INT < 28) {
+            // На Android 8.x аппаратный холст не поддерживает размытие кисти: рисуем плавный спад яркости
+            // густой стопкой прямоугольников с гауссовым профилем.
             val spreadPx = spread.toPx()
             val steps = 36
             for (i in steps downTo 1) {
@@ -101,15 +122,18 @@ fun Modifier.playGlow(
     }
 }
 
+/** Контур формы и временные объекты для рисования свечения по форме: пересчитываются только при смене размера или формы. */
 private class GlowPathCache {
     var size: Size = Size.Zero
     var shape: Shape? = null
     var base: android.graphics.Path? = null
+    /** Радиус, если форма — скруглённый прямоугольник с одинаковыми углами (тогда свет рисуется быстрым drawRoundRect); иначе -1. */
     var uniformRadius: Float = -1f
     val tmp = android.graphics.Path()
     val matrix = android.graphics.Matrix()
 }
 
+/** Свечение по контуру [shape]: размытая копия контура, которая «дышит» (чуть растёт и сжимается) под элементом. */
 private fun DrawScope.drawShapedGlow(
     shape: Shape,
     cache: GlowPathCache,
@@ -151,6 +175,7 @@ private fun DrawScope.drawShapedGlow(
     drawIntoCanvas { canvas ->
         val nc = canvas.nativeCanvas
         if (android.os.Build.VERSION.SDK_INT < 28) {
+            // Android 8.x: размытие кисти недоступно — плавный спад яркости стопкой увеличивающихся контуров.
             val steps = 36
             for (i in steps downTo 1) {
                 val f = i / steps.toFloat()
@@ -163,6 +188,8 @@ private fun DrawScope.drawShapedGlow(
             val g = spreadPx * (0.15f + 0.2f * p)
             val u = cache.uniformRadius
             if (u >= 0f) {
+                // Быстрый путь: размытый скруглённый прямоугольник с постоянным радиусом. Маска размытия кэшируется,
+                // а размытый контур-путь, меняющийся каждый кадр, пересчитывался бы целиком (это и подтормаживало прокрутку).
                 nc.drawRoundRect(-g, -g, w + g, h + g, u, u, blurPaint)
             } else {
                 draw(nc, g, blurPaint)

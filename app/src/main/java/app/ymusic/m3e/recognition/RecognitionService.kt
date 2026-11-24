@@ -26,6 +26,10 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+/**
+ * Фоновая запись для распознавания. Нужна, потому что запись звука устройства (MediaProjection) на Android 10+
+ * разрешена только из foreground-сервиса, а микрофон на Android 14+ — тоже.
+ */
 class RecognitionService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var job: Job? = null
@@ -63,8 +67,10 @@ class RecognitionService : Service() {
                     val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                     val mp = checkNotNull(mpm.getMediaProjection(code, data)) { "Не удалось получить доступ к звуку устройства" }
                     projection = mp
+                    // С Android 14 перед записью нужно зарегистрировать callback.
                     mp.registerCallback(object : MediaProjection.Callback() {}, Handler(mainLooper))
                 }
+                // Слушаем и параллельно проверяем: как только трек узнан, результат приходит сразу, не дожидаясь конца таймера.
                 val result = Recognizer.listen(source, projection, secs)
                 Recognizer.set(result)
                 (result as? RecState.Found)?.let { deliver(it.result) }
@@ -91,10 +97,10 @@ class RecognitionService : Service() {
         )
         val n: Notification = NotificationCompat.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ms_graphic_eq)
-            .setContentTitle("Слушаю музыку…")
-            .setContentText(if (source == RecSource.Device) "Звук с устройства" else "Микрофон")
+            .setContentTitle(app.ymusic.m3e.ui.AppLang.tr("Слушаю музыку…"))
+            .setContentText(app.ymusic.m3e.ui.AppLang.tr(if (source == RecSource.Device) "Звук с устройства" else "Микрофон"))
             .setOngoing(true)
-            .addAction(0, "Отмена", stop)
+            .addAction(0, app.ymusic.m3e.ui.AppLang.tr("Отмена"), stop)
             .build()
         if (Build.VERSION.SDK_INT >= 29) {
             val type = if (source == RecSource.Device) ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
@@ -106,6 +112,10 @@ class RecognitionService : Service() {
         }
     }
 
+    /**
+     * Что делать с найденным треком (Настройки → Распознавание музыки → «Когда трек узнан»). Если окно распознавания
+     * сейчас на экране, результат уже виден в нём, и ничего больше не нужно.
+     */
     private suspend fun deliver(r: RecResult) {
         if (Recognizer.uiShown > 0) return
         when (RecognitionSettings.onFound) {
@@ -113,12 +123,15 @@ class RecognitionService : Service() {
             FoundAction.Both -> { notifyResult(r); openApp(r) }
             FoundAction.OpenApp -> {
                 openApp(r)
+                // Из фона Android открывает окна только при особых условиях (приложение на экране или выдано
+                // «Поверх других приложений»). Не открылось — результат не должен пропасть, придёт уведомление.
                 delay(1200)
                 if (!Recognizer.appForeground) notifyResult(r)
             }
         }
     }
 
+    /** Открывает приложение на поиске найденного трека. Без особых прав система может не дать сделать это из фона. */
     private fun openApp(r: RecResult) {
         runCatching {
             startActivity(
@@ -129,6 +142,7 @@ class RecognitionService : Service() {
         }
     }
 
+    /** Всплывающее уведомление с результатом (отдельный канал с высокой важностью, чтобы оно появлялось поверх экрана). */
     private suspend fun notifyResult(r: RecResult) {
         val nm = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= 26) {
@@ -146,11 +160,12 @@ class RecognitionService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val cover = r.cover?.let { Recognizer.fetchCover(it) }
+        val findLabel = if (app.ymusic.m3e.ui.ActiveProvider.isVk) "Найти в VK Музыке" else "Найти в Яндекс Музыке"
         val b = NotificationCompat.Builder(this, CHANNEL_RESULT)
             .setSmallIcon(R.drawable.ms_music_note)
             .setContentTitle(r.title)
-            .setContentText(r.artist.ifBlank { "Найти в Яндекс Музыке" })
-            .setSubText("Найти в Яндекс Музыке")
+            .setContentText(r.artist.ifBlank { app.ymusic.m3e.ui.AppLang.tr(findLabel) })
+            .setSubText(app.ymusic.m3e.ui.AppLang.tr(findLabel))
             .setContentIntent(open)
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -175,8 +190,10 @@ class RecognitionService : Service() {
         private const val CHANNEL_RESULT = "recognition_result"
         private const val NOTIF_LISTENING = 4201
 
+        /** Уведомление с результатом; приложение убирает его, когда открывается на найденном треке. */
         const val NOTIF_RESULT = 4202
 
+        /** Выдано ли «Поверх других приложений»: с ним система разрешает открыть приложение из фона. */
         fun canOpenFromBackground(ctx: Context): Boolean = Settings.canDrawOverlays(ctx)
 
         fun start(ctx: Context, source: RecSource, resultCode: Int = 0, data: Intent? = null) {

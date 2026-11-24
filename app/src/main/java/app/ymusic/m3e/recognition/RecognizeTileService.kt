@@ -6,6 +6,7 @@ import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 
+/** Плитка «Распознать музыку» для шторки быстрых настроек: открывает окно распознавания поверх любого экрана. */
 class RecognizeTileService : TileService() {
 
     override fun onStartListening() {

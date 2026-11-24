@@ -42,19 +42,24 @@ import kotlin.coroutines.coroutineContext
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
+/** Откуда слушаем: микрофон или звук, который играет на самом устройстве (другие приложения). */
 enum class RecSource { Mic, Device }
 
+/** Найденный трек. */
 data class RecResult(
     val title: String,
     val artist: String,
     val album: String? = null,
     val cover: String? = null,
 ) {
+    /** Запрос для поиска в Яндекс Музыке. */
     val query: String get() = "$artist $title".trim()
 }
 
+/** Состояние распознавания: его показывает и шторка в приложении, и окно из плитки в шторке уведомлений. */
 sealed interface RecState {
     data object Idle : RecState
+    /** [matching] — пока идёт запись, фрагмент уже отправлен на проверку (трек могут узнать в любую секунду). */
     data class Listening(val source: RecSource, val secondsLeft: Int, val matching: Boolean = false) : RecState
     data class Searching(val source: RecSource) : RecState
     data class Found(val result: RecResult) : RecState
@@ -62,15 +67,21 @@ sealed interface RecState {
     data class Error(val message: String) : RecState
 }
 
+/**
+ * Что делать, когда трек узнан, а окно распознавания не на экране (например, слушали звук другого приложения).
+ * Если окно распознавания открыто и видно, результат показывается прямо в нём.
+ */
 enum class FoundAction(val title: String, val hint: String) {
     Notify("Уведомление", "Всплывающее уведомление с названием и исполнителем. Нажатие открывает поиск трека в приложении"),
     OpenApp("Открыть приложение", "Сразу открыть приложение на поиске найденного трека. Если система не даёт открыть его из фона, придёт уведомление"),
     Both("Оба способа", "И открыть приложение, и оставить уведомление с результатом"),
 }
 
+/** Настройки распознавания (SharedPreferences). */
 object RecognitionSettings {
     private var prefs: SharedPreferences? = null
 
+    /** Действие при найденном треке (Настройки → Распознавание музыки → «Когда трек узнан»). */
     var onFound by mutableStateOf(FoundAction.OpenApp)
         private set
 
@@ -79,9 +90,11 @@ object RecognitionSettings {
         prefs?.edit()?.putString("on_found", a.name)?.apply()
     }
 
+    /** Необязательный ключ api_token с https://dashboard.audd.io: запасной вариант, если Shazam не узнал трек. */
     var auddToken by mutableStateOf("")
         private set
 
+    /** Длина записываемого фрагмента, секунд. */
     var clipSeconds by mutableIntStateOf(12)
         private set
 
@@ -106,6 +119,12 @@ object RecognitionSettings {
     }
 }
 
+/**
+ * Распознавание музыки: записываем фрагмент (микрофон или внутренний звук устройства через
+ * AudioPlaybackCapture), считаем отпечаток прямо на телефоне и отправляем его в Shazam: ключи и настройка
+ * не нужны. Найденный трек потом ищется в Яндекс Музыке по «исполнитель + название».
+ * Если Shazam ничего не нашёл, а в настройках указан ключ AudD, пробуем ещё и его.
+ */
 object Recognizer {
     private const val RATE = 44100
 
@@ -113,15 +132,19 @@ object Recognizer {
     val state: StateFlow<RecState> = _state
 
     fun set(s: RecState) {
+        // Узнанный трек сразу попадает в историю распознавания.
         if (s is RecState.Found) RecognitionHistory.add(s.result)
         _state.value = s
     }
     fun reset() { _state.value = RecState.Idle }
 
+    /** Сколько окон распознавания сейчас на экране (RESUMED): если есть, результат виден и без уведомления. */
     @Volatile var uiShown: Int = 0
 
+    /** Главное окно приложения на экране (между onStart и onStop). */
     @Volatile var appForeground: Boolean = false
 
+    /** Идёт запись или поиск — повторно запускать нельзя. */
     val busy: Boolean get() = _state.value.let { it is RecState.Listening || it is RecState.Searching }
 
     private val http = OkHttpClient.Builder()
@@ -130,6 +153,7 @@ object Recognizer {
         .readTimeout(45, TimeUnit.SECONDS)
         .build()
 
+    /** Записывает [seconds] секунд звука и возвращает WAV (PCM 16 бит, моно). null — если звука нет совсем. */
     @SuppressLint("MissingPermission")
     suspend fun record(source: RecSource, projection: MediaProjection?, seconds: Int): ByteArray? =
         withContext(Dispatchers.IO) {
@@ -146,6 +170,7 @@ object Recognizer {
                     .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                     .addMatchingUsage(AudioAttributes.USAGE_GAME)
                     .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    // Своё приложение не слушаем: иначе «распознаем» собственный плеер.
                     .excludeUid(Process.myUid())
                     .build()
                 builder.setAudioPlaybackCaptureConfig(cfg)
@@ -177,6 +202,7 @@ object Recognizer {
                 rec.release()
             }
             if (!coroutineContext.isActive) return@withContext null
+            // Почти тишина — отправлять нечего.
             if (peak < 150) null else toWav(pcm, filled)
         }
 
@@ -195,6 +221,7 @@ object Recognizer {
         return out.toByteArray()
     }
 
+    /** Определяет трек по записи: сначала Shazam (без ключа), затем AudD, если указан ключ. */
     suspend fun identify(wav: ByteArray): RecState = withContext(Dispatchers.IO) {
         val shazam = identifyShazam(wav)
         if (shazam is RecState.Found) return@withContext shazam
@@ -211,9 +238,11 @@ object Recognizer {
         return ShortArray(n) { bb.short }
     }
 
+    /** Отпечаток считается на устройстве, на сервер уходит только он (несколько килобайт), а не сама запись. */
     private fun identifyShazam(wav: ByteArray): RecState {
         return try {
             val pcm = ShazamSignature.resampleTo16k(wavToPcm(wav), RATE)
+            // Пробуем отпечаток с начала записи, а если не узнали — с середины.
             val offsets = listOf(0, pcm.size / 3)
             var hadResponse = false
             for (off in offsets) {
@@ -233,6 +262,7 @@ object Recognizer {
     private fun askShazam(sig: ShazamSignature.Result): RecResult? =
         http.newCall(shazamRequest(sig)).execute().use { resp -> parseShazam(resp) }
 
+    /** То же, но запрос отменяется вместе с корутиной (кнопка «Отмена» не ждёт ответа сервера). */
     private suspend fun askShazamLive(sig: ShazamSignature.Result): RecResult? =
         http.newCall(shazamRequest(sig)).await().use { resp -> parseShazam(resp) }
 
@@ -287,6 +317,7 @@ object Recognizer {
         )
     }
 
+    /** Ждёт ответа, не блокируя поток; при отмене корутины отменяет и сам запрос. */
     private suspend fun Call.await(): Response = suspendCancellableCoroutine { cont ->
         cont.invokeOnCancellation { runCatching { cancel() } }
         enqueue(object : Callback {
@@ -300,20 +331,28 @@ object Recognizer {
         })
     }
 
+    // ---------- Мгновенное распознавание ----------
+
+    /** Итог одной попытки: узнали, не узнали или не получилось спросить сервер. */
     private sealed interface Attempt {
         data class Hit(val result: RecResult) : Attempt
         data object Miss : Attempt
         data class Fail(val message: String) : Attempt
     }
 
+    /** До первой попытки накапливаем столько звука, секунд. */
     private const val FIRST_TRY_SEC = 3.5
 
+    /** Новая попытка не раньше, чем набралось столько нового звука, секунд. */
     private const val STEP_SEC = 2.0
 
+    /** Попытка смотрит на последние столько секунд записи. */
     private const val WINDOW_SEC = 5.0
 
+    /** Тише этого пика звука считаем тишиной. */
     private const val MIN_PEAK = 150
 
+    /** Одна проверка: отпечаток по свежему куску записи и запрос в Shazam. */
     private suspend fun attempt(window: ShortArray): Attempt = try {
         val pcm = ShazamSignature.resampleTo16k(window, RATE)
         val sig = ShazamSignature.generate(pcm, 0)
@@ -327,6 +366,11 @@ object Recognizer {
         Attempt.Fail(e.message ?: "Ошибка распознавания")
     }
 
+    /**
+     * Слушает до [seconds] секунд и отдаёт результат сразу, как только трек узнан: пока идёт запись, каждые пару секунд
+     * свежий фрагмент уходит на проверку (параллельно, запись не прерывается). Если за всё время ничего не узнали,
+     * то только по окончании таймера возвращает [RecState.NotFound].
+     */
     @SuppressLint("MissingPermission")
     suspend fun listen(source: RecSource, projection: MediaProjection?, seconds: Int): RecState =
         withContext(Dispatchers.IO) {
@@ -343,6 +387,7 @@ object Recognizer {
                     .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                     .addMatchingUsage(AudioAttributes.USAGE_GAME)
                     .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    // Своё приложение не слушаем: иначе «распознаем» собственный плеер.
                     .excludeUid(Process.myUid())
                     .build()
                 builder.setAudioPlaybackCaptureConfig(cfg)
@@ -392,6 +437,7 @@ object Recognizer {
                         for (i in filled until filled + n) { val a = kotlin.math.abs(pcm[i].toInt()); if (a > peak) peak = a }
                         filled += n
                         val nowLeft = seconds - filled / RATE
+                        // Проверка закончилась: узнали — выходим сразу, не дожидаясь конца таймера.
                         val p = pending
                         if (p != null && p.isCompleted) {
                             pending = null
@@ -408,6 +454,7 @@ object Recognizer {
                         ) launchTry(filled)
                     }
 
+                    // Таймер вышел, а трек ещё не узнан: дожидаемся начатой проверки и делаем последнюю по самому свежему звуку.
                     if (hit == null && isActive) {
                         pending?.let { d ->
                             _state.value = RecState.Searching(source)
@@ -434,6 +481,7 @@ object Recognizer {
                     else "Не слышно звука. Поднесите телефон ближе к источнику",
                 )
                 else -> {
+                    // Запасной вариант: AudD по всей записи (если указан ключ).
                     var audd: RecState? = null
                     if (RecognitionSettings.auddToken.isNotBlank()) {
                         _state.value = RecState.Searching(source)
@@ -448,6 +496,7 @@ object Recognizer {
             }
         }
 
+    /** Обложка для уведомления: с коротким таймаутом; не получилось — уведомление придёт без неё. */
     suspend fun fetchCover(url: String): android.graphics.Bitmap? = withContext(Dispatchers.IO) {
         runCatching {
             val quick = http.newBuilder().callTimeout(4, TimeUnit.SECONDS).build()
@@ -457,6 +506,7 @@ object Recognizer {
         }.getOrNull()
     }
 
+    /** Запасной вариант: AudD, если пользователь указал свой ключ. */
     private fun identifyAudd(wav: ByteArray): RecState {
         val token = RecognitionSettings.auddToken
         return try {

@@ -42,10 +42,17 @@ import app.ymusic.m3e.R
 private val FallbackLight = lightColorScheme(primary = Color(0xFF6B4EFF), secondary = Color(0xFFFF6B6B))
 private val FallbackDark = darkColorScheme(primary = Color(0xFFC5BAFF), secondary = Color(0xFFFFB3B3))
 
+// Форма элементов берётся из выбранной «формы значков» (Настройки → Оформление). Для формы «Material 3» —
+// выразительные радиусы M3E; остальные формы задаются в IconShapes.kt.
 private fun m3eDp(base: Int): Dp = base.dp
 
+/** Форма для «прежнего» радиуса [base] dp: по выбранной форме значков. */
 fun rounded(base: Int): Shape = ThemeSettings.iconShape.shape(m3eDp(base))
 
+/**
+ * Дополнительный горизонтальный отступ внутри плиток и кнопок-карточек: у «Круга», «Капли», «Шестиугольника» и других форм
+ * края срезаются сильнее, и без него значок и текст у края плитки обрезались бы.
+ */
 fun shapeInset(): Dp = when (ThemeSettings.iconShape) {
     IconShape.Circle, IconShape.Teardrop, IconShape.Pebble -> 14.dp
     IconShape.Hexagon -> 10.dp
@@ -54,21 +61,32 @@ fun shapeInset(): Dp = when (ThemeSettings.iconShape) {
     else -> 0.dp
 }
 
+/** Форма для больших контейнеров с текстом: фиксированный радиус в dp, текст и обложки не срезаются (см. [containerShape]). */
 fun containerShape(base: Int): Shape = ThemeSettings.iconShape.containerShape(m3eDp(base))
 
+/**
+ * Форма для области нажатия вокруг текста (название и исполнитель трека, подпись, строка текста песни).
+ * Не зависит от выбранной формы значков: радиус фиксированный и небольшой, поэтому текст не срезается
+ * ни у «Круга», ни у «Шестиугольника», ни у «Капли».
+ */
 fun textShape(base: Int = 8): Shape = androidx.compose.foundation.shape.RoundedCornerShape(base.dp)
 
+/** Длительность анимации в мс с учётом настройки «Скорость анимации» (Внешний вид → Анимации). */
 fun animMs(ms: Int): Int = if (ThemeSettings.optimize) 1 else (ms / ThemeSettings.animSpeed).toInt().coerceAtLeast(1)
 
+/** Длительность «жёстко заданной» анимации в мс: при включённой «Оптимизации» — мгновенно, иначе как есть. */
 fun fxMs(ms: Int): Int = if (ThemeSettings.optimize) 1 else ms
 
+/** Пружина, которая при включённой «Оптимизации» превращается в мгновенный переход (snap). */
 fun <T> fxSpring(
     dampingRatio: Float = Spring.DampingRatioNoBouncy,
     stiffness: Float = Spring.StiffnessMedium,
 ): FiniteAnimationSpec<T> = if (ThemeSettings.optimize) snap() else spring(dampingRatio, stiffness)
 
+/** Радиус в dp (используется только формой «Material 3»). */
 fun scaledDp(base: Int): Dp = m3eDp(base)
 
+/** Форма с анимируемым радиусом (кнопка play, мини-плеер): у «Material 3» радиус меняется, у остальных форма постоянная. */
 fun cornerShape(r: Dp): Shape = ThemeSettings.iconShape.shape(r)
 
 private fun expressiveShapes(sh: IconShape) = Shapes(
@@ -79,12 +97,14 @@ private fun expressiveShapes(sh: IconShape) = Shapes(
     extraLarge = sh.themeShape(40.dp),
 )
 
+// Google Sans — основной шрифт приложения (OFL, латиница + кириллица).
 val GoogleSans = FontFamily(
     Font(R.font.google_sans_regular, FontWeight.Normal),
     Font(R.font.google_sans_medium, FontWeight.Medium),
     Font(R.font.google_sans_bold, FontWeight.Bold),
 )
 
+// Google Sans Code — моноширинный шрифт (коды, например код входа ya.ru/device).
 val GoogleSansCode = FontFamily(
     Font(R.font.google_sans_code_regular, FontWeight.Normal),
     Font(R.font.google_sans_code_medium, FontWeight.Medium),
@@ -92,6 +112,7 @@ val GoogleSansCode = FontFamily(
 
 private val BaseTypography = Typography()
 
+/** Набор стилей Material 3 (включая Expressive) с подстановкой нужного семейства шрифтов. */
 private fun typographyWith(f: FontFamily): Typography = Typography(
     displayLarge = BaseTypography.displayLarge.copy(fontFamily = f),
     displayMedium = BaseTypography.displayMedium.copy(fontFamily = f),
@@ -108,6 +129,7 @@ private fun typographyWith(f: FontFamily): Typography = Typography(
     labelLarge = BaseTypography.labelLarge.copy(fontFamily = f),
     labelMedium = BaseTypography.labelMedium.copy(fontFamily = f),
     labelSmall = BaseTypography.labelSmall.copy(fontFamily = f),
+    // Material 3 Expressive: акцентные (emphasized) стили для заголовков.
     displayLargeEmphasized = BaseTypography.displayLargeEmphasized.copy(fontFamily = f),
     displayMediumEmphasized = BaseTypography.displayMediumEmphasized.copy(fontFamily = f),
     displaySmallEmphasized = BaseTypography.displaySmallEmphasized.copy(fontFamily = f),
@@ -130,6 +152,7 @@ private val GoogleSansTypography = typographyWith(GoogleSans)
 
 @Composable
 fun YMusicTheme(content: @Composable () -> Unit) {
+    // Плагин темы (Lua), если он включён, задаёт цвет акцента поверх выбранного.
     val accent = app.ymusic.m3e.data.PluginSystem.themeAccent ?: ThemeSettings.accent
     val dark = when (ThemeSettings.mode) {
         ThemeMode.System -> isSystemInDarkTheme()
@@ -144,9 +167,12 @@ fun YMusicTheme(content: @Composable () -> Unit) {
         dark -> FallbackDark
         else -> FallbackLight
     }
+    // Свои цвета частей схемы (дополнительный, контрастный, фон) — поверх основной схемы.
     val slots = ThemeSettings.slotColors
     val tinted = if (slots.isEmpty()) baseScheme else baseScheme.withSlots(slots, dark)
+    // AMOLED: только в тёмной теме — фон и поверхности чисто чёрные, акцентные цвета остаются как были.
     val scheme = if (dark && (ThemeSettings.amoled || app.ymusic.m3e.data.PluginSystem.themeAmoled)) tinted.toAmoled() else tinted
+    // Иконки статус-бара и панели навигации должны соответствовать выбранной теме, а не системной.
     val view = LocalView.current
     if (!view.isInEditMode) {
         SideEffect {
@@ -156,6 +182,7 @@ fun YMusicTheme(content: @Composable () -> Unit) {
             controller.isAppearanceLightNavigationBars = !dark
         }
     }
+    // Шрифт: системный / Google Sans / пользовательский файл (при проблемах с файлом — системный).
     val customFont = ThemeSettings.customFont
     val customTypography = remember(customFont) { customFont?.let { typographyWith(it) } }
     val typography = when (ThemeSettings.fontMode) {
@@ -163,6 +190,8 @@ fun YMusicTheme(content: @Composable () -> Unit) {
         FontMode.GoogleSans -> GoogleSansTypography
         FontMode.File -> customTypography ?: SystemTypography
     }
+    // Material 3 Expressive: выразительная схема движения (пружины) для всех компонентов.
+    // Размер интерфейса (Настройки → Внешний вид): масштабируем плотность — вместе с ней растут и dp, и sp.
     val baseDensity = LocalDensity.current
     val uiScale = ThemeSettings.uiScale
     val density = remember(baseDensity, uiScale) { Density(baseDensity.density * uiScale, baseDensity.fontScale) }
@@ -177,6 +206,10 @@ fun YMusicTheme(content: @Composable () -> Unit) {
     }
 }
 
+/**
+ * AMOLED-вариант тёмной схемы: фон и основные поверхности — чисто чёрные (пиксели OLED-экрана выключены),
+ * поверхности карточек, панелей и окон — тот же оттенок, но темнее, чтобы они отличались от фона.
+ */
 private fun ColorScheme.toAmoled(): ColorScheme {
     fun darker(c: Color, k: Float) = lerp(Color.Black, c, k)
     return copy(
@@ -191,12 +224,14 @@ private fun ColorScheme.toAmoled(): ColorScheme {
     )
 }
 
+/** Тона одного цвета: оттенок и насыщенность берутся у выбранного цвета, светлота — по схеме Material 3. */
 private fun toneOf(argb: Int, tone: Int, satScale: Float = 1f, minSat: Float = 0.30f): Color {
     val hsv = FloatArray(3)
     android.graphics.Color.colorToHSV(argb, hsv)
     return Color.hsl(hsv[0], (hsv[1] * satScale).coerceIn(minSat * satScale, 0.9f), tone / 100f)
 }
 
+/** Накладывает свои цвета: «Дополнительный» красит secondary, «Контрастный» — tertiary, «Фон» — фон и поверхности. */
 private fun ColorScheme.withSlots(slots: Map<AccentSlot, Int>, dark: Boolean): ColorScheme {
     var cs = this
     slots[AccentSlot.Secondary]?.let { c ->
@@ -216,6 +251,7 @@ private fun ColorScheme.withSlots(slots: Map<AccentSlot, Int>, dark: Boolean): C
     slots[AccentSlot.Surface]?.let { c ->
         val hsv = FloatArray(3)
         android.graphics.Color.colorToHSV(c, hsv)
+        // Фон — приглушённый оттенок выбранного цвета: насыщенность невысокая, чтобы текст оставался читаемым.
         val sN = (hsv[1] * 0.30f).coerceIn(0.05f, 0.28f)
         val sV = (hsv[1] * 0.40f).coerceIn(0.07f, 0.34f)
         fun n(tone: Int) = Color.hsl(hsv[0], sN, tone / 100f)
@@ -241,6 +277,7 @@ private fun ColorScheme.withSlots(slots: Map<AccentSlot, Int>, dark: Boolean): C
     return cs
 }
 
+/** Цветовая схема из одного акцентного цвета (оттенок берётся из seed, тона — по схеме Material 3). */
 private fun seedScheme(seedArgb: Int, dark: Boolean): ColorScheme {
     val hsv = FloatArray(3)
     android.graphics.Color.colorToHSV(seedArgb, hsv)

@@ -13,6 +13,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 
+/** Музыка, лежащая на самом устройстве (MediaStore). Нужен доступ к аудиофайлам. */
 object LocalMusic {
     fun permission(): String =
         if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO
@@ -21,6 +22,10 @@ object LocalMusic {
     fun hasPermission(ctx: Context): Boolean =
         ContextCompat.checkSelfPermission(ctx, permission()) == PackageManager.PERMISSION_GRANTED
 
+    /**
+     * Все музыкальные файлы устройства, по алфавиту. Вызывать не из главного потока.
+     * [withRefs] — режим «Локальные файлы»: у трека есть ссылка на исполнителя (по ней открывается страница исполнителя из файлов).
+     */
     fun load(ctx: Context, withRefs: Boolean = false): List<Track> {
         val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
         val projection = arrayOf(
@@ -84,11 +89,13 @@ object LocalMusic {
     }
 }
 
+/** Префикс id исполнителя из файлов устройства (в [ArtistRef.id]): по нему приложение понимает, что страницу нужно открыть локально. */
 const val LOCAL_ARTIST_PREFIX = "local-artist:"
 
 const val UNKNOWN_ARTIST = "Неизвестный исполнитель"
 const val UNKNOWN_ALBUM = "Неизвестный альбом"
 
+/** Альбом из файлов устройства: треки в порядке номеров. */
 data class LocalAlbum(
     val key: String,
     val title: String,
@@ -97,12 +104,14 @@ data class LocalAlbum(
     val year: Int,
     val tracks: List<Track>,
 ) {
+    /** Тот же альбом в виде [AlbumInfo] — чтобы показывать его теми же карточками, что и альбомы Яндекс Музыки. */
     fun info(): AlbumInfo = AlbumInfo(
         id = key, title = title, artists = artist, coverUri = coverUri, year = year,
         trackCount = tracks.size, tracks = tracks,
     )
 }
 
+/** Исполнитель из файлов устройства: все его треки и альбомы, в которых он есть. */
 data class LocalArtist(
     val name: String,
     val coverUri: String?,
@@ -115,6 +124,7 @@ data class LocalArtist(
     )
 }
 
+/** Альбомы и исполнители, собранные из списка файлов устройства. */
 data class LocalLibrary(
     val albums: List<LocalAlbum> = emptyList(),
     val artists: List<LocalArtist> = emptyList(),
@@ -125,6 +135,7 @@ data class LocalLibrary(
     companion object {
         val EMPTY = LocalLibrary()
 
+        /** Группирует файлы по альбомам (id альбома в MediaStore, а если его нет — название + исполнитель) и по исполнителям. */
         fun build(tracks: List<Track>): LocalLibrary {
             if (tracks.isEmpty()) return EMPTY
             val order = compareBy<Track>({ if (it.trackNo == 0) Int.MAX_VALUE else it.trackNo }, { it.title.lowercase() })
@@ -158,9 +169,11 @@ data class LocalLibrary(
     }
 }
 
+/** Ключ альбома файла: id альбома в MediaStore, а если его нет — название и исполнитель. */
 fun Track.localAlbumKey(): String =
     if (localAlbumId > 0) "a$localAlbumId" else "t:${(albumTitle ?: "").lowercase()}|${artists.lowercase()}"
 
+/** Настройка «Файлы с устройства» (Настройки → Офлайн-режим). Хранится в SharedPreferences. */
 object LocalFilesSettings {
     private var prefs: SharedPreferences? = null
 
@@ -179,7 +192,13 @@ object LocalFilesSettings {
     }
 }
 
+/**
+ * Плейлисты-папки: выбранная на устройстве или SD-карте папка работает как отдельный плейлист. Список треков
+ * не хранится, а собирается из файлов устройства по пути (включая вложенные папки), поэтому новые файлы
+ * в папке появляются в плейлисте сами.
+ */
 object LocalFolders {
+    /** Путь папки, выбранной системным окном (ACTION_OPEN_DOCUMENT_TREE): внутренняя память, SD-карта или USB. */
     fun pathFromTree(uri: Uri): String? = runCatching {
         val docId = android.provider.DocumentsContract.getTreeDocumentId(uri)
         val colon = docId.indexOf(':')
@@ -195,6 +214,7 @@ object LocalFolders {
         if (rel.isEmpty()) root else "$root/$rel"
     }.getOrNull()
 
+    /** Имя папки для названия плейлиста по умолчанию. */
     fun displayName(path: String): String {
         val name = path.trimEnd('/').substringAfterLast('/')
         return name.ifBlank { "Музыка" }
@@ -204,6 +224,7 @@ object LocalFolders {
 
     private val cache = HashMap<String, Pair<List<Track>, List<Track>>>()
 
+    /** Файлы устройства из [all], лежащие в папке [folder] или её подпапках, по именам файлов. */
     @Synchronized
     fun tracksIn(all: List<Track>, folder: String): List<Track> {
         val hit = cache[folder]

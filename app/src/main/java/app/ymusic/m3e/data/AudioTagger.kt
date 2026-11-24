@@ -8,8 +8,16 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
 
+/**
+ * Записывает в скачанный файл теги и обложку: название, исполнитель, альбом, год, жанр, лейбл, картинка.
+ *  - mp3 — ID3v2.3 (старый ID3-блок из исходного файла вырезается, чтобы не было двух);
+ *  - flac — блоки VORBIS_COMMENT и PICTURE;
+ *  - m4a — атомы ilst внутри moov/udta/meta (смещения stco/co64 пересчитываются).
+ * Если формат не распознан или разбор не удался, файл копируется как есть.
+ */
 object AudioTagger {
 
+    /** Пишет в [out] содержимое [src] с тегами. [cover] — JPEG/PNG-байты или null. */
     fun write(src: File, out: OutputStream, ext: String, t: Track, cover: ByteArray?) {
         when (ext) {
             "mp3" -> tagMp3(src, out, t, cover)
@@ -18,6 +26,8 @@ object AudioTagger {
             else -> copyAll(src, out)
         }
     }
+
+    // ---------- Общее ----------
 
     private fun copyAll(src: File, out: OutputStream) {
         src.inputStream().use { it.copyTo(out, 64 * 1024) }
@@ -45,9 +55,12 @@ object AudioTagger {
 
     private fun usable(s: String?) = !s.isNullOrBlank()
 
+    // ---------- MP3 / ID3v2.3 ----------
+
     private fun tagMp3(src: File, out: OutputStream, t: Track, cover: ByteArray?) {
         val tag = id3(t, cover)
         src.inputStream().buffered().use { raw ->
+            // Пропускаем уже имеющийся ID3v2-блок исходного файла.
             raw.mark(16)
             val head = raw.readFully(10)
             var skip = 0L
@@ -83,10 +96,10 @@ object AudioTagger {
         }
         val pic = if (cover != null && cover.isNotEmpty()) {
             val data = ByteArrayOutputStream().apply {
-                write(0)
+                write(0)                                              // кодировка ISO-8859-1 для mime и описания
                 write(mimeOf(cover).toByteArray(Charsets.ISO_8859_1)); write(0)
-                write(3)
-                write(0)
+                write(3)                                              // тип: обложка (front)
+                write(0)                                              // пустое описание
                 write(cover)
             }.toByteArray()
             frame("APIC", data)
@@ -103,6 +116,8 @@ object AudioTagger {
         return header + body
     }
 
+    // ---------- FLAC ----------
+
     private fun tagFlac(src: File, out: OutputStream, t: Track, cover: ByteArray?) {
         src.inputStream().buffered().use { inp ->
             val magic = inp.readFully(4)
@@ -115,6 +130,7 @@ object AudioTagger {
                 val type = h[0].toInt() and 0x7f
                 val len = ((h[1].toInt() and 0xff) shl 16) or ((h[2].toInt() and 0xff) shl 8) or (h[3].toInt() and 0xff)
                 val data = inp.readFully(len) ?: break
+                // Старые комментарии, картинки и padding выбрасываем.
                 if (type != 4 && type != 6 && type != 1) keep += type to data
             }
             keep += 4 to vorbisComment(t)
@@ -150,14 +166,16 @@ object AudioTagger {
         val mime = mimeOf(img).toByteArray(Charsets.ISO_8859_1)
         val bo = ByteArrayOutputStream()
         DataOutputStream(bo).apply {
-            writeInt(3)
+            writeInt(3)                       // обложка (front)
             writeInt(mime.size); write(mime)
-            writeInt(0)
+            writeInt(0)                       // описание пустое
             writeInt(w); writeInt(h); writeInt(24); writeInt(0)
             writeInt(img.size); write(img)
         }
         return bo.toByteArray()
     }
+
+    // ---------- M4A / MP4 ----------
 
     private class Box(val type: String, val offset: Long, val size: Long)
 
@@ -210,6 +228,7 @@ object AudioTagger {
 
     private fun ilstText(code: String, s: String?): ByteArray {
         if (!usable(s)) return ByteArray(0)
+        // «©» — байт 0xA9
         val name = code.map { if (it == '@') 0xA9.toByte() else it.code.toByte() }.toByteArray()
         return ilstItem(name, 1, s!!.toByteArray(Charsets.UTF_8))
     }
@@ -239,6 +258,7 @@ object AudioTagger {
         return box("udta", meta)
     }
 
+    /** Сдвигает смещения чанков в stco/co64 на [delta], если они указывают после старого moov. */
     private fun shiftOffsets(b: ByteArray, start: Int, end: Int, oldMoovEnd: Long, delta: Long) {
         var p = start
         while (p + 8 <= end) {
@@ -277,6 +297,7 @@ object AudioTagger {
             val hdrLen = if (moov.size > 0xffffffffL) 16 else 8
             val old = ByteArray(moov.size.toInt())
             f.seek(moov.offset); f.readFully(old)
+            // Дети moov без старого udta + новый udta.
             val kids = ByteArrayOutputStream()
             var p = hdrLen
             while (p + 8 <= old.size) {
